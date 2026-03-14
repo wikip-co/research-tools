@@ -56,10 +56,8 @@ main() {
   # Output export statement (for eval or source usage)
   printf 'export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE="%s"\n' "$CREDENTIALS_FILE"
 
-  # If script is being sourced, also export directly
-  if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
-    export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE="$CREDENTIALS_FILE"
-  fi
+  # Also export directly for sourced usage
+  export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE="$CREDENTIALS_FILE"
 
   printf '# auth-bootstrap: Credentials written to %s\n' "$CREDENTIALS_FILE" >&2
 }

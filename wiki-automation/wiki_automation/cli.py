@@ -158,6 +158,7 @@ def suggest_tags(
 
     for tag, count in tag_counts.items():
         tag_norm = normalize(tag)
+        tag_terms = set(tag_norm.split())
         # Score based on match quality
         score = 0.0
         if query_norm == tag_norm:
@@ -167,10 +168,13 @@ def suggest_tags(
         elif tag_norm in query_norm:
             score = 70.0
         else:
-            # Check individual term matches
-            matched_terms = sum(1 for term in query_terms if term in tag_norm)
-            if matched_terms > 0:
-                score = 50.0 * (matched_terms / len(query_terms))
+            # Check individual term matches (both directions)
+            matched_in_tag = sum(1 for term in query_terms if term in tag_norm)
+            matched_in_query = sum(1 for term in tag_terms if term in query_norm)
+            if matched_in_tag > 0:
+                score = 50.0 * (matched_in_tag / len(query_terms))
+            elif matched_in_query > 0:
+                score = 40.0 * (matched_in_query / len(tag_terms))
 
         if score > 0:
             suggestions.append({
@@ -787,7 +791,7 @@ def append_research(args: argparse.Namespace) -> dict[str, Any]:
         if args.section:
             # Find the section header
             section_pattern = re.compile(
-                rf'^(#{1,3})\s+{re.escape(args.section)}\s*$',
+                rf'^(#{{1,3}})\s+{re.escape(args.section)}\s*$',
                 re.MULTILINE | re.IGNORECASE
             )
             section_match = section_pattern.search(original_content)
@@ -799,7 +803,7 @@ def append_research(args: argparse.Namespace) -> dict[str, Any]:
 
                 # Look for next section of same or higher level
                 next_section = re.compile(
-                    rf'^#{{{1},{section_level}}}\s+\S',
+                    rf'^#{{1,{section_level}}}\s+\S',
                     re.MULTILINE
                 )
                 next_match = next_section.search(original_content, section_end)
@@ -1050,8 +1054,11 @@ def list_tags(args: argparse.Namespace) -> dict[str, Any]:
     articles = load_articles(REPO_ROOT)
     tag_counts = collect_all_tags(articles)
 
+    # Use a sensible default limit for suggestions if not specified
+    limit = args.limit if args.limit > 0 else 20
+
     if args.suggest:
-        suggestions = suggest_tags(tag_counts, args.suggest, limit=args.limit)
+        suggestions = suggest_tags(tag_counts, args.suggest, limit=limit)
         return {
             "query": args.suggest,
             "suggestions": suggestions,
@@ -1064,7 +1071,7 @@ def list_tags(args: argparse.Namespace) -> dict[str, Any]:
         key=lambda x: (-x["count"], x["tag"].lower()),
     )
 
-    if args.limit:
+    if args.limit > 0:
         sorted_tags = sorted_tags[: args.limit]
 
     return {
