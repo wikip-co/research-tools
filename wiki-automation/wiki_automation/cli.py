@@ -137,6 +137,119 @@ def load_articles(repo_root: Path) -> list[ArticleRecord]:
     return articles
 
 
+def collect_all_tags(articles: list[ArticleRecord]) -> dict[str, int]:
+    """Collect all tags from articles with their frequency counts."""
+    tag_counts: dict[str, int] = {}
+    for article in articles:
+        for tag in article.tags:
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    return tag_counts
+
+
+def suggest_tags(
+    tag_counts: dict[str, int],
+    query: str,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Suggest tags matching a query, sorted by relevance and frequency."""
+    query_norm = normalize(query)
+    query_terms = query_norm.split()
+    suggestions = []
+
+    for tag, count in tag_counts.items():
+        tag_norm = normalize(tag)
+        # Score based on match quality
+        score = 0.0
+        if query_norm == tag_norm:
+            score = 100.0
+        elif query_norm in tag_norm:
+            score = 80.0
+        elif tag_norm in query_norm:
+            score = 70.0
+        else:
+            # Check individual term matches
+            matched_terms = sum(1 for term in query_terms if term in tag_norm)
+            if matched_terms > 0:
+                score = 50.0 * (matched_terms / len(query_terms))
+
+        if score > 0:
+            suggestions.append({
+                "tag": tag,
+                "count": count,
+                "score": round(score, 2),
+            })
+
+    suggestions.sort(key=lambda x: (-x["score"], -x["count"], x["tag"].lower()))
+    return suggestions[:limit]
+
+
+def find_reference_urls(body: str) -> list[dict[str, Any]]:
+    """Extract all reference URLs from article body."""
+    references = []
+    # Match footnote definitions like [^1]: **Title:** [text](url)
+    footnote_pattern = re.compile(
+        r'\[\^(\d+)\]:\s*(?:\*\*Title:\*\*\s*)?\[([^\]]*)\]\(([^)]+)\)',
+        re.MULTILINE
+    )
+    for match in footnote_pattern.finditer(body):
+        ref_num, title, url = match.groups()
+        references.append({
+            "ref_num": int(ref_num),
+            "title": title.strip(),
+            "url": url.strip(),
+        })
+
+    # Also match simpler formats like [^1]: [text](url)
+    simple_pattern = re.compile(
+        r'\[\^(\d+)\]:\s*\[([^\]]*)\]\(([^)]+)\)',
+        re.MULTILINE
+    )
+    seen_refs = {r["ref_num"] for r in references}
+    for match in simple_pattern.finditer(body):
+        ref_num, title, url = match.groups()
+        if int(ref_num) not in seen_refs:
+            references.append({
+                "ref_num": int(ref_num),
+                "title": title.strip(),
+                "url": url.strip(),
+            })
+
+    return sorted(references, key=lambda x: x["ref_num"])
+
+
+def check_reference_exists(
+    articles: list[ArticleRecord],
+    url: str,
+) -> dict[str, Any] | None:
+    """Check if a URL is already referenced in any article."""
+    url_normalized = url.strip().rstrip("/").lower()
+    # Also check without protocol
+    url_no_protocol = re.sub(r'^https?://', '', url_normalized)
+
+    for article in articles:
+        refs = find_reference_urls(article.body)
+        for ref in refs:
+            ref_url = ref["url"].strip().rstrip("/").lower()
+            ref_no_protocol = re.sub(r'^https?://', '', ref_url)
+            if url_normalized == ref_url or url_no_protocol == ref_no_protocol:
+                return {
+                    "exists": True,
+                    "path": article.path,
+                    "title": article.title,
+                    "ref_num": ref["ref_num"],
+                    "ref_title": ref["title"],
+                }
+    return {"exists": False}
+
+
+def get_next_reference_number(body: str) -> int:
+    """Get the next available reference number for an article."""
+    refs = find_reference_urls(body)
+    if not refs:
+        return 1
+    return max(r["ref_num"] for r in refs) + 1
+
+
 def score_match(title: str, article: ArticleRecord) -> float:
     title_norm = normalize(title)
     article_title_norm = normalize(article.title)
@@ -492,6 +605,293 @@ def unique_route_key(candidate_path: Path, articles: list[ArticleRecord]) -> str
     return "/".join(parts)
 
 
+def format_reference_block(
+    ref_num: int,
+    scrape: dict[str, Any],
+) -> str:
+    """Format a reference block in the content repo style."""
+    title = scrape.get("title", "Unknown Title")
+    url = scrape.get("reference_url") or scrape.get("url", "")
+    journal = scrape.get("journal", "")
+    pub_date = scrape.get("pub_date", "Unknown")
+    study_type = scrape.get("study_type", "Research Article")
+    authors = scrape.get("authors", "Unknown")
+
+    lines = [
+        f'[^{ref_num}]: **Title:** [{title}]({url})<br>',
+    ]
+    if journal:
+        lines.append(f'**Publication:** [{journal}]({scrape.get("url", "")})<br>')
+    lines.append(f'**Date:** {pub_date}<br>')
+    lines.append(f'**Study Type:** {study_type}<br>')
+    lines.append(f'**Author(s):** {authors}<br>')
+    lines.append(f'**Source:** [{scrape.get("url", "")}]({scrape.get("url", "")})')
+
+    return "\n".join(lines)
+
+
+def extract_key_findings(abstract: str, limit: int = 5) -> list[str]:
+    """Extract key findings from abstract as bullet points."""
+    if not abstract:
+        return []
+
+    # Split on sentence boundaries
+    sentences = re.split(r'(?<=[.!?])\s+', abstract.strip())
+
+    # Filter for informative sentences (skip short or uninformative ones)
+    findings = []
+    skip_patterns = [
+        r'^(this|the|we|our|in this|here|however|therefore|thus|hence|moreover|furthermore)\b',
+        r'^(background|introduction|methods?|results?|conclusions?|objectives?|aims?|purpose)[:.]?\s*$',
+    ]
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if len(sentence) < 30:
+            continue
+        if any(re.match(pat, sentence, re.IGNORECASE) for pat in skip_patterns):
+            continue
+        # Prefer sentences with findings indicators
+        if len(findings) < limit:
+            findings.append(sentence)
+
+    return findings[:limit]
+
+
+def suggest_tags_for_content(
+    existing_tags: dict[str, int],
+    title: str,
+    abstract: str,
+    keywords: str,
+    current_article_tags: list[str],
+) -> list[str]:
+    """Suggest new tags based on content that aren't already on the article."""
+    # Combine text sources
+    combined = " ".join([title, abstract, keywords]).lower()
+    current_tags_lower = {t.lower() for t in current_article_tags}
+
+    suggestions = []
+    for tag in existing_tags:
+        tag_lower = tag.lower()
+        # Skip if already on article
+        if tag_lower in current_tags_lower:
+            continue
+        # Check if tag appears in content
+        # Handle multi-word tags
+        tag_pattern = re.escape(tag_lower).replace(r"\ ", r"\s+")
+        if re.search(tag_pattern, combined, re.IGNORECASE):
+            suggestions.append(tag)
+
+    # Sort by frequency in repo
+    suggestions.sort(key=lambda t: -existing_tags.get(t, 0))
+    return suggestions[:10]
+
+
+def append_research(args: argparse.Namespace) -> dict[str, Any]:
+    """Scrape a URL and append research to an existing article."""
+    ensure_tool_dir(WEB_SCRAPER_DIR, "web-scraper")
+    articles = load_articles(REPO_ROOT)
+    tag_counts = collect_all_tags(articles)
+
+    # Find target article
+    target_path = Path(args.target)
+    if target_path.is_absolute():
+        target_path = target_path.relative_to(REPO_ROOT)
+
+    target_article = None
+    for article in articles:
+        if article.path == str(target_path):
+            target_article = article
+            break
+
+    if not target_article:
+        raise FileNotFoundError(f"Target article not found: {target_path}")
+
+    # Check for duplicate reference
+    existing_ref = check_reference_exists(articles, args.url)
+    if existing_ref.get("exists"):
+        return {
+            "status": "duplicate",
+            "message": f"URL already referenced in {existing_ref['path']} as [^{existing_ref['ref_num']}]",
+            "existing_reference": existing_ref,
+        }
+
+    # Scrape the URL
+    scrape = run_json_tool(
+        WEB_SCRAPER_DIR,
+        ["main.py", args.url],
+    )
+
+    # Get next reference number
+    next_ref = get_next_reference_number(target_article.body)
+
+    # Suggest tags
+    suggested_tags = suggest_tags_for_content(
+        tag_counts,
+        scrape.get("title", ""),
+        scrape.get("abstract", ""),
+        scrape.get("keywords", ""),
+        target_article.tags,
+    )
+
+    # Extract key findings
+    key_findings = extract_key_findings(scrape.get("abstract", ""))
+
+    # Format content section
+    content_lines = []
+    if args.section:
+        if args.subsection:
+            content_lines.append(f"\n### {args.subsection}\n")
+        else:
+            content_lines.append(f"\n### {scrape.get('title', 'New Research')}\n")
+
+    # Add abstract summary or key findings
+    if key_findings:
+        for finding in key_findings[:3]:
+            content_lines.append(f"- {finding}[^{next_ref}]")
+    elif scrape.get("abstract"):
+        abstract = scrape["abstract"]
+        if len(abstract) > 500:
+            abstract = abstract[:500] + "..."
+        content_lines.append(f"{abstract}[^{next_ref}]")
+
+    content_block = "\n".join(content_lines) + "\n"
+
+    # Format reference
+    reference_block = format_reference_block(next_ref, scrape)
+
+    result = {
+        "target_article": target_article.path,
+        "target_title": target_article.title,
+        "scrape": {
+            "url": scrape.get("url"),
+            "title": scrape.get("title"),
+            "study_type": scrape.get("study_type"),
+            "authors": scrape.get("authors"),
+            "pub_date": scrape.get("pub_date"),
+        },
+        "next_ref_num": next_ref,
+        "suggested_tags": suggested_tags,
+        "content_block": content_block,
+        "reference_block": reference_block,
+    }
+
+    # If --apply flag is set, actually modify the file
+    if args.apply:
+        full_path = REPO_ROOT / target_path
+        original_content = full_path.read_text(encoding="utf-8")
+
+        # Find where to insert content
+        new_content = original_content
+
+        if args.section:
+            # Find the section header
+            section_pattern = re.compile(
+                rf'^(#{1,3})\s+{re.escape(args.section)}\s*$',
+                re.MULTILINE | re.IGNORECASE
+            )
+            section_match = section_pattern.search(original_content)
+
+            if section_match:
+                # Find the end of this section (next same-level or higher header, or EOF)
+                section_level = len(section_match.group(1))
+                section_end = section_match.end()
+
+                # Look for next section of same or higher level
+                next_section = re.compile(
+                    rf'^#{{{1},{section_level}}}\s+\S',
+                    re.MULTILINE
+                )
+                next_match = next_section.search(original_content, section_end)
+
+                if next_match:
+                    insert_pos = next_match.start()
+                else:
+                    # Insert before references section if it exists
+                    refs_match = re.search(r'\n\[\^1\]:', original_content)
+                    if refs_match:
+                        insert_pos = refs_match.start()
+                    else:
+                        insert_pos = len(original_content)
+
+                new_content = (
+                    original_content[:insert_pos].rstrip() +
+                    "\n" + content_block + "\n" +
+                    original_content[insert_pos:]
+                )
+            else:
+                # Section not found - append before references
+                refs_match = re.search(r'\n\[\^1\]:', original_content)
+                if refs_match:
+                    insert_pos = refs_match.start()
+                    new_content = (
+                        original_content[:insert_pos].rstrip() +
+                        f"\n\n## {args.section}\n" + content_block + "\n" +
+                        original_content[insert_pos:]
+                    )
+                else:
+                    new_content = original_content.rstrip() + f"\n\n## {args.section}\n" + content_block
+        else:
+            # No section specified - append before references
+            refs_match = re.search(r'\n\[\^1\]:', original_content)
+            if refs_match:
+                insert_pos = refs_match.start()
+                new_content = (
+                    original_content[:insert_pos].rstrip() +
+                    "\n" + content_block + "\n" +
+                    original_content[insert_pos:]
+                )
+            else:
+                new_content = original_content.rstrip() + "\n" + content_block
+
+        # Append reference at end
+        new_content = new_content.rstrip() + "\n\n" + reference_block + "\n"
+
+        # Add suggested tags to frontmatter if requested
+        if args.add_tags and suggested_tags:
+            tags_to_add = suggested_tags[:5] if not args.tags else args.tags
+            # Parse frontmatter
+            if new_content.startswith("---\n"):
+                end_match = re.search(r'\n---\n', new_content[4:])
+                if end_match:
+                    fm_end = end_match.start() + 4
+                    frontmatter = new_content[4:fm_end]
+                    rest = new_content[fm_end + 4:]
+
+                    # Add new tags
+                    for tag in tags_to_add:
+                        if tag not in target_article.tags:
+                            frontmatter = frontmatter.rstrip() + f"\n- {tag}"
+
+                    new_content = "---\n" + frontmatter + "\n---\n" + rest
+
+        full_path.write_text(new_content, encoding="utf-8")
+        result["applied"] = True
+        result["status"] = "success"
+
+        # Commit if requested
+        if args.commit:
+            import subprocess
+            commit_msg = f"Add {scrape.get('study_type', 'research')} on {scrape.get('title', 'topic')[:50]}"
+            subprocess.run(
+                ["git", "add", str(target_path)],
+                cwd=REPO_ROOT,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", commit_msg],
+                cwd=REPO_ROOT,
+                capture_output=True,
+            )
+            result["committed"] = True
+    else:
+        result["applied"] = False
+        result["status"] = "preview"
+        result["message"] = "Use --apply to write changes to the article"
+
+    return result
+
+
 def prepare_packet(args: argparse.Namespace) -> dict[str, Any]:
     ensure_tool_dir(WEB_SCRAPER_DIR, "web-scraper")
     output_dir = ensure_output_dir(Path(args.output_dir).expanduser().resolve())
@@ -646,6 +1046,41 @@ def match_title(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def list_tags(args: argparse.Namespace) -> dict[str, Any]:
+    articles = load_articles(REPO_ROOT)
+    tag_counts = collect_all_tags(articles)
+
+    if args.suggest:
+        suggestions = suggest_tags(tag_counts, args.suggest, limit=args.limit)
+        return {
+            "query": args.suggest,
+            "suggestions": suggestions,
+            "total_unique_tags": len(tag_counts),
+        }
+
+    # Sort by frequency (descending) then alphabetically
+    sorted_tags = sorted(
+        [{"tag": tag, "count": count} for tag, count in tag_counts.items()],
+        key=lambda x: (-x["count"], x["tag"].lower()),
+    )
+
+    if args.limit:
+        sorted_tags = sorted_tags[: args.limit]
+
+    return {
+        "tags": sorted_tags,
+        "total_unique_tags": len(tag_counts),
+        "total_tag_usages": sum(tag_counts.values()),
+    }
+
+
+def check_ref(args: argparse.Namespace) -> dict[str, Any]:
+    articles = load_articles(REPO_ROOT)
+    result = check_reference_exists(articles, args.url)
+    result["url"] = args.url
+    return result
+
+
 def search_content(args: argparse.Namespace) -> dict[str, Any]:
     articles = load_articles(REPO_ROOT)
     fields = args.fields or list(SEARCH_FIELD_WEIGHTS.keys())
@@ -727,6 +1162,74 @@ def build_parser() -> argparse.ArgumentParser:
         help="Alert name for keyword matching when --match-existing is set.",
     )
 
+    tags_parser = subparsers.add_parser(
+        "tags",
+        help="List all tags in the content repo with frequency counts.",
+    )
+    tags_parser.add_argument(
+        "--suggest",
+        help="Suggest tags matching a query term.",
+    )
+    tags_parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Maximum tags to return (0 = all).",
+    )
+
+    check_ref_parser = subparsers.add_parser(
+        "check-ref",
+        help="Check if a URL is already referenced in any article.",
+    )
+    check_ref_parser.add_argument(
+        "url",
+        help="URL to check for existing references.",
+    )
+
+    append_parser = subparsers.add_parser(
+        "append",
+        help="Scrape a URL and append research to an existing article.",
+    )
+    append_parser.add_argument(
+        "url",
+        help="URL to scrape and add to the article.",
+    )
+    append_parser.add_argument(
+        "--target",
+        required=True,
+        help="Relative path to the target article in the content repo.",
+    )
+    append_parser.add_argument(
+        "--section",
+        help="Section header to insert content under (e.g., 'Disease / Symptom Treatment').",
+    )
+    append_parser.add_argument(
+        "--subsection",
+        help="Subsection header to create (e.g., 'Spine Health').",
+    )
+    append_parser.add_argument(
+        "--tag",
+        dest="tags",
+        action="append",
+        default=[],
+        help="Tag to add to the article. Repeatable.",
+    )
+    append_parser.add_argument(
+        "--add-tags",
+        action="store_true",
+        help="Automatically add suggested tags to the article frontmatter.",
+    )
+    append_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually write changes to the article (default is preview mode).",
+    )
+    append_parser.add_argument(
+        "--commit",
+        action="store_true",
+        help="Create a git commit after applying changes (implies --apply).",
+    )
+
     backlog_parser = subparsers.add_parser(
         "backlog",
         help="Query the gmail-reader DB for unprocessed candidate articles.",
@@ -780,6 +1283,14 @@ def main(argv: list[str] | None = None) -> int:
             result = prepare_packet(args)
         elif args.command == "backlog":
             result = backlog_query(args)
+        elif args.command == "tags":
+            result = list_tags(args)
+        elif args.command == "check-ref":
+            result = check_ref(args)
+        elif args.command == "append":
+            if args.commit:
+                args.apply = True  # --commit implies --apply
+            result = append_research(args)
         else:
             parser.error(f"Unsupported command: {args.command}")
             return 1

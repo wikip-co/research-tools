@@ -19,12 +19,19 @@ require_command() {
 usage() {
   cat <<'EOF'
 Usage:
+  agent-workflow setup                              # Install dependencies and verify auth
   agent-workflow backlog [wiki-automation backlog args...]
   agent-workflow queue [wiki-automation queue args...]
   agent-workflow match "<title or topic>" [wiki-automation match args...]
   agent-workflow search "<query>" [wiki-automation search args...]
   agent-workflow prepare "<url>" [wiki-automation prepare args...]
+  agent-workflow append "<url>" --target "<path>" [wiki-automation append args...]
+  agent-workflow tags [--suggest "<query>"] [--limit N]
+  agent-workflow check-ref "<url>"
   agent-workflow help
+
+Authentication:
+  source auth-bootstrap                             # Load Google credentials from Vault
 EOF
 }
 
@@ -111,6 +118,136 @@ run_prepare() {
     uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation prepare "$@"
 }
 
+run_append() {
+  require_command uv
+  if (($# < 1)); then
+    printf 'append requires a URL\n' >&2
+    exit 1
+  fi
+
+  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
+    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation append "$@"
+}
+
+run_tags() {
+  require_command uv
+
+  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
+    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation tags "$@"
+}
+
+run_check_ref() {
+  require_command uv
+  if (($# < 1)); then
+    printf 'check-ref requires a URL\n' >&2
+    exit 1
+  fi
+
+  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
+    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation check-ref "$@"
+}
+
+run_setup() {
+  local errors=0
+
+  printf 'Setting up research-tools...\n\n'
+
+  # Check required commands
+  printf '==> Checking required commands...\n'
+  for cmd in uv vault gws; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      printf '  ✓ %s found\n' "$cmd"
+    else
+      printf '  ✗ %s NOT FOUND\n' "$cmd"
+      ((errors++))
+    fi
+  done
+  printf '\n'
+
+  # Sync dependencies for each tool
+  printf '==> Installing tool dependencies...\n'
+  for tool_dir in gmail-reader wiki-automation web-scraper image-upload; do
+    local dir="$AGENT_TOOLS_ROOT/$tool_dir"
+    if [[ -d "$dir" ]]; then
+      printf '  → %s: ' "$tool_dir"
+      if (cd "$dir" && uv sync --quiet 2>/dev/null); then
+        printf 'OK\n'
+      else
+        printf 'FAILED\n'
+        ((errors++))
+      fi
+    fi
+  done
+  printf '\n'
+
+  # Install Playwright browsers for web-scraper
+  printf '==> Installing Playwright browsers...\n'
+  local scraper_dir="$AGENT_TOOLS_ROOT/web-scraper"
+  if [[ -d "$scraper_dir" ]]; then
+    # Check if already installed
+    if [[ -d "$HOME/.cache/ms-playwright/chromium-"* ]]; then
+      printf '  ✓ Chromium already installed\n'
+    elif (cd "$scraper_dir" && uv run playwright install chromium 2>&1 | grep -q -E "(downloaded|already)"); then
+      printf '  ✓ Chromium installed\n'
+    else
+      # Try installation and check result
+      if (cd "$scraper_dir" && uv run playwright install chromium >/dev/null 2>&1); then
+        printf '  ✓ Chromium installed\n'
+      else
+        printf '  ⚠ Chromium may need manual installation\n'
+      fi
+    fi
+  fi
+  printf '\n'
+
+  # Check Vault connectivity
+  printf '==> Checking Vault connectivity...\n'
+  if vault status >/dev/null 2>&1; then
+    printf '  ✓ Vault is accessible\n'
+
+    # Try to load credentials
+    printf '  → Testing credential retrieval: '
+    if source "$AGENT_TOOLS_ROOT/auth-bootstrap" 2>/dev/null; then
+      printf 'OK\n'
+    else
+      printf 'FAILED (run: source auth-bootstrap)\n'
+      ((errors++))
+    fi
+  else
+    printf '  ✗ Cannot connect to Vault\n'
+    ((errors++))
+  fi
+  printf '\n'
+
+  # Check Gmail auth
+  printf '==> Checking Gmail authentication...\n'
+  if [[ -n "${GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE:-}" ]] && [[ -f "$GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE" ]]; then
+    printf '  ✓ Credentials file exists\n'
+
+    # Test Gmail access
+    printf '  → Testing Gmail access: '
+    if (cd "$AGENT_TOOLS_ROOT/gmail-reader" && uv run gmail-reader alerts >/dev/null 2>&1); then
+      printf 'OK\n'
+    else
+      printf 'FAILED\n'
+      ((errors++))
+    fi
+  else
+    printf '  ✗ No credentials loaded (run: source auth-bootstrap)\n'
+    ((errors++))
+  fi
+  printf '\n'
+
+  # Summary
+  if ((errors == 0)); then
+    printf '==> Setup complete! All checks passed.\n'
+  else
+    printf '==> Setup completed with %d error(s).\n' "$errors"
+  fi
+
+  return $errors
+}
+
 main() {
   local command="${1:-help}"
   if (($# > 0)); then
@@ -118,6 +255,9 @@ main() {
   fi
 
   case "$command" in
+    setup)
+      run_setup "$@"
+      ;;
     backlog)
       run_backlog "$@"
       ;;
@@ -132,6 +272,15 @@ main() {
       ;;
     prepare)
       run_prepare "$@"
+      ;;
+    append)
+      run_append "$@"
+      ;;
+    tags)
+      run_tags "$@"
+      ;;
+    check-ref)
+      run_check_ref "$@"
       ;;
     help|-h|--help)
       usage

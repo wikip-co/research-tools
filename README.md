@@ -83,9 +83,68 @@ Vault bootstrap variables:
 ## Layout
 
 - `agent-workflow`: wrapper for the operational commands
+- `auth-bootstrap`: fetch Google OAuth credentials from Vault
 - `scripts/entrypoint.sh`: container entrypoint
 - `scripts/fetch-vault-secrets.sh`: fetch and export runtime secrets
 - `docker-compose.yml`: local deployment template
+
+## Local Setup
+
+For local development without Docker:
+
+```bash
+# Initial setup - install dependencies and verify auth
+./agent-workflow setup
+
+# Load credentials into your shell
+source auth-bootstrap
+```
+
+## Agent Workflow Commands
+
+```bash
+# Setup and authentication
+./agent-workflow setup                    # Install deps, verify auth
+source auth-bootstrap                     # Load Google credentials
+
+# Search and discovery
+./agent-workflow search "resveratrol"     # Search content repo
+./agent-workflow match "spine health"     # Find matching articles
+./agent-workflow tags                     # List all tags with counts
+./agent-workflow tags --suggest "cardio"  # Suggest related tags
+./agent-workflow check-ref "<url>"        # Check if URL already cited
+
+# Email processing
+./agent-workflow queue --topic "health"   # Build queue from Gmail
+./agent-workflow backlog --open-access    # Query stored backlog
+
+# Article operations
+./agent-workflow prepare "<url>"          # Scrape and create new article
+./agent-workflow append "<url>" \         # Append research to existing article
+  --target "path/to/article.md" \
+  --section "Disease / Symptom Treatment" \
+  --subsection "Spine Health" \
+  --apply                                 # Use --apply to write, --commit to git commit
+```
+
+## New Features (2026-03)
+
+### `append` command
+Scrape a URL and append the research to an existing article. Handles:
+- Automatic reference numbering
+- Duplicate reference detection
+- Tag suggestions based on content
+- Section/subsection placement
+- Optional git commit
+
+### `tags` command
+List all tags in the content repo with frequency counts, or suggest tags matching a query.
+
+### `check-ref` command
+Check if a URL is already referenced in any article in the content repo.
+
+### Study Type Detection
+The web-scraper now automatically detects study types (Review, Meta-Analysis, RCT, In Vivo, In Vitro, etc.) from article metadata.
 
 ## Notes
 

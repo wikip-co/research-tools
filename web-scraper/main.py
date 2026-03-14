@@ -55,6 +55,128 @@ UNWANTED_SELECTORS = [
     "figure > figcaption",
 ]
 
+# Study type detection patterns
+STUDY_TYPE_PATTERNS = {
+    # Meta-analyses and systematic reviews (check first - most specific)
+    "Systematic Review and Meta-Analysis": [
+        r"systematic\s+review.*meta[\-\s]?analysis",
+        r"meta[\-\s]?analysis.*systematic\s+review",
+    ],
+    "Meta-Analysis": [
+        r"\bmeta[\-\s]?analysis\b",
+    ],
+    "Systematic Review": [
+        r"\bsystematic\s+review\b",
+    ],
+    # Human studies
+    "Human Study: Randomized Controlled Trial": [
+        r"\brandomized\s+controlled\s+trial\b",
+        r"\brandomised\s+controlled\s+trial\b",
+        r"\brct\b",
+    ],
+    "Human Study: Clinical Trial": [
+        r"\bclinical\s+trial\b",
+        r"\bcontrolled\s+trial\b",
+    ],
+    "Human Study: Cohort Study": [
+        r"\bcohort\s+study\b",
+        r"\bprospective\s+study\b",
+        r"\bretrospective\s+study\b",
+    ],
+    "Human Study: Cross-Sectional": [
+        r"\bcross[\-\s]?sectional\b",
+    ],
+    "Human Study: Case-Control": [
+        r"\bcase[\-\s]?control\b",
+    ],
+    "Human Study: Observational": [
+        r"\bobservational\s+study\b",
+    ],
+    # Animal studies
+    "Animal Study: In Vivo": [
+        r"\bin\s+vivo\b",
+        r"\banimal\s+study\b",
+        r"\banimal\s+model\b",
+        r"\bmouse\s+model\b",
+        r"\brat\s+model\b",
+        r"\bmice\b.*\bstudy\b",
+        r"\brats\b.*\bstudy\b",
+    ],
+    # Cell studies
+    "Cell Study: In Vitro": [
+        r"\bin\s+vitro\b",
+        r"\bcell\s+line\b",
+        r"\bcell\s+culture\b",
+        r"\bcultured\s+cells\b",
+    ],
+    # Reviews (check after more specific types)
+    "Narrative Review": [
+        r"\bnarrative\s+review\b",
+    ],
+    "Review": [
+        r"\breview\b",
+        r"\boverview\b",
+    ],
+    # Computational
+    "Computational Study": [
+        r"\bcomputational\b",
+        r"\bin\s+silico\b",
+        r"\bmolecular\s+docking\b",
+        r"\bnetwork\s+pharmacology\b",
+    ],
+    # Case reports
+    "Case Report": [
+        r"\bcase\s+report\b",
+        r"\bcase\s+series\b",
+    ],
+}
+
+import re as _re
+
+def detect_study_type(
+    title: str,
+    abstract: str,
+    publication_types: list[str],
+    mesh_terms: list[str],
+    body_text: str = "",
+) -> str:
+    """Detect study type from article metadata and content."""
+    # Combine all text sources for pattern matching
+    combined_text = " ".join([
+        title.lower(),
+        abstract.lower(),
+        " ".join(pt.lower() for pt in publication_types),
+        " ".join(mt.lower() for mt in mesh_terms),
+    ])
+
+    # Check publication types first (most reliable for PubMed)
+    pub_types_lower = [pt.lower() for pt in publication_types]
+    if "meta-analysis" in pub_types_lower and "systematic review" in pub_types_lower:
+        return "Systematic Review and Meta-Analysis"
+    if "meta-analysis" in pub_types_lower:
+        return "Meta-Analysis"
+    if "systematic review" in pub_types_lower:
+        return "Systematic Review"
+    if "review" in pub_types_lower:
+        return "Review"
+    if "randomized controlled trial" in pub_types_lower:
+        return "Human Study: Randomized Controlled Trial"
+    if "clinical trial" in pub_types_lower:
+        return "Human Study: Clinical Trial"
+    if "case reports" in pub_types_lower:
+        return "Case Report"
+    if "observational study" in pub_types_lower:
+        return "Human Study: Observational"
+
+    # Pattern matching on combined text
+    for study_type, patterns in STUDY_TYPE_PATTERNS.items():
+        for pattern in patterns:
+            if _re.search(pattern, combined_text, _re.IGNORECASE):
+                return study_type
+
+    # Default
+    return "Research Article"
+
 
 def clean_html(raw_html: str) -> str:
     soup = BeautifulSoup(raw_html, "html.parser")
@@ -98,11 +220,13 @@ def footnote_markdown(data: dict[str, str]) -> str:
     title_link = citation_url(data)
     publication_name = data["journal"] or "Source"
     publication_line = f"**Publication:** [{publication_name}]({data['url']})<br>"
+    study_type_line = f"**Study Type:** {data.get('study_type', 'Research Article')}<br>"
     return "\n".join(
         [
             f"[^1]: **Title:** [{data['title']}]({title_link})<br>",
             publication_line,
             f"**Date:** {data['pub_date'] or 'Unknown'}<br>",
+            study_type_line,
             f"**Author(s):** {data['authors'] or 'Unknown'}<br>",
             f"**Source URL:** [{data['url']}]({data['url']})",
         ]
@@ -121,6 +245,7 @@ def markdown_packet(data: dict[str, str]) -> str:
         f"- **Journal:** {data['journal'] or 'N/A'}\n"
         f"- **Published:** {data['pub_date'] or 'Unknown'}\n"
         f"- **DOI:** {data['doi'] or 'N/A'}\n"
+        f"- **Study Type:** {data.get('study_type', 'Research Article')}\n"
         f"{keywords_section}"
         f"{abstract_section}"
         f"\n## Extracted Content\n\n"
@@ -183,7 +308,35 @@ def scrape_article(url: str) -> dict[str, str]:
     if abstract:
         abstract = BeautifulSoup(abstract, "html.parser").get_text(" ", strip=True)
 
+    # Extract publication types (PubMed-specific)
+    publication_types = []
+    # PubMed uses specific selectors for publication types
+    pub_type_elements = page.css('[data-ga-label="publication_types"] a::text').getall()
+    if pub_type_elements:
+        publication_types = [pt.strip() for pt in pub_type_elements if pt.strip()]
+    # Also check for schema.org metadata
+    if not publication_types:
+        schema_type = page.css('meta[property="og:type"]::attr(content)').get()
+        if schema_type:
+            publication_types = [schema_type.strip()]
+
+    # Extract MeSH terms (PubMed-specific)
+    mesh_terms = []
+    mesh_elements = page.css('[data-ga-label="mesh_terms"] a::text').getall()
+    if mesh_elements:
+        mesh_terms = [mt.strip() for mt in mesh_elements if mt.strip()]
+
     body_markdown = html_to_markdown(clean_html(raw_html))
+
+    # Detect study type
+    study_type = detect_study_type(
+        title=title,
+        abstract=abstract,
+        publication_types=publication_types,
+        mesh_terms=mesh_terms,
+        body_text=body_markdown[:5000],  # First 5000 chars of body
+    )
+
     data = {
         "url": url,
         "title": title.strip(),
@@ -194,6 +347,9 @@ def scrape_article(url: str) -> dict[str, str]:
         "journal": journal.strip(),
         "pub_date": pub_date.strip(),
         "keywords": keywords.strip(),
+        "study_type": study_type,
+        "publication_types": publication_types,
+        "mesh_terms": mesh_terms,
         "scraped_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
     }
     data["reference_url"] = citation_url(data)

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+#
+# auth-bootstrap - Fetch Google OAuth credentials from Vault for gws CLI
+#
+# Usage:
+#   source auth-bootstrap          # Export credentials to current shell
+#   eval "$(./auth-bootstrap)"     # Alternative sourcing method
+#
+# Prerequisites:
+#   - vault CLI installed and configured
+#   - VAULT_ADDR set (or using default)
+#   - Authenticated to Vault (via VAULT_TOKEN or vault login)
+#
+# Vault secret path: secret/Google/oauth/credentials
+# Expected field: google_workspace_cli_credentials_json
+#
+
+set -euo pipefail
+
+VAULT_SECRET_PATH="${VAULT_GOOGLE_SECRET_PATH:-secret/Google/oauth/credentials}"
+VAULT_SECRET_FIELD="${VAULT_SECRET_JSON_KEY:-google_workspace_cli_credentials_json}"
+CREDENTIALS_FILE="${GWS_CREDENTIALS_FILE:-/tmp/gws_credentials_$(id -u).json}"
+
+error() {
+  printf 'auth-bootstrap: %s\n' "$1" >&2
+  exit 1
+}
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    error "Required command not found: $1"
+  fi
+}
+
+main() {
+  require_command vault
+
+  # Check if Vault is accessible
+  if ! vault status >/dev/null 2>&1; then
+    error "Cannot connect to Vault. Check VAULT_ADDR and authentication."
+  fi
+
+  # Fetch credentials from Vault
+  local credentials
+  credentials=$(vault kv get -field="$VAULT_SECRET_FIELD" "$VAULT_SECRET_PATH" 2>/dev/null) || \
+    error "Failed to fetch credentials from Vault at $VAULT_SECRET_PATH"
+
+  if [[ -z "$credentials" ]]; then
+    error "Empty credentials returned from Vault"
+  fi
+
+  # Write credentials to temp file with restricted permissions
+  umask 077
+  printf '%s\n' "$credentials" > "$CREDENTIALS_FILE"
+
+  # Output export statement (for eval or source usage)
+  printf 'export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE="%s"\n' "$CREDENTIALS_FILE"
+
+  # If script is being sourced, also export directly
+  if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+    export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE="$CREDENTIALS_FILE"
+  fi
+
+  printf '# auth-bootstrap: Credentials written to %s\n' "$CREDENTIALS_FILE" >&2
+}
+
+main "$@"
