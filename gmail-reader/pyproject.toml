@@ -1,0 +1,19 @@
+[project]
+name = "gmail-reader"
+version = "0.1.0"
+description = "CLI tool for parsing Google Scholar alert emails from Gmail into SQLite"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.12.3",
+]
+
+[project.scripts]
+gmail-reader = "gmail_reader.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true

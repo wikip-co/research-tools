@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGENT_TOOLS_ROOT="${AGENT_TOOLS_ROOT:-$SCRIPT_DIR}"
+CONTENT_REPO_ROOT="${CONTENT_REPO_ROOT:-$(pwd)}"
+WIKI_AUTOMATION_DIR="$AGENT_TOOLS_ROOT/wiki-automation"
+VALIDATOR="$CONTENT_REPO_ROOT/.github/scripts/validate_content.py"
+DEFAULT_OUTPUT_DIR="${AGENT_OUTPUT_DIR:-$AGENT_TOOLS_ROOT/out}"
+
+require_command() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    printf 'Missing required command: %s\n' "$cmd" >&2
+    exit 1
+  fi
+}
+
+require_file() {
+  local path="$1"
+  local label="$2"
+  if [[ ! -f "$path" ]]; then
+    printf 'Missing %s: %s\n' "$label" "$path" >&2
+    exit 1
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  agent-workflow backlog [wiki-automation backlog args...]
+  agent-workflow queue [wiki-automation queue args...]
+  agent-workflow match "<title or topic>" [wiki-automation match args...]
+  agent-workflow search "<query>" [wiki-automation search args...]
+  agent-workflow prepare "<url>" [wiki-automation prepare args...]
+  agent-workflow validate [validator args...]
+  agent-workflow help
+EOF
+}
+
+run_queue() {
+  require_command uv
+
+  local gmail_query="label:inbox newer_than:1d"
+  local days_back="1"
+  local max_messages="25"
+  local max_results="10"
+  local output_dir="$DEFAULT_OUTPUT_DIR"
+
+  local passthrough=()
+  while (($#)); do
+    case "$1" in
+      --gmail-query|--days-back|--max-messages|--max-results|--output-dir)
+        if (($# < 2)); then
+          printf 'Missing value for %s\n' "$1" >&2
+          exit 1
+        fi
+        case "$1" in
+          --gmail-query) gmail_query="$2" ;;
+          --days-back) days_back="$2" ;;
+          --max-messages) max_messages="$2" ;;
+          --max-results) max_results="$2" ;;
+          --output-dir) output_dir="$2" ;;
+        esac
+        shift 2
+        ;;
+      *)
+        passthrough+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
+    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation queue \
+      --gmail-query "$gmail_query" \
+      --days-back "$days_back" \
+      --max-messages "$max_messages" \
+      --max-results "$max_results" \
+      --output-dir "$output_dir" \
+      "${passthrough[@]}"
+}
+
+run_match() {
+  require_command uv
+  if (($# < 1)); then
+    printf 'match requires a title or topic\n' >&2
+    exit 1
+  fi
+
+  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
+    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation match "$@"
+}
+
+run_search() {
+  require_command uv
+  if (($# < 1)); then
+    printf 'search requires a query\n' >&2
+    exit 1
+  fi
+
+  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
+    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation search "$@"
+}
+
+run_backlog() {
+  require_command uv
+
+  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
+    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation backlog "$@"
+}
+
+run_prepare() {
+  require_command uv
+  if (($# < 1)); then
+    printf 'prepare requires a URL\n' >&2
+    exit 1
+  fi
+
+  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
+    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation prepare "$@"
+}
+
+run_validate() {
+  require_command python3
+  require_file "$VALIDATOR" "content validator"
+  python3 "$VALIDATOR" --repo-root "$CONTENT_REPO_ROOT" "$@"
+}
+
+main() {
+  local command="${1:-help}"
+  if (($# > 0)); then
+    shift
+  fi
+
+  case "$command" in
+    backlog)
+      run_backlog "$@"
+      ;;
+    queue)
+      run_queue "$@"
+      ;;
+    match)
+      run_match "$@"
+      ;;
+    search)
+      run_search "$@"
+      ;;
+    prepare)
+      run_prepare "$@"
+      ;;
+    validate)
+      run_validate "$@"
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      printf 'Unknown command: %s\n\n' "$command" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,9 @@
+services:
+  image-upload:
+    build:
+      context: .
+    environment:
+      CLOUDINARY_API_KEY: ${CLOUDINARY_API_KEY}
+      CLOUDINARY_API_SECRET: ${CLOUDINARY_API_SECRET}
+      CLOUDINARY_CLOUD_NAME: ${CLOUDINARY_CLOUD_NAME}
+    command: ["--help"]

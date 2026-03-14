@@ -1,0 +1,15 @@
+services:
+  agent-tools:
+    build:
+      context: .
+    image: content-agent-tools:latest
+    env_file:
+      - .env
+    environment:
+      CONTENT_REPO_ROOT: /workspace/content
+      AGENT_TOOLS_ROOT: /opt/content-agent-tools
+      GMAIL_READER_DB: /var/lib/content-agent/gmail-reader/scholar-alerts.db
+    volumes:
+      - ${CONTENT_REPO_HOST_PATH:-../content}:/workspace/content
+      - ${GMAIL_READER_DB_HOST_PATH:-./runtime/gmail-reader}:/var/lib/content-agent/gmail-reader
+    working_dir: /workspace/content

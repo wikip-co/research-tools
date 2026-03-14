@@ -1,0 +1,19 @@
+[project]
+name = "image-upload"
+version = "0.1.0"
+description = "CLI tool for uploading local files to Cloudinary"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cloudinary>=1.44.1",
+]
+
+[project.scripts]
+image-upload = "image_upload.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
