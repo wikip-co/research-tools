@@ -20,20 +20,25 @@ This repository separates the operational tooling from the markdown content repo
 
 ## Required Vault Fields
 
-The bootstrap script expects one Vault secret containing these fields by default:
+The bootstrap can read either one combined secret or separate secrets for each service.
 
-- `google_workspace_cli_credentials_json`
-- `cloudinary_cloud_name`
-- `cloudinary_api_key`
-- `cloudinary_api_secret`
+Default Google secret:
 
-You can override the field names with environment variables in `docker-compose.yml`.
+- Path: `secret/data/Google/oauth`
+- Field: `google_workspace_cli_credentials_json`
+
+Default Cloudinary secret:
+
+- Path: `secret/data/cloudinary`
+- Fields: `cloud_name`, `key`, `secret`
+
+You can override the paths and field names with environment variables.
 
 ## Quick Start
 
 1. Clone your content repo onto the stable machine.
 2. Clone this repo alongside it.
-3. Copy `.env.example` to `.env` and fill in the Vault connection values.
+3. Create a `.env` file in the repo root and fill in the Vault connection values.
 4. Create a host data directory for the SQLite DB.
 5. Start the container:
 
@@ -56,16 +61,24 @@ Important runtime environment variables:
 - `AGENT_TOOLS_ROOT=/opt/content-agent-tools`
 - `GMAIL_READER_DB=/var/lib/content-agent/gmail-reader/scholar-alerts.db`
 - `VAULT_ADDR=https://vault.wikip.co`
-- `VAULT_SECRET_PATH=kv/data/content-agent/prod`
+- `VAULT_GOOGLE_SECRET_PATH=secret/data/Google/oauth`
+- `VAULT_CLOUDINARY_SECRET_PATH=secret/data/cloudinary`
 
 Vault bootstrap variables:
 
 - `VAULT_TOKEN` or `VAULT_TOKEN_FILE`
+- Or `VAULT_USERNAME` plus `VAULT_PASSWORD` or `VAULT_PASSWORD_FILE`
 - `VAULT_KV_VERSION=2`
+- `VAULT_AUTH_PATH=auth/userpass/login`
+- `VAULT_SECRET_PATH`
+- `VAULT_GOOGLE_SECRET_PATH`
+- `VAULT_CLOUDINARY_SECRET_PATH`
 - `VAULT_SECRET_JSON_KEY=google_workspace_cli_credentials_json`
-- `VAULT_CLOUDINARY_CLOUD_NAME_KEY=cloudinary_cloud_name`
-- `VAULT_CLOUDINARY_API_KEY_KEY=cloudinary_api_key`
-- `VAULT_CLOUDINARY_API_SECRET_KEY=cloudinary_api_secret`
+- `VAULT_CLOUDINARY_CLOUD_NAME_KEY=cloud_name`
+- `VAULT_CLOUDINARY_API_KEY_KEY=key`
+- `VAULT_CLOUDINARY_API_SECRET_KEY=secret`
+
+`VAULT_SECRET_PATH` remains as a backward-compatible fallback when both services live in one secret. If no Vault token is provided, the bootstrap script logs in with the `userpass` auth endpoint and uses the returned client token for the secret reads.
 
 ## Layout
 
