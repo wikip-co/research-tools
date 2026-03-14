@@ -15,15 +15,15 @@ It does five things:
 Install the tool itself:
 
 ```bash
-cd .github/agent-tools/wiki-automation
+cd wiki-automation
 uv sync
 ```
 
 The helper shells out to sibling tools, so these also need to be usable:
 
-- `.github/agent-tools/gmail-reader`
-- `.github/agent-tools/web-scraper`
-- `.github/agent-tools/image-upload` when uploading images
+- `gmail-reader`
+- `web-scraper`
+- `image-upload` when uploading images
 
 ## Usage
 
@@ -47,7 +47,7 @@ Build a daily queue from recent Gmail alerts:
 uv run wiki-automation queue \
   --topic "health nutrition" \
   --gmail-query 'label:inbox newer_than:1d' \
-  --output-dir ./.github/agent-tools/wiki-automation/out
+  --output-dir ./out
 ```
 
 Query the existing backlog for the strongest unprocessed open-access candidates:
@@ -92,12 +92,12 @@ The CLI always prints JSON:
 By default packets are written under:
 
 ```bash
-.github/agent-tools/wiki-automation/out
+out
 ```
 
 ## Manual Trigger
 
-For your current workflow, the simpler entrypoint is the repo-level manual launcher:
+For your current workflow, the simpler entrypoint is the repo-level manual launcher in `research-tools`:
 
 ```bash
 ./agent-workflow queue --topic "health nutrition"
@@ -110,7 +110,6 @@ Other common manual commands:
 ./agent-workflow match "postpartum hypertension"
 ./agent-workflow search "postpartum hypertension" --match phrase
 ./agent-workflow prepare "https://example.org/article" --category "Child Development/Infant/Nutrition" --create-new --tag Nutrition
-./agent-workflow validate
 ```
 
 If you want scheduling later, use this launcher rather than scheduling a raw LLM prompt.

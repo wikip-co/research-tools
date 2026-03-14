@@ -169,7 +169,7 @@ Response contract:
 
 Operational notes for agents:
 
-- The default database path is `.github/agent-tools/gmail-reader/data/scholar-alerts.db`.
+- The default database path in the standalone runtime is `/var/lib/content-agent/gmail-reader/scholar-alerts.db`.
 - The tool uses a Gmail search query scoped to Google Scholar alert messages by default.
 - `sync` stores both the source message metadata and every parsed article candidate.
 - Heuristic triage assigns each article one of `selected`, `review`, or `rejected`.
@@ -204,7 +204,7 @@ Useful article columns:
 The default database path is:
 
 ```bash
-.github/agent-tools/gmail-reader/data/scholar-alerts.db
+/var/lib/content-agent/gmail-reader/scholar-alerts.db
 ```
 
 That is fine for active local work, but for long-term storage it is better to keep the authoritative copy somewhere backed up outside the repo working tree.
@@ -232,13 +232,13 @@ For most setups, local primary DB plus NAS backup is safer than using the NAS fi
 This repo includes a simple manual backup script:
 
 ```bash
-.github/agent-tools/gmail-reader/backup-db.sh
+gmail-reader/backup-db.sh
 ```
 
 Run it from the tool directory:
 
 ```bash
-cd .github/agent-tools/gmail-reader
+cd gmail-reader
 bash ./backup-db.sh
 ```
 

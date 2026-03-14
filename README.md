@@ -90,4 +90,4 @@ Vault bootstrap variables:
 ## Notes
 
 - Use a single active writer for the SQLite DB. Do not run multiple containers on multiple machines against the same database file at the same time.
-- The content validator still lives in the mounted content repo at `.github/scripts/validate_content.py`.
+- The content repo no longer needs to carry in-repo agent tooling.

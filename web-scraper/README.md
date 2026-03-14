@@ -4,21 +4,21 @@ This tool scrapes a URL and returns structured JSON for downstream repository up
 
 ## Location
 
-`.github/agent-tools/web-scraper`
+`research-tools/web-scraper`
 
 ## Run
 
 Using `uv` (preferred):
 
 ```bash
-cd .github/agent-tools/web-scraper
+cd web-scraper
 uv run main.py "<URL>" --output "<output_file.md>"
 ```
 
 Using `pip` + `python`:
 
 ```bash
-cd .github/agent-tools/web-scraper
+cd web-scraper
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -28,7 +28,7 @@ python3 main.py "<URL>" "<output_file.md>"
 ## Example
 
 ```bash
-cd .github/agent-tools/web-scraper
+cd web-scraper
 uv run main.py "https://example.org/article" --output "../../Current Events/Research/article-review.md"
 ```
 

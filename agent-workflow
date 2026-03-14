@@ -6,22 +6,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_TOOLS_ROOT="${AGENT_TOOLS_ROOT:-$SCRIPT_DIR}"
 CONTENT_REPO_ROOT="${CONTENT_REPO_ROOT:-$(pwd)}"
 WIKI_AUTOMATION_DIR="$AGENT_TOOLS_ROOT/wiki-automation"
-VALIDATOR="$CONTENT_REPO_ROOT/.github/scripts/validate_content.py"
 DEFAULT_OUTPUT_DIR="${AGENT_OUTPUT_DIR:-$AGENT_TOOLS_ROOT/out}"
 
 require_command() {
   local cmd="$1"
   if ! command -v "$cmd" >/dev/null 2>&1; then
     printf 'Missing required command: %s\n' "$cmd" >&2
-    exit 1
-  fi
-}
-
-require_file() {
-  local path="$1"
-  local label="$2"
-  if [[ ! -f "$path" ]]; then
-    printf 'Missing %s: %s\n' "$label" "$path" >&2
     exit 1
   fi
 }
@@ -34,7 +24,6 @@ Usage:
   agent-workflow match "<title or topic>" [wiki-automation match args...]
   agent-workflow search "<query>" [wiki-automation search args...]
   agent-workflow prepare "<url>" [wiki-automation prepare args...]
-  agent-workflow validate [validator args...]
   agent-workflow help
 EOF
 }
@@ -122,12 +111,6 @@ run_prepare() {
     uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation prepare "$@"
 }
 
-run_validate() {
-  require_command python3
-  require_file "$VALIDATOR" "content validator"
-  python3 "$VALIDATOR" --repo-root "$CONTENT_REPO_ROOT" "$@"
-}
-
 main() {
   local command="${1:-help}"
   if (($# > 0)); then
@@ -149,9 +132,6 @@ main() {
       ;;
     prepare)
       run_prepare "$@"
-      ;;
-    validate)
-      run_validate "$@"
       ;;
     help|-h|--help)
       usage
