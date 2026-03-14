@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     AGENT_TOOLS_ROOT=/opt/content-agent-tools \
     CONTENT_REPO_ROOT=/workspace/content \
     GMAIL_READER_DB=/var/lib/content-agent/gmail-reader/scholar-alerts.db \
-    PATH=/opt/content-agent-tools:$PATH
+    PATH=/opt/content-agent-tools:${PATH}
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
