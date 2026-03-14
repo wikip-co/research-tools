@@ -34,7 +34,8 @@ RUN chmod +x /opt/content-agent-tools/agent-workflow /opt/content-agent-tools/sc
     && uv sync --directory /opt/content-agent-tools/wiki-automation --frozen \
     && uv sync --directory /opt/content-agent-tools/image-upload --frozen \
     && uv sync --directory /opt/content-agent-tools/web-scraper --frozen \
-    && /opt/content-agent-tools/web-scraper/.venv/bin/playwright install --with-deps chromium
+    && /opt/content-agent-tools/web-scraper/.venv/bin/playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
 
 ENTRYPOINT ["/opt/content-agent-tools/scripts/entrypoint.sh"]
 CMD ["agent-workflow", "help"]
