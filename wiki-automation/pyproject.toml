@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "Automation helpers for the content repo agent workflow"
 readme = "README.md"
 requires-python = ">=3.11"
+dependencies = [
+    "PyYAML>=6.0.2",
+    "content-agent-core",
+]
 
 [project.scripts]
 wiki-automation = "wiki_automation.cli:main"
@@ -14,3 +18,6 @@ build-backend = "hatchling.build"
 
 [tool.uv]
 package = true
+
+[tool.uv.sources]
+content-agent-core = { workspace = true }

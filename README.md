@@ -8,15 +8,15 @@ This repository separates the operational tooling from the markdown content repo
 
 - `gmail-reader`: read Google Scholar alert mail via `gws` and store results in SQLite
 - `wiki-automation`: build queues, search content, and prepare scrape packets
-- `image-upload`: upload article images to Cloudinary
-- `web-scraper`: scrape source URLs into structured packets
+- `image-upload`: upload article images to Cloudinary, including browser-captured screenshots
+- `web-scraper`: scrape source URLs into structured packets, with optional `agent-browser` fallback
 
 ## Runtime Model
 
 - The content repo is mounted read-write at `/workspace/content`
 - The SQLite DB is mounted from the host at `/var/lib/content-agent/gmail-reader`
 - Secrets are pulled from `vault.wikip.co` at container start
-- `gws` is installed in the image with `npm install -g @googleworkspace/cli`
+- `gws` and `agent-browser` are installed in the image with `npm install -g`
 
 ## Required Vault Fields
 
@@ -24,8 +24,9 @@ The bootstrap can read either one combined secret or separate secrets for each s
 
 Default Google secret:
 
-- Path: `secret/data/Google/oauth`
-- Field: `google_workspace_cli_credentials_json`
+- Preferred path: `secret/data/Google/oauth/credentials`
+- Fallback path also supported: `secret/data/Google/oauth`
+- Preferred field: `google_workspace_cli_credentials_json`
 
 Default Cloudinary secret:
 
@@ -61,7 +62,7 @@ Important runtime environment variables:
 - `AGENT_TOOLS_ROOT=/opt/content-agent-tools`
 - `GMAIL_READER_DB=/var/lib/content-agent/gmail-reader/scholar-alerts.db`
 - `VAULT_ADDR=https://vault.wikip.co`
-- `VAULT_GOOGLE_SECRET_PATH=secret/data/Google/oauth`
+- `VAULT_GOOGLE_SECRET_PATH=secret/data/Google/oauth/credentials`
 - `VAULT_CLOUDINARY_SECRET_PATH=secret/data/cloudinary`
 
 Vault bootstrap variables:
@@ -100,11 +101,28 @@ For local development without Docker:
 source auth-bootstrap
 ```
 
+Local workflow note:
+
+- `agent-workflow` no longer searches or edits the `research-tools` checkout by default.
+- If `CONTENT_REPO_ROOT` is not explicitly set, it now uses a managed working copy at `runtime/content-repo`.
+- On first use it clones from `CONTENT_REPO_SOURCE_PATH` when available, otherwise from `CONTENT_REPO_GIT_URL`.
+
+The local bash entrypoints (`agent-workflow`, `auth-bootstrap`, and `scripts/fetch-vault-secrets.sh`) now parse the repo `.env` safely when present. `image-upload` also reads `.env` directly and can bootstrap Cloudinary credentials from Vault when only the Vault settings are present.
+
+For workspace-level setup and CI-aligned installs:
+
+```bash
+uv sync --all-packages
+make test
+```
+
 ## Agent Workflow Commands
 
 ```bash
 # Setup and authentication
 ./agent-workflow setup                    # Install deps, verify auth
+./agent-workflow doctor                   # JSON environment and repo health check
+./agent-workflow sync-content-repo        # Refresh the managed content repo clone
 source auth-bootstrap                     # Load Google credentials
 
 # Search and discovery
@@ -112,20 +130,47 @@ source auth-bootstrap                     # Load Google credentials
 ./agent-workflow match "spine health"     # Find matching articles
 ./agent-workflow tags                     # List all tags with counts
 ./agent-workflow tags --suggest "cardio"  # Suggest related tags
+./agent-workflow audit-tags               # Find tag normalization conflicts
+./agent-workflow lint-frontmatter         # Scan content markdown frontmatter
 ./agent-workflow check-ref "<url>"        # Check if URL already cited
+./agent-workflow check-duplicate-paper "<url-or-doi>"
 
 # Email processing
 ./agent-workflow queue --topic "health"   # Build queue from Gmail
 ./agent-workflow backlog --open-access    # Query stored backlog
 
 # Article operations
+./agent-workflow intake "<url-or-pdf>"    # Scrape + dedupe + match + optional archive
+./agent-workflow ingest-paper "<url-or-pdf>" --archive
 ./agent-workflow prepare "<url>"          # Scrape and create new article
 ./agent-workflow append "<url>" \         # Append research to existing article
   --target "path/to/article.md" \
   --section "Disease / Symptom Treatment" \
   --subsection "Spine Health" \
   --apply                                 # Use --apply to write, --commit to git commit
+./agent-workflow archive-source "<url-or-file>"
+./agent-workflow open-pr --fill
+./agent-workflow publish-pr --draft
 ```
+
+## Publishing Through Content
+
+The intended workflow is:
+
+1. Use these tools to decide whether a source belongs in an existing article or a new markdown page in `content`.
+2. Write only to the `content` repo.
+3. Commit on a branch and open a PR in `content`.
+4. After merge to `content/main`, that repo triggers downstream site rebuilds such as `wikip.co`.
+
+Agents should not write generated HTML directly. The static site and Cloudflare deployment path is downstream from `content`.
+
+For a task like "analyze a PDF and incorporate the findings into the content repo":
+
+- Search or match first to avoid creating duplicate pages.
+- Preserve the repo's existing markdown and footnote style.
+- Cite each published claim with the appropriate footnote.
+- Add or update the article reference list.
+- Open the PR in `content`, not in `wikip.co`.
 
 ## New Features (2026-03)
 
@@ -145,6 +190,29 @@ Check if a URL is already referenced in any article in the content repo.
 
 ### Study Type Detection
 The web-scraper now automatically detects study types (Review, Meta-Analysis, RCT, In Vivo, In Vitro, etc.) from article metadata.
+
+### Browser Fallback and Screenshots
+- `web-scraper` supports `--agent-browser-mode auto|off|force` for pages that need a browser-rendered fallback
+- `image-upload --capture-url "<url>"` captures a browser screenshot, uploads it to Cloudinary, and returns the hosted URLs in JSON
+
+### PDF Intake and Source Archiving
+- `web-scraper` now accepts local PDFs and PDF URLs in addition to HTML URLs
+- `wiki-automation ingest-paper "<url-or-pdf>"` emits a normalized packet with match suggestions
+- `wiki-automation intake "<url-or-pdf>"` performs scrape, duplicate checks, content matching, and optional archiving without modifying content
+- `wiki-automation archive-source "<url-or-file>"` stores a raw snapshot for provenance and records it in the paper index
+
+### Canonical Paper Tracking
+- `gmail-reader` now maintains a `papers` table alongside alert occurrences
+- Paper records now track workflow state (`discovered`, `scraped`, `matched`, `drafted`, `committed`, `pr_open`, `merged`) plus archive state and git metadata
+- `gmail-reader papers`, `find-paper`, `set-paper-state`, `mark-published`, and `attach-archive` expose that state to agents
+
+### PR Publication Workflow
+- `wiki-automation publish-pr` creates or reuses a branch, commits changed article markdown, pushes, and opens a PR
+- The publish workflow advances matched papers from `drafted` to `committed` to `pr_open` based on the affected article paths
+
+### Workspace and CI
+- The repo now has a root `uv` workspace, root `uv.lock`, `Makefile`, and GitHub Actions CI
+- Runtime DB files are ignored by default and the checked-in SQLite database has been removed from source control
 
 ## Notes
 

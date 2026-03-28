@@ -19,7 +19,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv
-RUN npm install -g @googleworkspace/cli
+RUN npm install -g @googleworkspace/cli agent-browser@0.23.0
+RUN agent-browser install --with-deps
 
 WORKDIR /opt/content-agent-tools
 COPY gmail-reader ./gmail-reader

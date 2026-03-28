@@ -48,9 +48,9 @@ It supports two modes:
    - Keep references aligned with the source article
    - If the article is new, include the uploaded thumbnail metadata
 
-6. **Future Archive Step**
+6. **Archive Step**
    - Store downloaded PDFs or source snapshots for long-term provenance
-   - This is not implemented yet, but the workflow should preserve article URLs and PDF URLs now so the archive step can be added later
+   - Archive data now lives alongside canonical paper records so the agent can prove what source was used later
 
 ## Recommended Command Patterns
 

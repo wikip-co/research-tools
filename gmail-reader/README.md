@@ -8,6 +8,8 @@ Small CLI tool for agent-friendly ingestion of Google Scholar alert emails from 
 - Parses each alert email into structured article candidates
 - Runs a first-pass heuristic triage to keep obviously relevant studies and filter noisy matches
 - Stores message history and article candidates in SQLite for later processing
+- Maintains canonical `papers` records so publish/archive state can survive repeated Scholar alerts
+- Tracks each paper through a workflow lifecycle from discovery to merged PR
 
 ## Important Framing
 
@@ -159,6 +161,13 @@ Supported command patterns:
 - List stored articles: `gmail-reader articles [--status selected|review|rejected|all] [--alert-name NAME] [--limit N] [--db PATH]`
 - Curate a recent topic-focused subset: `gmail-reader curate --topic "strawberry muscle mass" [--days-back N | --after YYYY-MM-DD] [--max-messages N] [--max-results N] [--query QUERY] [--db PATH]`
 - Search recent Scholar mail with arbitrary Gmail filters: `gmail-reader search [--gmail-query QUERY] [--topic TOPIC] [--days-back N | --after YYYY-MM-DD] [--before YYYY-MM-DD] [--max-messages N] [--max-results N] [--include-review] [--save] [--query QUERY] [--db PATH]`
+- List canonical papers: `gmail-reader papers [--status all|matched|unmatched|archived|unarchived] [--limit N] [--db PATH]`
+- Filter papers by workflow state: `gmail-reader papers [--workflow-state discovered|scraped|matched|drafted|committed|pr_open|merged]`
+- Find a paper: `gmail-reader find-paper <identifier> [--db PATH]`
+- Upsert a paper: `gmail-reader upsert-paper --title TITLE [--url URL] [--doi DOI] [--pmid PMID] [--workflow-state STATE] [--matched-content-path PATH] [--db PATH]`
+- Advance a paper: `gmail-reader set-paper-state <identifier> --state discovered|scraped|matched|drafted|committed|pr_open|merged [--matched-content-path PATH] [--commit SHA] [--pr URL] [--archive-path PATH] [--db PATH]`
+- Mark a paper as published/matched: `gmail-reader mark-published <identifier> --matched-content-path PATH [--commit SHA] [--pr URL] [--db PATH]`
+- Attach an archive path: `gmail-reader attach-archive <identifier> --archive-path PATH [--db PATH]`
 
 Response contract:
 
@@ -174,7 +183,8 @@ Operational notes for agents:
 - `sync` stores both the source message metadata and every parsed article candidate.
 - Heuristic triage assigns each article one of `selected`, `review`, or `rejected`.
 - `selected` is the working queue for downstream article processing.
-- Duplicate article candidates are deduplicated by alert name plus normalized title plus source URL.
+- Alert occurrences remain separate, but canonical paper state is tracked in the `papers` table.
+- Workflow state now distinguishes `scraped`, `matched`, `drafted`, `committed`, `pr_open`, and `merged` instead of treating all downstream work as simply "processed".
 - `curate` does not depend on the stored triage alone; it re-reads a small recent mail window and returns parsed candidates that match the requested topic.
 - This is intended for agent judgment on narrow user requests such as "today's strawberries research" or "three quality URLs from today's inbox".
 - `search` is the more general on-demand entrypoint for agents. It lets the agent combine Gmail search operators like `label:inbox`, `newer_than:1d`, or quoted phrases with optional topic ranking.
@@ -182,10 +192,11 @@ Operational notes for agents:
 
 ## SQLite Schema Summary
 
-The database contains two main tables:
+The database contains three main tables:
 
 - `messages`: one row per ingested Gmail message
 - `articles`: one row per parsed Scholar result with triage fields and source links
+- `papers`: one row per canonical paper identity with publish/archive state
 
 Useful article columns:
 

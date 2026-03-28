@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 
+from .browser_capture import capture_page_screenshot, cleanup_capture
 from .uploader import upload_file
 
 
@@ -12,6 +13,30 @@ def build_parser() -> argparse.ArgumentParser:
         description="Upload a local image or video file to Cloudinary."
     )
     parser.add_argument("file", nargs="?", help="Path to the local file to upload")
+    parser.add_argument(
+        "--capture-url",
+        help="Capture a browser screenshot of a URL and upload the image to Cloudinary.",
+    )
+    parser.add_argument(
+        "--capture-output",
+        help="Optional local path or directory for the captured screenshot. If omitted, a temporary file is used.",
+    )
+    parser.add_argument(
+        "--full-page",
+        action="store_true",
+        help="Capture a full-page screenshot when using --capture-url.",
+    )
+    parser.add_argument(
+        "--annotate",
+        action="store_true",
+        help="Annotate interactive elements in the screenshot when using --capture-url.",
+    )
+    parser.add_argument(
+        "--wait-ms",
+        type=int,
+        default=1500,
+        help="Extra wait time after navigation before taking a screenshot.",
+    )
     parser.add_argument("--folder", help="Optional Cloudinary folder")
     parser.add_argument("--public-id", help="Optional Cloudinary public ID")
     parser.add_argument(
@@ -78,6 +103,11 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        if args.capture_url and args.file:
+            parser.error("use either a local file argument or --capture-url, not both")
+        if args.capture_url and (args.search_prefix or args.search_tag or args.download or args.check_only):
+            parser.error("--capture-url cannot be combined with search, download, or check-only modes")
+
         if args.search_prefix or args.search_tag:
             from .uploader import list_assets
 
@@ -123,17 +153,49 @@ def main() -> int:
             print(json.dumps({"ok": True, "result": result}, indent=2))
             return 0
 
-        if not args.file:
-            parser.error("the following arguments are required: file")
+        if args.capture_url:
+            capture = capture_page_screenshot(
+                args.capture_url,
+                output_path=args.capture_output,
+                basename=args.public_id,
+                full_page=args.full_page,
+                annotate=args.annotate,
+                wait_ms=args.wait_ms,
+            )
+            try:
+                result = upload_file(
+                    capture["local_path"],
+                    folder=args.folder,
+                    public_id=args.public_id,
+                    tags=args.tags,
+                    overwrite=args.overwrite,
+                    validate_url=args.validate_url,
+                )
+            finally:
+                cleanup_capture(capture)
 
-        result = upload_file(
-            args.file,
-            folder=args.folder,
-            public_id=args.public_id,
-            tags=args.tags,
-            overwrite=args.overwrite,
-            validate_url=args.validate_url,
-        )
+            result["capture"] = {
+                "requested_url": capture["requested_url"],
+                "final_url": capture["final_url"],
+                "page_title": capture["page_title"],
+                "local_path": None if capture["temporary"] else capture["local_path"],
+                "full_page": capture["full_page"],
+                "annotate": capture["annotate"],
+                "wait_ms": capture["wait_ms"],
+                "captured_bytes": capture["bytes"],
+            }
+        else:
+            if not args.file:
+                parser.error("the following arguments are required: file")
+
+            result = upload_file(
+                args.file,
+                folder=args.folder,
+                public_id=args.public_id,
+                tags=args.tags,
+                overwrite=args.overwrite,
+                validate_url=args.validate_url,
+            )
     except Exception as exc:
         print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
         return 1

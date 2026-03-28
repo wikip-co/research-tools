@@ -4,9 +4,128 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_TOOLS_ROOT="${AGENT_TOOLS_ROOT:-$SCRIPT_DIR}"
-CONTENT_REPO_ROOT="${CONTENT_REPO_ROOT:-$(pwd)}"
 WIKI_AUTOMATION_DIR="$AGENT_TOOLS_ROOT/wiki-automation"
 DEFAULT_OUTPUT_DIR="${AGENT_OUTPUT_DIR:-$AGENT_TOOLS_ROOT/out}"
+CONTENT_REPO_MANAGED_ROOT="${CONTENT_REPO_MANAGED_ROOT:-$AGENT_TOOLS_ROOT/runtime/content-repo}"
+CONTENT_REPO_SOURCE_PATH="${CONTENT_REPO_SOURCE_PATH:-}"
+CONTENT_REPO_GIT_URL="${CONTENT_REPO_GIT_URL:-}"
+CONTENT_REPO_REF="${CONTENT_REPO_REF:-main}"
+CONTENT_REPO_ROOT="${CONTENT_REPO_ROOT:-}"
+
+load_dotenv() {
+  local candidate raw_line line key value
+  for candidate in "$SCRIPT_DIR/.env" "$PWD/.env"; do
+    if [[ -f "$candidate" ]]; then
+      while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+        line="${raw_line#"${raw_line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        if [[ -z "$line" || "$line" == \#* ]]; then
+          continue
+        fi
+        if [[ "$line" == export\ * ]]; then
+          line="${line#export }"
+        fi
+        if [[ "$line" != *=* ]]; then
+          continue
+        fi
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ ${#value} -ge 2 ]]; then
+          if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+            value="${value:1:${#value}-2}"
+          elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+            value="${value:1:${#value}-2}"
+          fi
+        fi
+        if [[ -n "$key" && -z "${!key:-}" ]]; then
+          export "$key=$value"
+        fi
+      done <"$candidate"
+      return
+    fi
+  done
+}
+
+load_dotenv
+
+default_content_source_path() {
+  local candidate="$SCRIPT_DIR/../content"
+  if [[ -d "$candidate/.git" ]]; then
+    (cd "$candidate" && pwd)
+  fi
+}
+
+resolve_content_repo_source() {
+  if [[ -n "$CONTENT_REPO_SOURCE_PATH" ]]; then
+    printf '%s\n' "$CONTENT_REPO_SOURCE_PATH"
+    return
+  fi
+  default_content_source_path
+}
+
+is_git_repo() {
+  local path="$1"
+  [[ -d "$path" ]] && git -C "$path" rev-parse --git-dir >/dev/null 2>&1
+}
+
+ensure_content_repo_ready() {
+  local source_path
+  if [[ -n "$CONTENT_REPO_ROOT" ]]; then
+    if ! is_git_repo "$CONTENT_REPO_ROOT"; then
+      printf 'Configured CONTENT_REPO_ROOT is not a git repo: %s\n' "$CONTENT_REPO_ROOT" >&2
+      exit 1
+    fi
+    export CONTENT_REPO_ROOT
+    return
+  fi
+
+  CONTENT_REPO_ROOT="$CONTENT_REPO_MANAGED_ROOT"
+  if is_git_repo "$CONTENT_REPO_ROOT"; then
+    export CONTENT_REPO_ROOT
+    return
+  fi
+
+  source_path="$(resolve_content_repo_source)"
+  mkdir -p "$(dirname "$CONTENT_REPO_ROOT")"
+
+  if [[ -n "$source_path" && -d "$source_path/.git" ]]; then
+    require_command git
+    git clone --local --no-hardlinks "$source_path" "$CONTENT_REPO_ROOT" >/dev/null 2>&1
+    export CONTENT_REPO_ROOT
+    return
+  fi
+
+  if [[ -n "$CONTENT_REPO_GIT_URL" ]]; then
+    require_command git
+    git clone --branch "$CONTENT_REPO_REF" "$CONTENT_REPO_GIT_URL" "$CONTENT_REPO_ROOT" >/dev/null 2>&1
+    export CONTENT_REPO_ROOT
+    return
+  fi
+
+  cat >&2 <<EOF
+Content repo is not configured.
+Set one of:
+  CONTENT_REPO_ROOT=/path/to/working-copy
+  CONTENT_REPO_SOURCE_PATH=/path/to/source-repo
+  CONTENT_REPO_GIT_URL=https://...
+EOF
+  exit 1
+}
+
+sync_content_repo() {
+  ensure_content_repo_ready
+  require_command git
+
+  if [[ -n "$CONTENT_REPO_REF" ]]; then
+    git -C "$CONTENT_REPO_ROOT" fetch --all --prune >/dev/null 2>&1 || true
+    git -C "$CONTENT_REPO_ROOT" checkout "$CONTENT_REPO_REF" >/dev/null 2>&1 || true
+    git -C "$CONTENT_REPO_ROOT" pull --ff-only >/dev/null 2>&1 || true
+  fi
+}
 
 require_command() {
   local cmd="$1"
@@ -20,14 +139,24 @@ usage() {
   cat <<'EOF'
 Usage:
   agent-workflow setup                              # Install dependencies and verify auth
+  agent-workflow doctor                             # JSON health check for tooling and repo wiring
+  agent-workflow sync-content-repo                  # Refresh the managed content repo clone
   agent-workflow backlog [wiki-automation backlog args...]
   agent-workflow queue [wiki-automation queue args...]
   agent-workflow match "<title or topic>" [wiki-automation match args...]
   agent-workflow search "<query>" [wiki-automation search args...]
   agent-workflow prepare "<url>" [wiki-automation prepare args...]
+  agent-workflow intake "<url-or-pdf>" [wiki-automation intake args...]
+  agent-workflow ingest-paper "<source>" [wiki-automation ingest-paper args...]
   agent-workflow append "<url>" --target "<path>" [wiki-automation append args...]
   agent-workflow tags [--suggest "<query>"] [--limit N]
+  agent-workflow audit-tags [wiki-automation audit-tags args...]
+  agent-workflow lint-frontmatter [wiki-automation lint-frontmatter args...]
   agent-workflow check-ref "<url>"
+  agent-workflow check-duplicate-paper "<identifier>"
+  agent-workflow archive-source "<source>" [wiki-automation archive-source args...]
+  agent-workflow open-pr [wiki-automation open-pr args...]
+  agent-workflow publish-pr [wiki-automation publish-pr args...]
   agent-workflow help
 
 Authentication:
@@ -35,8 +164,15 @@ Authentication:
 EOF
 }
 
-run_queue() {
+run_wiki_command() {
   require_command uv
+  ensure_content_repo_ready
+  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
+    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation "$@"
+}
+
+run_queue() {
+  ensure_content_repo_ready
 
   local gmail_query="label:inbox newer_than:1d"
   local days_back="1"
@@ -68,93 +204,196 @@ run_queue() {
     esac
   done
 
-  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
-    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation queue \
-      --gmail-query "$gmail_query" \
-      --days-back "$days_back" \
-      --max-messages "$max_messages" \
-      --max-results "$max_results" \
-      --output-dir "$output_dir" \
-      "${passthrough[@]}"
+  run_wiki_command queue \
+    --gmail-query "$gmail_query" \
+    --days-back "$days_back" \
+    --max-messages "$max_messages" \
+    --max-results "$max_results" \
+    --output-dir "$output_dir" \
+    "${passthrough[@]}"
 }
 
 run_match() {
-  require_command uv
   if (($# < 1)); then
     printf 'match requires a title or topic\n' >&2
     exit 1
   fi
 
-  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
-    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation match "$@"
+  run_wiki_command match "$@"
 }
 
 run_search() {
-  require_command uv
   if (($# < 1)); then
     printf 'search requires a query\n' >&2
     exit 1
   fi
 
-  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
-    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation search "$@"
+  run_wiki_command search "$@"
 }
 
 run_backlog() {
-  require_command uv
-
-  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
-    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation backlog "$@"
+  run_wiki_command backlog "$@"
 }
 
 run_prepare() {
-  require_command uv
   if (($# < 1)); then
     printf 'prepare requires a URL\n' >&2
     exit 1
   fi
 
-  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
-    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation prepare "$@"
+  run_wiki_command prepare "$@"
+}
+
+run_intake() {
+  if (($# < 1)); then
+    printf 'intake requires a source path or URL\n' >&2
+    exit 1
+  fi
+
+  run_wiki_command intake "$@"
+}
+
+run_ingest_paper() {
+  if (($# < 1)); then
+    printf 'ingest-paper requires a source path or URL\n' >&2
+    exit 1
+  fi
+
+  run_wiki_command ingest-paper "$@"
 }
 
 run_append() {
-  require_command uv
   if (($# < 1)); then
     printf 'append requires a URL\n' >&2
     exit 1
   fi
 
-  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
-    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation append "$@"
+  run_wiki_command append "$@"
 }
 
 run_tags() {
-  require_command uv
+  run_wiki_command tags "$@"
+}
 
-  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
-    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation tags "$@"
+run_audit_tags() {
+  run_wiki_command audit-tags "$@"
+}
+
+run_lint_frontmatter() {
+  run_wiki_command lint-frontmatter "$@"
 }
 
 run_check_ref() {
-  require_command uv
   if (($# < 1)); then
     printf 'check-ref requires a URL\n' >&2
     exit 1
   fi
 
-  CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
-    uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation check-ref "$@"
+  run_wiki_command check-ref "$@"
+}
+
+run_check_duplicate_paper() {
+  if (($# < 1)); then
+    printf 'check-duplicate-paper requires an identifier\n' >&2
+    exit 1
+  fi
+
+  run_wiki_command check-duplicate-paper "$@"
+}
+
+run_archive_source() {
+  if (($# < 1)); then
+    printf 'archive-source requires a source path or URL\n' >&2
+    exit 1
+  fi
+
+  run_wiki_command archive-source "$@"
+}
+
+run_open_pr() {
+  run_wiki_command open-pr "$@"
+}
+
+run_publish_pr() {
+  run_wiki_command publish-pr "$@"
+}
+
+run_doctor() {
+  require_command jq
+  local managed_exists=0 configured_root_exists=0 source_exists=0
+  local resolved_source=""
+  local repo_root_display="${CONTENT_REPO_ROOT:-$CONTENT_REPO_MANAGED_ROOT}"
+
+  if [[ -n "${CONTENT_REPO_ROOT:-}" && -d "$CONTENT_REPO_ROOT" ]]; then
+    configured_root_exists=1
+  fi
+  if is_git_repo "$CONTENT_REPO_MANAGED_ROOT"; then
+    managed_exists=1
+  fi
+  resolved_source="$(resolve_content_repo_source)"
+  if [[ -n "$resolved_source" && -d "$resolved_source" ]]; then
+    source_exists=1
+  fi
+
+  jq -n \
+    --arg agent_tools_root "$AGENT_TOOLS_ROOT" \
+    --arg content_repo_root "$repo_root_display" \
+    --arg managed_root "$CONTENT_REPO_MANAGED_ROOT" \
+    --arg source_path "$resolved_source" \
+    --arg git_url "${CONTENT_REPO_GIT_URL:-}" \
+    --arg ref "$CONTENT_REPO_REF" \
+    --arg gmail_db "${GMAIL_READER_DB:-}" \
+    --argjson uv "$(command -v uv >/dev/null 2>&1 && printf 'true' || printf 'false')" \
+    --argjson gh "$(command -v gh >/dev/null 2>&1 && printf 'true' || printf 'false')" \
+    --argjson gws "$(command -v gws >/dev/null 2>&1 && printf 'true' || printf 'false')" \
+    --argjson git "$(command -v git >/dev/null 2>&1 && printf 'true' || printf 'false')" \
+    --argjson vault "$(command -v vault >/dev/null 2>&1 && printf 'true' || printf 'false')" \
+    --argjson agent_browser "$(command -v agent-browser >/dev/null 2>&1 && printf 'true' || printf 'false')" \
+    --argjson configured_root_exists "$([[ "$configured_root_exists" -eq 1 ]] && printf 'true' || printf 'false')" \
+    --argjson managed_root_exists "$([[ "$managed_exists" -eq 1 ]] && printf 'true' || printf 'false')" \
+    --argjson source_exists "$([[ "$source_exists" -eq 1 ]] && printf 'true' || printf 'false')" \
+    --argjson cloudinary_env "$([[ -n "${CLOUDINARY_CLOUD_NAME:-}" && -n "${CLOUDINARY_API_KEY:-}" && -n "${CLOUDINARY_API_SECRET:-}" ]] && printf 'true' || printf 'false')" \
+    --argjson google_env "$([[ -n "${GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE:-}" ]] && printf 'true' || printf 'false')" \
+    '{
+      ok: true,
+      result: {
+        commands: {
+          uv: $uv,
+          gh: $gh,
+          gws: $gws,
+          git: $git,
+          vault: $vault,
+          agent_browser: $agent_browser
+        },
+        paths: {
+          agent_tools_root: $agent_tools_root,
+          content_repo_root: $content_repo_root,
+          managed_content_repo_root: $managed_root,
+          content_repo_source_path: $source_path,
+          content_repo_git_url: $git_url,
+          content_repo_ref: $ref,
+          gmail_reader_db: $gmail_db
+        },
+        status: {
+          configured_content_repo_exists: $configured_root_exists,
+          managed_content_repo_exists: $managed_root_exists,
+          source_content_repo_exists: $source_exists,
+          cloudinary_env_loaded: $cloudinary_env,
+          google_env_loaded: $google_env
+        }
+      }
+    }'
 }
 
 run_setup() {
   local errors=0
+  local source_path=""
 
   printf 'Setting up research-tools...\n\n'
 
   # Check required commands
   printf '==> Checking required commands...\n'
-  for cmd in uv vault gws; do
+  for cmd in uv git vault gws jq; do
     if command -v "$cmd" >/dev/null 2>&1; then
       printf '  ✓ %s found\n' "$cmd"
     else
@@ -166,18 +405,31 @@ run_setup() {
 
   # Sync dependencies for each tool
   printf '==> Installing tool dependencies...\n'
-  for tool_dir in gmail-reader wiki-automation web-scraper image-upload; do
-    local dir="$AGENT_TOOLS_ROOT/$tool_dir"
-    if [[ -d "$dir" ]]; then
-      printf '  → %s: ' "$tool_dir"
-      if (cd "$dir" && uv sync --quiet 2>/dev/null); then
-        printf 'OK\n'
-      else
-        printf 'FAILED\n'
-        ((errors++))
-      fi
+  printf '  → workspace: '
+  if (cd "$AGENT_TOOLS_ROOT" && uv sync --all-packages --quiet 2>/dev/null); then
+    printf 'OK\n'
+  else
+    printf 'FAILED\n'
+    ((errors++))
+  fi
+  printf '\n'
+
+  # Ensure the managed content repo exists for local workflows.
+  printf '==> Checking content repo...\n'
+  source_path="$(resolve_content_repo_source)"
+  if ensure_content_repo_ready >/dev/null 2>&1; then
+    printf '  ✓ Working copy ready at %s\n' "$CONTENT_REPO_ROOT"
+  else
+    printf '  ✗ Unable to prepare content repo working copy\n'
+    if [[ -n "$source_path" ]]; then
+      printf '    source path: %s\n' "$source_path"
+    elif [[ -n "$CONTENT_REPO_GIT_URL" ]]; then
+      printf '    git url: %s\n' "$CONTENT_REPO_GIT_URL"
+    else
+      printf '    configure CONTENT_REPO_SOURCE_PATH or CONTENT_REPO_GIT_URL\n'
     fi
-  done
+    ((errors++))
+  fi
   printf '\n'
 
   # Install Playwright browsers for web-scraper
@@ -185,7 +437,7 @@ run_setup() {
   local scraper_dir="$AGENT_TOOLS_ROOT/web-scraper"
   if [[ -d "$scraper_dir" ]]; then
     # Check if already installed
-    if [[ -d "$HOME/.cache/ms-playwright/chromium-"* ]]; then
+    if compgen -G "$HOME/.cache/ms-playwright/chromium-*" >/dev/null; then
       printf '  ✓ Chromium already installed\n'
     elif (cd "$scraper_dir" && uv run playwright install chromium 2>&1 | grep -q -E "(downloaded|already)"); then
       printf '  ✓ Chromium installed\n'
@@ -197,6 +449,15 @@ run_setup() {
         printf '  ⚠ Chromium may need manual installation\n'
       fi
     fi
+  fi
+  printf '\n'
+
+  # Check agent-browser availability for screenshot capture and fallback scraping
+  printf '==> Checking agent-browser...\n'
+  if command -v agent-browser >/dev/null 2>&1; then
+    printf '  ✓ agent-browser found\n'
+  else
+    printf '  ⚠ agent-browser not found (browser screenshots and scrape fallback will be unavailable)\n'
   fi
   printf '\n'
 
@@ -270,8 +531,20 @@ main() {
     search)
       run_search "$@"
       ;;
+    doctor)
+      run_doctor "$@"
+      ;;
+    sync-content-repo)
+      sync_content_repo
+      ;;
     prepare)
       run_prepare "$@"
+      ;;
+    intake)
+      run_intake "$@"
+      ;;
+    ingest-paper)
+      run_ingest_paper "$@"
       ;;
     append)
       run_append "$@"
@@ -279,8 +552,26 @@ main() {
     tags)
       run_tags "$@"
       ;;
+    audit-tags)
+      run_audit_tags "$@"
+      ;;
+    lint-frontmatter)
+      run_lint_frontmatter "$@"
+      ;;
     check-ref)
       run_check_ref "$@"
+      ;;
+    check-duplicate-paper)
+      run_check_duplicate_paper "$@"
+      ;;
+    archive-source)
+      run_archive_source "$@"
+      ;;
+    open-pr)
+      run_open_pr "$@"
+      ;;
+    publish-pr)
+      run_publish_pr "$@"
       ;;
     help|-h|--help)
       usage

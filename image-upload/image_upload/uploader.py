@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import mimetypes
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -10,34 +11,70 @@ from urllib.request import Request, urlopen
 import cloudinary
 import cloudinary.api
 from cloudinary.uploader import upload
+from content_agent_core.dotenv import load_dotenv_files
 
 REQUIRED_ENV_VARS = (
     "CLOUDINARY_CLOUD_NAME",
     "CLOUDINARY_API_KEY",
     "CLOUDINARY_API_SECRET",
 )
+IMAGE_UPLOAD_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = IMAGE_UPLOAD_ROOT.parent
 
 
 def load_dotenv() -> None:
-    candidate_paths = [
-        Path.cwd() / ".env",
-        Path(__file__).resolve().parent.parent / ".env",
+    load_dotenv_files(
+        [
+            Path.cwd() / ".env",
+            IMAGE_UPLOAD_ROOT / ".env",
+            REPO_ROOT / ".env",
+        ]
+    )
+
+
+def bootstrap_cloudinary_from_vault() -> None:
+    if all(os.environ.get(name) for name in REQUIRED_ENV_VARS):
+        return
+
+    fetch_script = REPO_ROOT / "scripts" / "fetch-vault-secrets.sh"
+    if not fetch_script.is_file():
+        return
+
+    env = os.environ.copy()
+    env.setdefault("AGENT_TOOLS_ROOT", str(REPO_ROOT))
+    command = [
+        "bash",
+        "-lc",
+        f'source "{fetch_script}" >/dev/null; env -0',
     ]
 
-    for env_path in candidate_paths:
-        if not env_path.is_file():
-            continue
-        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip())
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=False,
+            env=env,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
         return
+
+    for item in result.stdout.split(b"\0"):
+        if not item or b"=" not in item:
+            continue
+        key_bytes, value_bytes = item.split(b"=", 1)
+        try:
+            key = key_bytes.decode("utf-8")
+            value = value_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if key.startswith("CLOUDINARY_"):
+            os.environ.setdefault(key, value)
 
 
 def configure_cloudinary() -> None:
     load_dotenv()
+    bootstrap_cloudinary_from_vault()
 
     missing = [name for name in REQUIRED_ENV_VARS if not os.environ.get(name)]
     if missing:

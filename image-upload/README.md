@@ -5,6 +5,7 @@ Small CLI tool for agent-friendly Cloudinary image operations. All commands retu
 ## What It Does
 
 - Upload local files to Cloudinary
+- Capture a browser screenshot of a URL and upload it to Cloudinary
 - Check whether an asset already exists by `public_id`
 - Search images by `public_id` prefix or Cloudinary tag
 - Download either the transformed site image or the original uploaded asset
@@ -12,7 +13,8 @@ Small CLI tool for agent-friendly Cloudinary image operations. All commands retu
 ## Setup
 
 The CLI reads credentials from a local `.env` file automatically, or from exported shell variables.
-It looks in the current working directory first and then in the tool directory.
+It looks in the current working directory, then in the tool directory, and then in the repo root.
+If Cloudinary credentials are still missing but the repo `.env` contains Vault settings, it will attempt to bootstrap the Cloudinary variables through `scripts/fetch-vault-secrets.sh`.
 
 Required variables:
 
@@ -52,6 +54,22 @@ Upload into a folder:
 
 ```bash
 uv run image-upload /path/to/photo.jpg --folder agent-uploads --public-id my-photo
+```
+
+Capture a page screenshot and upload it:
+
+```bash
+uv run image-upload --capture-url "https://example.com" --public-id example-domain-shot
+```
+
+Capture a full-page screenshot and keep a local copy:
+
+```bash
+uv run image-upload \
+  --capture-url "https://example.com" \
+  --full-page \
+  --capture-output /tmp/article-shots \
+  --public-id example-domain-full
 ```
 
 Check whether a `public_id` already exists:
@@ -122,6 +140,7 @@ Preferred invocation forms:
 Supported command patterns:
 
 - Upload: `image-upload /path/to/file.jpg [--folder FOLDER] [--public-id ID] [--tag TAG] [--overwrite] [--validate-url]`
+- Capture + upload: `image-upload --capture-url URL [--capture-output PATH] [--full-page] [--annotate] [--wait-ms N] [--folder FOLDER] [--public-id ID] [--tag TAG] [--overwrite] [--validate-url]`
 - Existence check: `image-upload --check-only --public-id ID [--resource-type image|video]`
 - Search by prefix: `image-upload --search-prefix PREFIX [--max-results N] [--resource-type image|video]`
 - Search by tag: `image-upload --search-tag TAG [--max-results N] [--resource-type image|video]`
@@ -139,9 +158,10 @@ Operational notes for agents:
 - `--search-prefix` and `--search-tag` are mutually exclusive.
 - `--check-only` and `--download` both require `--public-id`.
 - Uploads detect resource type automatically.
+- `--capture-url` requires `agent-browser` to be installed and able to launch a browser.
 - Downloads default to the transformed image URL for image assets unless `--download-original` is set.
 - `--resource-type` defaults to `image`.
-- The CLI reads a local `.env` file automatically if present.
+- The CLI reads a local `.env` file automatically if present and can bootstrap Cloudinary credentials from Vault using the repo `.env`.
 - The default image delivery URL format is `https://res.cloudinary.com/<cloud_name>/image/upload/w_200,f_auto/<public_id>`.
 - For new wiki articles, prefer setting frontmatter `image:` explicitly even if the filename-based theme fallback would work.
 

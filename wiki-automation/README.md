@@ -2,13 +2,18 @@
 
 Cron-friendly helper CLI for the content repo's agent workflow.
 
-It does five things:
+It does several things:
 
 - search local markdown content by title, tags, permalink, path, and body
 - build a structured queue from `gmail-reader`
 - query the stored gmail-reader backlog for unprocessed candidate articles
 - match scraped or proposed titles against existing markdown articles
 - prepare a scrape packet and optionally create a new article stub with optional Cloudinary upload
+- ingest a URL or PDF into a normalized packet and optional source archive
+- run an intake workflow that scrapes, checks duplicates, matches content, and optionally archives without modifying content
+- audit tags and lint markdown frontmatter
+- open a PR from the mounted content repo with `gh`
+- publish a PR end-to-end by creating a branch, committing article changes, pushing, and opening the PR
 
 ## Setup
 
@@ -79,6 +84,38 @@ uv run wiki-automation prepare \
   --tag Technology
 ```
 
+Scrape a URL and use a browser screenshot as the article image:
+
+```bash
+uv run wiki-automation prepare \
+  "https://example.org/article" \
+  --category "Current Events/Technology" \
+  --create-new \
+  --image-screenshot \
+  --image-screenshot-full-page \
+  --image-public-id article-slug-shot \
+  --tag Technology
+```
+
+Ingest a local PDF and archive the original source snapshot:
+
+```bash
+uv run wiki-automation ingest-paper /tmp/paper.pdf --archive --output-dir ./out
+```
+
+Run a non-destructive intake pass before choosing append vs new article:
+
+```bash
+uv run wiki-automation intake /tmp/paper.pdf --archive --output-dir ./out
+```
+
+Audit tag variants and frontmatter quality:
+
+```bash
+uv run wiki-automation audit-tags --limit 20
+uv run wiki-automation lint-frontmatter --limit 50
+```
+
 ## Output
 
 The CLI always prints JSON:
@@ -88,6 +125,13 @@ The CLI always prints JSON:
 - `backlog` returns stored gmail-reader candidates filtered for downstream article work
 - `prepare` writes a scrape packet and, when requested, a new article stub in the repo
 - `match` returns scored existing article candidates
+- `ingest-paper` writes a normalized packet for URL/PDF intake and can archive the raw source
+- `intake` writes a packet with scrape data, duplicate checks, content matches, and an action suggestion
+- `archive-source` stores a provenance snapshot and attaches it to the canonical paper record
+- `audit-tags` groups likely-duplicate tags by normalized form
+- `lint-frontmatter` reports invalid YAML, missing titles/tags, duplicate tags, and empty bodies
+- `open-pr` shells out to `gh pr create` from the mounted content repo
+- `publish-pr` creates a branch, commits changed article markdown, pushes, opens a PR, and advances matched papers to `pr_open`
 
 By default packets are written under:
 
@@ -109,7 +153,9 @@ Other common manual commands:
 ./agent-workflow backlog --open-access --min-score 18 --limit 20
 ./agent-workflow match "postpartum hypertension"
 ./agent-workflow search "postpartum hypertension" --match phrase
+./agent-workflow intake "https://example.org/article"
 ./agent-workflow prepare "https://example.org/article" --category "Child Development/Infant/Nutrition" --create-new --tag Nutrition
+./agent-workflow publish-pr --draft
 ```
 
 If you want scheduling later, use this launcher rather than scheduling a raw LLM prompt.

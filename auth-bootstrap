@@ -11,47 +11,191 @@
 #   - VAULT_ADDR set (or using default)
 #   - Authenticated to Vault (via VAULT_TOKEN or vault login)
 #
-# Vault secret path: secret/Google/oauth/credentials
-# Expected field: google_workspace_cli_credentials_json
+# Supported Google secret paths:
+#   - secret/data/Google/oauth/credentials with field google_workspace_cli_credentials_json
+#   - secret/data/Google/oauth with installed/web JSON payloads
 #
+
+__AUTH_BOOTSTRAP_WAS_SOURCED=0
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  __AUTH_BOOTSTRAP_WAS_SOURCED=1
+fi
+__AUTH_BOOTSTRAP_OLD_SET_OPTS="$(set +o)"
 
 set -euo pipefail
 
-VAULT_SECRET_PATH="${VAULT_GOOGLE_SECRET_PATH:-secret/Google/oauth/credentials}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+load_dotenv() {
+  local candidate raw_line line key value
+  for candidate in "$SCRIPT_DIR/.env" "$PWD/.env"; do
+    if [[ -f "$candidate" ]]; then
+      while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+        line="${raw_line#"${raw_line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        if [[ -z "$line" || "$line" == \#* ]]; then
+          continue
+        fi
+        if [[ "$line" == export\ * ]]; then
+          line="${line#export }"
+        fi
+        if [[ "$line" != *=* ]]; then
+          continue
+        fi
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ ${#value} -ge 2 ]]; then
+          if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+            value="${value:1:${#value}-2}"
+          elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+            value="${value:1:${#value}-2}"
+          fi
+        fi
+        if [[ -n "$key" && -z "${!key:-}" ]]; then
+          export "$key=$value"
+        fi
+      done <"$candidate"
+      return
+    fi
+  done
+}
+
+load_dotenv
+
+normalize_vault_kv_path() {
+  local path="$1"
+  if [[ "${VAULT_KV_VERSION:-2}" == "2" ]]; then
+    path="${path#/}"
+    path="${path/\/data\//\/}"
+  fi
+  printf '%s' "$path"
+}
+
 VAULT_SECRET_FIELD="${VAULT_SECRET_JSON_KEY:-google_workspace_cli_credentials_json}"
 CREDENTIALS_FILE="${GWS_CREDENTIALS_FILE:-/tmp/gws_credentials_$(id -u).json}"
 
+finish() {
+  local exit_code="${1:-0}"
+  local was_sourced="$__AUTH_BOOTSTRAP_WAS_SOURCED"
+  eval "$__AUTH_BOOTSTRAP_OLD_SET_OPTS"
+  unset __AUTH_BOOTSTRAP_OLD_SET_OPTS
+  unset __AUTH_BOOTSTRAP_WAS_SOURCED
+  if (( was_sourced )); then
+    return "$exit_code"
+  fi
+  exit "$exit_code"
+}
+
 error() {
   printf 'auth-bootstrap: %s\n' "$1" >&2
-  exit 1
+  return 1
 }
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
-    error "Required command not found: $1"
+    error "Required command not found: $1" || return 1
   fi
 }
 
+append_unique_candidate_path() {
+  local value="${1:-}"
+  if [[ -z "$value" ]]; then
+    return
+  fi
+
+  local normalized
+  normalized="$(normalize_vault_kv_path "$value")"
+  local candidate
+  for candidate in "${VAULT_SECRET_PATH_CANDIDATES[@]:-}"; do
+    if [[ "$candidate" == "$normalized" ]]; then
+      return
+    fi
+  done
+  VAULT_SECRET_PATH_CANDIDATES+=("$normalized")
+}
+
+build_candidate_paths() {
+  VAULT_SECRET_PATH_CANDIDATES=()
+  append_unique_candidate_path "${VAULT_GOOGLE_SECRET_PATH:-}"
+  append_unique_candidate_path "${VAULT_SECRET_PATH:-}"
+  if ((${#VAULT_SECRET_PATH_CANDIDATES[@]} == 0)); then
+    append_unique_candidate_path "secret/data/Google/oauth/credentials"
+    append_unique_candidate_path "secret/data/Google/oauth"
+  fi
+}
+
+extract_credentials_from_payload() {
+  local payload="$1"
+
+  if ! command -v jq >/dev/null 2>&1; then
+    return 1
+  fi
+
+  if jq -e --arg key "$VAULT_SECRET_FIELD" '.data.data | has($key)' >/dev/null 2>&1 <<<"$payload"; then
+    jq -er --arg key "$VAULT_SECRET_FIELD" '.data.data[$key]' <<<"$payload"
+    return 0
+  fi
+  if jq -e '.data.data | has("installed")' >/dev/null 2>&1 <<<"$payload"; then
+    jq -ec '.data.data.installed' <<<"$payload"
+    return 0
+  fi
+  if jq -e '.data.data | has("web")' >/dev/null 2>&1 <<<"$payload"; then
+    jq -ec '.data.data.web' <<<"$payload"
+    return 0
+  fi
+  jq -ec '.data.data' <<<"$payload"
+}
+
+fetch_credentials() {
+  local candidate credentials payload
+  FETCHED_CREDENTIALS=''
+  VAULT_SECRET_PATH=''
+  build_candidate_paths
+
+  for candidate in "${VAULT_SECRET_PATH_CANDIDATES[@]}"; do
+    if credentials="$(vault kv get -field="$VAULT_SECRET_FIELD" "$candidate" 2>/dev/null)" && [[ -n "$credentials" ]]; then
+      VAULT_SECRET_PATH="$candidate"
+      FETCHED_CREDENTIALS="$credentials"
+      return 0
+    fi
+
+    if command -v jq >/dev/null 2>&1; then
+      if payload="$(vault kv get -format=json "$candidate" 2>/dev/null)" && [[ -n "$payload" ]]; then
+        if credentials="$(extract_credentials_from_payload "$payload" 2>/dev/null)" && [[ -n "$credentials" ]]; then
+          VAULT_SECRET_PATH="$candidate"
+          FETCHED_CREDENTIALS="$credentials"
+          return 0
+        fi
+      fi
+    fi
+  done
+
+  return 1
+}
+
 main() {
-  require_command vault
+  require_command vault || return 1
 
   # Check if Vault is accessible
   if ! vault status >/dev/null 2>&1; then
-    error "Cannot connect to Vault. Check VAULT_ADDR and authentication."
+    error "Cannot connect to Vault. Check VAULT_ADDR and authentication." || return 1
   fi
 
   # Fetch credentials from Vault
-  local credentials
-  credentials=$(vault kv get -field="$VAULT_SECRET_FIELD" "$VAULT_SECRET_PATH" 2>/dev/null) || \
-    error "Failed to fetch credentials from Vault at $VAULT_SECRET_PATH"
+  fetch_credentials || \
+    error "Failed to fetch Google credentials from the configured Vault paths" || return 1
 
-  if [[ -z "$credentials" ]]; then
-    error "Empty credentials returned from Vault"
+  if [[ -z "${FETCHED_CREDENTIALS:-}" ]]; then
+    error "Empty credentials returned from Vault" || return 1
   fi
 
   # Write credentials to temp file with restricted permissions
   umask 077
-  printf '%s\n' "$credentials" > "$CREDENTIALS_FILE"
+  printf '%s\n' "$FETCHED_CREDENTIALS" > "$CREDENTIALS_FILE"
 
   # Output export statement (for eval or source usage)
   printf 'export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE="%s"\n' "$CREDENTIALS_FILE"
@@ -59,7 +203,10 @@ main() {
   # Also export directly for sourced usage
   export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE="$CREDENTIALS_FILE"
 
-  printf '# auth-bootstrap: Credentials written to %s\n' "$CREDENTIALS_FILE" >&2
+  printf '# auth-bootstrap: Credentials written to %s from %s\n' "$CREDENTIALS_FILE" "$VAULT_SECRET_PATH" >&2
 }
 
-main "$@"
+if ! main "$@"; then
+  finish 1
+fi
+finish 0

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import unicodedata
@@ -12,6 +14,10 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+
+import yaml
 
 SKIP_DIRS = {".git", ".github", ".venv", "node_modules", "__pycache__"}
 DEFAULT_TAGS = ["Research"]
@@ -27,13 +33,23 @@ TOOL_DIR = Path(__file__).resolve().parents[1]
 AGENT_TOOLS_ROOT = Path(
     os.environ.get("AGENT_TOOLS_ROOT", str(TOOL_DIR.parent))
 ).expanduser().resolve()
+DEFAULT_MANAGED_CONTENT_REPO_ROOT = Path(
+    os.environ.get(
+        "CONTENT_REPO_MANAGED_ROOT",
+        str(AGENT_TOOLS_ROOT / "runtime" / "content-repo"),
+    )
+).expanduser().resolve()
 REPO_ROOT = Path(
-    os.environ.get("CONTENT_REPO_ROOT", str(Path.cwd()))
+    os.environ.get("CONTENT_REPO_ROOT", str(DEFAULT_MANAGED_CONTENT_REPO_ROOT))
 ).expanduser().resolve()
 GMAIL_READER_DIR = AGENT_TOOLS_ROOT / "gmail-reader"
 WEB_SCRAPER_DIR = AGENT_TOOLS_ROOT / "web-scraper"
 IMAGE_UPLOAD_DIR = AGENT_TOOLS_ROOT / "image-upload"
 DEFAULT_OUTPUT_DIR = TOOL_DIR / "out"
+CONTENT_INDEX_DIR = AGENT_TOOLS_ROOT / "runtime" / "indexes"
+DEFAULT_ARCHIVE_DIR = Path(
+    os.environ.get("AGENT_ARCHIVE_ROOT", str(AGENT_TOOLS_ROOT / "archive"))
+).expanduser().resolve()
 
 
 @dataclass
@@ -65,10 +81,9 @@ def slugify(text: str) -> str:
     return re.sub(r"-{2,}", "-", normalize(text).replace(" ", "-")).strip("-")
 
 
-def parse_markdown_article(path: Path) -> tuple[dict[str, Any], str]:
-    text = path.read_text(encoding="utf-8")
+def split_markdown_document(text: str) -> tuple[str | None, str]:
     if not text.startswith("---\n"):
-        return {}, text
+        return None, text
 
     lines = text.splitlines()
     end_index = None
@@ -77,31 +92,52 @@ def parse_markdown_article(path: Path) -> tuple[dict[str, Any], str]:
             end_index = index
             break
     if end_index is None:
+        return None, text
+
+    frontmatter = "\n".join(lines[1:end_index])
+    body = "\n".join(lines[end_index + 1 :])
+    return frontmatter, body
+
+
+def clean_frontmatter_mapping(metadata: dict[str, Any]) -> dict[str, Any]:
+    cleaned: dict[str, Any] = {}
+    for key, value in metadata.items():
+        if value in (None, "", []):
+            continue
+        cleaned[str(key)] = value
+    return cleaned
+
+
+def parse_markdown_article(path: Path) -> tuple[dict[str, Any], str]:
+    text = path.read_text(encoding="utf-8")
+    frontmatter_text, body = split_markdown_document(text)
+    if frontmatter_text is None:
         return {}, text
 
-    metadata: dict[str, Any] = {}
-    current_key: str | None = None
-    list_values: dict[str, list[str]] = {}
-
-    for raw_line in lines[1:end_index]:
-        line = raw_line.rstrip()
-        if not line:
-            continue
-        if line.lstrip().startswith("-") and current_key:
-            value = line.lstrip()[1:].strip()
-            list_values.setdefault(current_key, []).append(value)
-            continue
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        current_key = key.strip()
-        metadata[current_key] = value.strip().strip("'\"")
-
-    for key, values in list_values.items():
-        metadata[key] = values
-
-    body = "\n".join(lines[end_index + 1 :])
+    try:
+        metadata = yaml.safe_load(frontmatter_text) or {}
+    except yaml.YAMLError as exc:
+        return {"_frontmatter_error": str(exc)}, body
+    if not isinstance(metadata, dict):
+        return {"_frontmatter_error": "frontmatter is not a YAML mapping"}, body
     return metadata, body
+
+
+def build_markdown_article(metadata: dict[str, Any], body: str) -> str:
+    cleaned = clean_frontmatter_mapping(metadata)
+    if not cleaned:
+        return body.lstrip("\n")
+
+    frontmatter = yaml.safe_dump(
+        cleaned,
+        sort_keys=False,
+        allow_unicode=False,
+        default_flow_style=False,
+    ).strip()
+    normalized_body = body.lstrip("\n")
+    if normalized_body:
+        return f"---\n{frontmatter}\n---\n\n{normalized_body}"
+    return f"---\n{frontmatter}\n---\n"
 
 
 def parse_frontmatter(path: Path) -> dict[str, Any]:
@@ -118,11 +154,71 @@ def coerce_frontmatter_list(value: Any) -> list[str]:
     return []
 
 
+def canonicalize_url(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return url.strip().lower()
+    if not parsed.scheme or not parsed.netloc:
+        return url.strip().lower()
+    hostname = (parsed.hostname or "").lower().removeprefix("www.")
+    path = re.sub(r"/{2,}", "/", parsed.path or "").rstrip("/")
+    return f"https://{hostname}{path}"
+
+
+def paper_fingerprint(identifier: str) -> str:
+    normalized = canonicalize_url(identifier) or normalize(identifier)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
 def load_articles(repo_root: Path) -> list[ArticleRecord]:
-    articles: list[ArticleRecord] = []
+    if not repo_root.is_dir():
+        raise FileNotFoundError(
+            f"Content repo not found: {repo_root}. Run ./agent-workflow setup or configure CONTENT_REPO_ROOT."
+        )
+    if repo_root == AGENT_TOOLS_ROOT:
+        raise ValueError(
+            "CONTENT_REPO_ROOT points at research-tools itself. Use the managed content repo working copy instead."
+        )
+
+    cache_path = CONTENT_INDEX_DIR / f"{hashlib.sha256(str(repo_root).encode('utf-8')).hexdigest()[:16]}.json"
+    snapshot: list[dict[str, int | str]] = []
+    markdown_paths: list[Path] = []
     for path in sorted(repo_root.rglob("*.md")):
         if any(part in SKIP_DIRS for part in path.parts):
             continue
+        stat = path.stat()
+        snapshot.append(
+            {
+                "path": str(path.relative_to(repo_root)),
+                "mtime_ns": stat.st_mtime_ns,
+                "size": stat.st_size,
+            }
+        )
+        markdown_paths.append(path)
+
+    if cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if cached.get("repo_root") == str(repo_root) and cached.get("snapshot") == snapshot:
+                return [
+                    ArticleRecord(
+                        path=item["path"],
+                        title=item["title"],
+                        stem=item["stem"],
+                        tags=item["tags"],
+                        permalink=item.get("permalink"),
+                        body=item["body"],
+                    )
+                    for item in cached.get("articles", [])
+                ]
+        except Exception:
+            pass
+
+    articles: list[ArticleRecord] = []
+    for path in markdown_paths:
         metadata, body = parse_markdown_article(path)
         articles.append(
             ArticleRecord(
@@ -134,6 +230,29 @@ def load_articles(repo_root: Path) -> list[ArticleRecord]:
                 body=body,
             )
         )
+
+    CONTENT_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "repo_root": str(repo_root),
+                "snapshot": snapshot,
+                "articles": [
+                    {
+                        "path": article.path,
+                        "title": article.title,
+                        "stem": article.stem,
+                        "tags": article.tags,
+                        "permalink": article.permalink,
+                        "body": article.body,
+                    }
+                    for article in articles
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     return articles
 
 
@@ -227,6 +346,7 @@ def check_reference_exists(
 ) -> dict[str, Any] | None:
     """Check if a URL is already referenced in any article."""
     url_normalized = url.strip().rstrip("/").lower()
+    url_canonical = canonicalize_url(url_normalized)
     # Also check without protocol
     url_no_protocol = re.sub(r'^https?://', '', url_normalized)
 
@@ -234,8 +354,13 @@ def check_reference_exists(
         refs = find_reference_urls(article.body)
         for ref in refs:
             ref_url = ref["url"].strip().rstrip("/").lower()
+            ref_canonical = canonicalize_url(ref_url)
             ref_no_protocol = re.sub(r'^https?://', '', ref_url)
-            if url_normalized == ref_url or url_no_protocol == ref_no_protocol:
+            if (
+                url_normalized == ref_url
+                or url_no_protocol == ref_no_protocol
+                or (url_canonical and ref_canonical == url_canonical)
+            ):
                 return {
                     "exists": True,
                     "path": article.path,
@@ -566,6 +691,134 @@ def run_json_tool(tool_dir: Path, args: list[str]) -> dict[str, Any]:
     return payload["result"]
 
 
+def scrape_source_packet(source: str, output_path: Path | None = None) -> dict[str, Any]:
+    scrape_args = ["main.py", source]
+    if output_path is not None:
+        scrape_args.extend(["--output", str(output_path)])
+    return run_json_tool(WEB_SCRAPER_DIR, scrape_args)
+
+
+def sync_paper_record(
+    scrape: dict[str, Any],
+    *,
+    workflow_state: str = "discovered",
+    matched_content_path: str = "",
+) -> dict[str, Any] | None:
+    if not GMAIL_READER_DIR.is_dir():
+        return None
+    url = scrape.get("reference_url") or scrape.get("url") or scrape.get("requested_url") or ""
+    title = scrape.get("title") or "Untitled Source"
+    doi = scrape.get("doi") or ""
+    pmid = scrape.get("pmid") or ""
+    if not (title or url or doi):
+        return None
+
+    upsert_args = gmail_reader_command(
+        "upsert-paper",
+        "--title",
+        title,
+        "--url",
+        url,
+        "--doi",
+        doi,
+        "--pmid",
+        pmid,
+        "--workflow-state",
+        workflow_state,
+    )
+    if matched_content_path:
+        upsert_args.extend(["--matched-content-path", matched_content_path])
+    try:
+        return run_json_tool(GMAIL_READER_DIR, upsert_args)
+    except Exception:
+        return None
+
+
+def set_paper_workflow_state(
+    identifier: str,
+    workflow_state: str,
+    *,
+    matched_content_path: str = "",
+    archive_path: str = "",
+    commit: str = "",
+    pr: str = "",
+) -> dict[str, Any] | None:
+    if not GMAIL_READER_DIR.is_dir() or not identifier:
+        return None
+    args = gmail_reader_command(
+        "set-paper-state",
+        identifier,
+        "--state",
+        workflow_state,
+    )
+    if matched_content_path:
+        args.extend(["--matched-content-path", matched_content_path])
+    if commit:
+        args.extend(["--commit", commit])
+    if pr:
+        args.extend(["--pr", pr])
+    if archive_path:
+        args.extend(["--archive-path", archive_path])
+    try:
+        return run_json_tool(GMAIL_READER_DIR, args)
+    except Exception:
+        return None
+
+
+def attach_archived_source_state(identifier: str, archive_path: str) -> dict[str, Any] | None:
+    if not GMAIL_READER_DIR.is_dir() or not identifier or not archive_path:
+        return None
+    return set_paper_workflow_state(
+        identifier,
+        "discovered",
+        archive_path=archive_path,
+    )
+
+
+def archive_source_material(source: str, *, root: Path = DEFAULT_ARCHIVE_DIR) -> dict[str, Any]:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    slug = slugify(Path(source).stem if not source.startswith("http") else paper_fingerprint(source))
+    archive_dir = ensure_output_dir(root / timestamp[:4] / timestamp[4:6] / f"{timestamp}-{slug}")
+
+    metadata: dict[str, Any] = {
+        "archived_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+        "requested_source": source,
+    }
+    if source.startswith("http://") or source.startswith("https://"):
+        request = Request(source, headers={"User-Agent": "content-agent-tools/0.1"})
+        with urlopen(request, timeout=60) as response:
+            payload = response.read()
+            content_type = response.headers.get_content_type()
+            final_url = response.geturl()
+        metadata["final_url"] = final_url
+        metadata["content_type"] = content_type
+        if source.lower().endswith(".pdf") or content_type == "application/pdf":
+            extension = ".pdf"
+            archive_path = archive_dir / "source.pdf"
+        else:
+            extension = ".html"
+            archive_path = archive_dir / "source.html"
+        archive_path.write_bytes(payload)
+        metadata["archive_kind"] = extension.lstrip(".")
+    else:
+        local_path = Path(source).expanduser().resolve()
+        if not local_path.is_file():
+            raise FileNotFoundError(f"Archive source not found: {source}")
+        extension = local_path.suffix or ".bin"
+        archive_path = archive_dir / f"source{extension}"
+        shutil.copy2(local_path, archive_path)
+        metadata["archive_kind"] = extension.lstrip(".")
+        metadata["final_url"] = ""
+        metadata["content_type"] = ""
+
+    metadata["archive_path"] = str(archive_path)
+    (archive_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8",
+    )
+    return metadata
+
+
 def article_stub(
     *,
     title: str,
@@ -575,22 +828,17 @@ def article_stub(
     abstract: str,
     footnote: str,
 ) -> str:
-    frontmatter_lines = [
-        "---",
-        f"title: {title}",
-    ]
-    if permalink:
-        frontmatter_lines.append(f"permalink: {permalink}")
-    if image:
-        frontmatter_lines.append(f"image: {image}")
-    frontmatter_lines.append("tags:")
-    for tag in tags:
-        frontmatter_lines.append(f"- {tag}")
-    frontmatter_lines.append("---")
-
     abstract_block = f"\n## Abstract\n\n{abstract}\n" if abstract else ""
-    return "\n".join(frontmatter_lines) + (
-        "\n\nBrief introduction.\n"
+    metadata: dict[str, Any] = {
+        "title": title,
+        "tags": tags,
+    }
+    if permalink:
+        metadata["permalink"] = permalink
+    if image:
+        metadata["image"] = image
+    body = (
+        "Brief introduction.\n"
         "\n## Key Findings\n\n"
         "- Add the first validated finding here.[^1]\n"
         f"{abstract_block}"
@@ -598,6 +846,7 @@ def article_stub(
         "- Review the scraped packet before publishing.\n\n"
         f"{footnote}\n"
     )
+    return build_markdown_article(metadata, body)
 
 
 def unique_route_key(candidate_path: Path, articles: list[ArticleRecord]) -> str | None:
@@ -853,25 +1102,24 @@ def append_research(args: argparse.Namespace) -> dict[str, Any]:
 
         # Add suggested tags to frontmatter if requested
         if args.add_tags and suggested_tags:
-            tags_to_add = suggested_tags[:5] if not args.tags else args.tags
-            # Parse frontmatter
-            if new_content.startswith("---\n"):
-                end_match = re.search(r'\n---\n', new_content[4:])
-                if end_match:
-                    fm_end = end_match.start() + 4
-                    frontmatter = new_content[4:fm_end]
-                    rest = new_content[fm_end + 4:]
-
-                    # Add new tags
-                    for tag in tags_to_add:
-                        if tag not in target_article.tags:
-                            frontmatter = frontmatter.rstrip() + f"\n- {tag}"
-
-                    new_content = "---\n" + frontmatter + "\n---\n" + rest
+            tags_to_add = args.tags or suggested_tags[:5]
+            frontmatter_text, body_text = split_markdown_document(new_content)
+            if frontmatter_text is not None:
+                metadata = yaml.safe_load(frontmatter_text) or {}
+                existing_tags = coerce_frontmatter_list(metadata.get("tags", []))
+                metadata["tags"] = existing_tags + [
+                    tag for tag in tags_to_add if tag not in existing_tags
+                ]
+                new_content = build_markdown_article(metadata, body_text)
 
         full_path.write_text(new_content, encoding="utf-8")
         result["applied"] = True
         result["status"] = "success"
+        sync_paper_record(
+            scrape,
+            workflow_state="drafted",
+            matched_content_path=str(target_path),
+        )
 
         # Commit if requested
         if args.commit:
@@ -882,12 +1130,33 @@ def append_research(args: argparse.Namespace) -> dict[str, Any]:
                 cwd=REPO_ROOT,
                 capture_output=True,
             )
-            subprocess.run(
+            commit_result = subprocess.run(
                 ["git", "commit", "-m", commit_msg],
                 cwd=REPO_ROOT,
                 capture_output=True,
+                text=True,
             )
             result["committed"] = True
+            if commit_result.returncode == 0:
+                commit_sha = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                result["commit_sha"] = commit_sha
+                set_paper_workflow_state(
+                    scrape.get("reference_url") or scrape.get("url") or args.url,
+                    "committed",
+                    matched_content_path=str(target_path),
+                    commit=commit_sha,
+                )
+        else:
+            set_paper_workflow_state(
+                scrape.get("reference_url") or scrape.get("url") or args.url,
+                "drafted",
+                matched_content_path=str(target_path),
+            )
     else:
         result["applied"] = False
         result["status"] = "preview"
@@ -903,10 +1172,7 @@ def prepare_packet(args: argparse.Namespace) -> dict[str, Any]:
 
     source_slug = slugify(args.slug or Path(args.url).stem or "source")
     scrape_output_path = output_dir / f"{source_slug}-source.md"
-    scrape = run_json_tool(
-        WEB_SCRAPER_DIR,
-        ["main.py", args.url, "--output", str(scrape_output_path)],
-    )
+    scrape = scrape_source_packet(args.url, scrape_output_path)
 
     if args.match_existing:
         matches = top_matches_extended(
@@ -919,17 +1185,44 @@ def prepare_packet(args: argparse.Namespace) -> dict[str, Any]:
         matches = top_matches(articles, scrape["title"], limit=args.limit)
     image_result = None
     image_public_id = args.image_public_id
-    if args.image_file:
+
+    image_capture_url = args.image_screenshot_url or (args.url if args.image_screenshot else None)
+    image_source_count = sum(
+        1 for value in (args.image_file, image_capture_url) if value
+    )
+    if image_source_count > 1:
+        raise ValueError(
+            "Use only one image source: --image-file, --image-screenshot, or --image-screenshot-url"
+        )
+
+    if args.image_file or image_capture_url:
         ensure_tool_dir(IMAGE_UPLOAD_DIR, "image-upload")
         if not image_public_id:
             image_public_id = slugify(scrape["title"])
-        upload_args = [
-            "image-upload",
-            args.image_file,
+        if args.image_file:
+            upload_args = [
+                "image-upload",
+                args.image_file,
+            ]
+        else:
+            upload_args = [
+                "image-upload",
+                "--capture-url",
+                image_capture_url,
+            ]
+            if args.image_screenshot_output:
+                upload_args.extend(["--capture-output", args.image_screenshot_output])
+            if args.image_screenshot_full_page:
+                upload_args.append("--full-page")
+            if args.image_screenshot_annotate:
+                upload_args.append("--annotate")
+            upload_args.extend(["--wait-ms", str(args.image_screenshot_wait_ms)])
+
+        upload_args.extend([
             "--public-id",
             image_public_id,
             "--validate-url",
-        ]
+        ])
         if args.image_folder:
             upload_args.extend(["--folder", args.image_folder])
         image_result = run_json_tool(IMAGE_UPLOAD_DIR, upload_args)
@@ -987,12 +1280,17 @@ def prepare_packet(args: argparse.Namespace) -> dict[str, Any]:
     packet_path = output_dir / f"{packet_slug}-packet.json"
     packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
     packet["packet_path"] = str(packet_path)
-
-    # Mark the article as processed in the gmail-reader DB (non-fatal if unavailable)
-    try:
-        run_json_tool(GMAIL_READER_DIR, gmail_reader_command("mark-processed", args.url))
-    except Exception:
-        pass
+    packet["paper"] = sync_paper_record(
+        scrape,
+        workflow_state="drafted" if created_article_path else "matched" if matches else "scraped",
+        matched_content_path=created_article_path or "",
+    )
+    if created_article_path:
+        packet["paper_state"] = set_paper_workflow_state(
+            scrape.get("reference_url") or scrape.get("url") or args.url,
+            "drafted",
+            matched_content_path=created_article_path,
+        )
 
     return packet
 
@@ -1105,6 +1403,477 @@ def search_content(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def audit_tags(args: argparse.Namespace) -> dict[str, Any]:
+    articles = load_articles(REPO_ROOT)
+    groups: dict[str, dict[str, Any]] = {}
+    for article in articles:
+        for tag in article.tags:
+            normalized = normalize(tag)
+            group = groups.setdefault(
+                normalized,
+                {"normalized": normalized, "variants": {}, "paths": set(), "total": 0},
+            )
+            group["variants"][tag] = group["variants"].get(tag, 0) + 1
+            group["paths"].add(article.path)
+            group["total"] += 1
+
+    conflicts = []
+    for group in groups.values():
+        if len(group["variants"]) < 2 and not args.include_all:
+            continue
+        sorted_variants = sorted(
+            (
+                {"tag": tag, "count": count}
+                for tag, count in group["variants"].items()
+            ),
+            key=lambda item: (-item["count"], item["tag"].lower()),
+        )
+        conflicts.append(
+            {
+                "normalized": group["normalized"],
+                "total": group["total"],
+                "suggested_canonical": sorted_variants[0]["tag"],
+                "variants": sorted_variants,
+                "example_paths": sorted(group["paths"])[:5],
+            }
+        )
+
+    conflicts.sort(key=lambda item: (-len(item["variants"]), -item["total"], item["normalized"]))
+    if args.limit > 0:
+        conflicts = conflicts[: args.limit]
+    return {
+        "group_count": len(conflicts),
+        "groups": conflicts,
+    }
+
+
+def lint_frontmatter(args: argparse.Namespace) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    scanned = 0
+    for path in sorted(REPO_ROOT.rglob("*.md")):
+        if any(part in SKIP_DIRS for part in path.parts):
+            continue
+        scanned += 1
+        metadata, body = parse_markdown_article(path)
+        file_issues: list[str] = []
+        rel_path = str(path.relative_to(REPO_ROOT))
+
+        if "_frontmatter_error" in metadata:
+            file_issues.append(f"invalid_frontmatter:{metadata['_frontmatter_error']}")
+        else:
+            title = metadata.get("title")
+            tags = metadata.get("tags")
+            if not title or not str(title).strip():
+                file_issues.append("missing_title")
+            if tags is None:
+                file_issues.append("missing_tags")
+            elif not isinstance(tags, list):
+                file_issues.append("tags_not_list")
+            else:
+                lowered: set[str] = set()
+                duplicates: list[str] = []
+                for tag in coerce_frontmatter_list(tags):
+                    lowered_tag = tag.lower()
+                    if lowered_tag in lowered and tag not in duplicates:
+                        duplicates.append(tag)
+                    lowered.add(lowered_tag)
+                if duplicates:
+                    file_issues.append(f"duplicate_tags:{', '.join(duplicates)}")
+        if not body.strip():
+            file_issues.append("empty_body")
+        if file_issues:
+            issues.append({"path": rel_path, "issues": file_issues})
+
+    return {
+        "scanned_files": scanned,
+        "issue_count": len(issues),
+        "files": issues[: args.limit] if args.limit > 0 else issues,
+    }
+
+
+def check_duplicate_paper(args: argparse.Namespace) -> dict[str, Any]:
+    articles = load_articles(REPO_ROOT)
+    identifier = args.identifier.strip()
+    normalized_identifier = normalize(identifier)
+    canonical_identifier = canonicalize_url(identifier)
+    content_hits: list[dict[str, Any]] = []
+
+    for article in articles:
+        refs = find_reference_urls(article.body)
+        for ref in refs:
+            ref_url = ref["url"].strip()
+            ref_title = ref["title"].strip()
+            if (
+                identifier.lower() in ref_url.lower()
+                or (canonical_identifier and canonicalize_url(ref_url) == canonical_identifier)
+                or normalize(ref_title) == normalized_identifier
+            ):
+                content_hits.append(
+                    {
+                        "path": article.path,
+                        "title": article.title,
+                        "ref_num": ref["ref_num"],
+                        "ref_title": ref_title,
+                        "ref_url": ref_url,
+                    }
+                )
+
+    paper_result = None
+    if GMAIL_READER_DIR.is_dir():
+        try:
+            paper_result = run_json_tool(
+                GMAIL_READER_DIR,
+                gmail_reader_command("find-paper", identifier),
+            )
+        except Exception:
+            paper_result = None
+
+    return {
+        "identifier": identifier,
+        "content_hit_count": len(content_hits),
+        "content_hits": content_hits[: args.limit] if args.limit > 0 else content_hits,
+        "paper_result": paper_result,
+    }
+
+
+def archive_source_command(args: argparse.Namespace) -> dict[str, Any]:
+    metadata = archive_source_material(
+        args.source,
+        root=Path(args.archive_root).expanduser().resolve(),
+    )
+    paper_state = attach_archived_source_state(
+        args.identifier or args.source,
+        metadata["archive_path"],
+    )
+    return {
+        "archive": metadata,
+        "paper_state": paper_state,
+    }
+
+
+def ingest_paper(args: argparse.Namespace) -> dict[str, Any]:
+    ensure_tool_dir(WEB_SCRAPER_DIR, "web-scraper")
+    output_dir = ensure_output_dir(Path(args.output_dir).expanduser().resolve())
+    articles = load_articles(REPO_ROOT)
+    source_slug = slugify(args.slug or Path(args.source).stem or "source")
+    scrape_output_path = output_dir / f"{source_slug}-source.md"
+    scrape = scrape_source_packet(args.source, scrape_output_path)
+    matches = top_matches(articles, scrape["title"], limit=args.limit)
+    archive_result = None
+    if args.archive:
+        archive_result = archive_source_material(
+            args.source,
+            root=Path(args.archive_root).expanduser().resolve(),
+        )
+        attach_archived_source_state(
+            scrape.get("reference_url") or scrape.get("url") or args.source,
+            archive_result["archive_path"],
+        )
+
+    packet = {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+        "source": args.source,
+        "scrape": scrape,
+        "matches": matches,
+        "archive": archive_result,
+        "paper": sync_paper_record(
+            scrape,
+            workflow_state="matched" if matches else "scraped",
+        ),
+    }
+    packet_path = output_dir / f"{source_slug}-ingest.json"
+    packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
+    packet["packet_path"] = str(packet_path)
+    return packet
+
+
+def intake_source(args: argparse.Namespace) -> dict[str, Any]:
+    ensure_tool_dir(WEB_SCRAPER_DIR, "web-scraper")
+    output_dir = ensure_output_dir(Path(args.output_dir).expanduser().resolve())
+    articles = load_articles(REPO_ROOT)
+    source_slug = slugify(args.slug or Path(args.source).stem or "source")
+    scrape_output_path = output_dir / f"{source_slug}-source.md"
+    scrape = scrape_source_packet(args.source, scrape_output_path)
+    matches = top_matches(articles, scrape["title"], limit=args.limit)
+    duplicate = check_duplicate_paper(
+        argparse.Namespace(identifier=scrape.get("reference_url") or scrape.get("url") or args.source, limit=args.limit)
+    )
+    archive_result = None
+    if args.archive:
+        archive_result = archive_source_material(
+            args.source,
+            root=Path(args.archive_root).expanduser().resolve(),
+        )
+        attach_archived_source_state(
+            scrape.get("reference_url") or scrape.get("url") or args.source,
+            archive_result["archive_path"],
+        )
+
+    suggested_action = "new_article"
+    if duplicate.get("content_hit_count", 0) > 0:
+        suggested_action = "already_cited"
+    elif matches:
+        suggested_action = "append_existing"
+
+    packet = {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+        "source": args.source,
+        "scrape": scrape,
+        "matches": matches,
+        "duplicate": duplicate,
+        "archive": archive_result,
+        "suggested_action": suggested_action,
+        "paper": sync_paper_record(
+            scrape,
+            workflow_state="matched" if matches or duplicate.get("content_hit_count", 0) else "scraped",
+        ),
+    }
+    packet_path = output_dir / f"{source_slug}-intake.json"
+    packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
+    packet["packet_path"] = str(packet_path)
+    return packet
+
+
+def create_pull_request(
+    *,
+    base: str,
+    head: str | None,
+    title: str | None,
+    body: str | None,
+    fill: bool,
+    draft: bool,
+) -> dict[str, Any]:
+    gh_binary = shutil.which("gh")
+    if not gh_binary:
+        raise FileNotFoundError("gh CLI is not installed")
+    if not fill and (not title or not body):
+        raise ValueError("Provide --fill or both --title and --body")
+
+    command = [gh_binary, "pr", "create", "--base", base]
+    if head:
+        command.extend(["--head", head])
+    if draft:
+        command.append("--draft")
+    if fill:
+        command.append("--fill")
+    else:
+        command.extend(["--title", title, "--body", body])
+
+    result = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "gh pr create failed")
+    return {
+        "url": result.stdout.strip(),
+        "base": base,
+        "head": head or "",
+        "draft": draft,
+    }
+
+
+def open_pull_request(args: argparse.Namespace) -> dict[str, Any]:
+    return create_pull_request(
+        base=args.base,
+        head=args.head,
+        title=args.title,
+        body=args.body,
+        fill=args.fill,
+        draft=args.draft,
+    )
+
+
+def changed_repo_paths() -> list[str]:
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "git status failed")
+    paths: list[str] = []
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            continue
+        path = line[3:] if len(line) > 3 else ""
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        cleaned = path.strip()
+        if cleaned:
+            paths.append(cleaned)
+    return paths
+
+
+def article_repo_paths(paths: list[str]) -> list[str]:
+    selected: list[str] = []
+    for value in paths:
+        path = Path(value)
+        if path.suffix.lower() != ".md":
+            continue
+        if any(part in SKIP_DIRS for part in path.parts):
+            continue
+        selected.append(path.as_posix())
+    return sorted(set(selected))
+
+
+def default_commit_message(paths: list[str]) -> str:
+    if len(paths) == 1:
+        return f"Update article {Path(paths[0]).stem.replace('-', ' ')}"
+    return f"Update {len(paths)} articles"
+
+
+def default_branch_name(paths: list[str]) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    seed = Path(paths[0]).stem if paths else "articles"
+    return f"agent/{slugify(seed)[:40]}-{timestamp}"
+
+
+def ensure_branch_checked_out(branch: str) -> None:
+    existing = subprocess.run(
+        ["git", "rev-parse", "--verify", branch],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if existing.returncode == 0:
+        command = ["git", "checkout", branch]
+    else:
+        command = ["git", "checkout", "-b", branch]
+    result = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git checkout failed")
+
+
+def stage_and_commit_paths(paths: list[str], commit_message: str, include_all: bool) -> str:
+    add_command = ["git", "add", "-A"] if include_all else ["git", "add", "--", *paths]
+    add_result = subprocess.run(add_command, cwd=REPO_ROOT, capture_output=True, text=True)
+    if add_result.returncode != 0:
+        raise RuntimeError(add_result.stderr.strip() or add_result.stdout.strip() or "git add failed")
+
+    commit_result = subprocess.run(
+        ["git", "commit", "-m", commit_message],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if commit_result.returncode != 0:
+        raise RuntimeError(commit_result.stderr.strip() or commit_result.stdout.strip() or "git commit failed")
+
+    sha_result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if sha_result.returncode != 0:
+        raise RuntimeError(sha_result.stderr.strip() or "git rev-parse failed")
+    return sha_result.stdout.strip()
+
+
+def push_branch(branch: str, remote: str) -> None:
+    result = subprocess.run(
+        ["git", "push", "--set-upstream", remote, branch],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git push failed")
+
+
+def update_paper_states_for_paths(
+    paths: list[str],
+    workflow_state: str,
+    *,
+    commit: str = "",
+    pr: str = "",
+) -> list[dict[str, Any]]:
+    if not GMAIL_READER_DIR.is_dir() or not paths:
+        return []
+    matched = run_json_tool(
+        GMAIL_READER_DIR,
+        gmail_reader_command("papers", "--status", "matched", "--limit", "5000"),
+    ).get("papers", [])
+    by_path = {
+        str(item.get("matched_content_path", "")).replace("\\", "/"): item
+        for item in matched
+        if item.get("matched_content_path")
+    }
+    updates: list[dict[str, Any]] = []
+    for path in paths:
+        record = by_path.get(path.replace("\\", "/"))
+        if not record:
+            continue
+        updated = set_paper_workflow_state(
+            record["paper_key"],
+            workflow_state,
+            matched_content_path=path,
+            commit=commit,
+            pr=pr,
+        )
+        if updated:
+            updates.append(updated)
+    return updates
+
+
+def publish_pull_request(args: argparse.Namespace) -> dict[str, Any]:
+    if not shutil.which("git"):
+        raise FileNotFoundError("git is not installed")
+    if not shutil.which("gh"):
+        raise FileNotFoundError("gh CLI is not installed")
+
+    selected_paths = [Path(path).as_posix() for path in (args.paths or [])]
+    if not selected_paths:
+        selected_paths = article_repo_paths(changed_repo_paths())
+    if not selected_paths:
+        raise ValueError("No changed article markdown files found in the content repo")
+
+    branch = args.branch or default_branch_name(selected_paths)
+    ensure_branch_checked_out(branch)
+
+    commit_message = args.commit_message or default_commit_message(selected_paths)
+    commit_sha = stage_and_commit_paths(selected_paths, commit_message, args.include_all)
+    commit_updates = update_paper_states_for_paths(
+        selected_paths,
+        "committed",
+        commit=commit_sha,
+    )
+
+    push_branch(branch, args.remote)
+    pr_title = args.title or commit_message
+    pr_body = args.body or "Updated article files:\n" + "\n".join(f"- `{path}`" for path in selected_paths)
+    pr = create_pull_request(
+        base=args.base,
+        head=branch,
+        title=pr_title,
+        body=pr_body,
+        fill=args.fill,
+        draft=args.draft,
+    )
+    pr_updates = update_paper_states_for_paths(
+        selected_paths,
+        "pr_open",
+        commit=commit_sha,
+        pr=pr["url"],
+    )
+    return {
+        "branch": branch,
+        "base": args.base,
+        "remote": args.remote,
+        "paths": selected_paths,
+        "commit_message": commit_message,
+        "commit_sha": commit_sha,
+        "pull_request": pr,
+        "paper_commit_updates": commit_updates,
+        "paper_pr_updates": pr_updates,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Agent orchestration helpers for the content repository."
@@ -1154,6 +1923,35 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--overwrite", action="store_true", help="Allow overwriting an existing target article.")
     prepare_parser.add_argument("--tag", dest="tags", action="append", default=[], help="Tag to place on a newly created article. Repeatable.")
     prepare_parser.add_argument("--image-file", help="Optional local image file to upload before creating a new article.")
+    prepare_parser.add_argument(
+        "--image-screenshot",
+        action="store_true",
+        help="Capture a screenshot of the source URL and upload it as the article image.",
+    )
+    prepare_parser.add_argument(
+        "--image-screenshot-url",
+        help="Capture a screenshot of a different URL and upload it as the article image.",
+    )
+    prepare_parser.add_argument(
+        "--image-screenshot-output",
+        help="Optional local path or directory to keep the captured screenshot.",
+    )
+    prepare_parser.add_argument(
+        "--image-screenshot-full-page",
+        action="store_true",
+        help="Capture a full-page screenshot when using image screenshot mode.",
+    )
+    prepare_parser.add_argument(
+        "--image-screenshot-annotate",
+        action="store_true",
+        help="Annotate interactive elements when using image screenshot mode.",
+    )
+    prepare_parser.add_argument(
+        "--image-screenshot-wait-ms",
+        type=int,
+        default=1500,
+        help="Extra wait time before capturing a screenshot for the article image.",
+    )
     prepare_parser.add_argument("--image-public-id", help="Optional Cloudinary public ID for the article image.")
     prepare_parser.add_argument("--image-folder", help="Optional Cloudinary folder for uploaded images.")
     prepare_parser.add_argument("--limit", type=int, default=5, help="Maximum match candidates to return.")
@@ -1184,6 +1982,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum tags to return (0 = all).",
     )
 
+    audit_tags_parser = subparsers.add_parser(
+        "audit-tags",
+        help="Group similar tags to identify normalization and merge candidates.",
+    )
+    audit_tags_parser.add_argument(
+        "--include-all",
+        action="store_true",
+        help="Include groups even when there is only one observed tag variant.",
+    )
+    audit_tags_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum groups to return.",
+    )
+
+    lint_parser = subparsers.add_parser(
+        "lint-frontmatter",
+        help="Scan markdown files for invalid or inconsistent frontmatter.",
+    )
+    lint_parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum files with issues to return (0 = all).",
+    )
+
     check_ref_parser = subparsers.add_parser(
         "check-ref",
         help="Check if a URL is already referenced in any article.",
@@ -1191,6 +2016,21 @@ def build_parser() -> argparse.ArgumentParser:
     check_ref_parser.add_argument(
         "url",
         help="URL to check for existing references.",
+    )
+
+    duplicate_paper_parser = subparsers.add_parser(
+        "check-duplicate-paper",
+        help="Check for duplicate paper references in content and the Gmail paper index.",
+    )
+    duplicate_paper_parser.add_argument(
+        "identifier",
+        help="URL, DOI, PMID, or title fragment to check.",
+    )
+    duplicate_paper_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum matching content references to return.",
     )
 
     append_parser = subparsers.add_parser(
@@ -1255,6 +2095,117 @@ def build_parser() -> argparse.ArgumentParser:
     backlog_parser.add_argument("--include-processed", action="store_true")
     backlog_parser.add_argument("--limit", type=int, default=20)
 
+    archive_parser = subparsers.add_parser(
+        "archive-source",
+        help="Archive a PDF or HTML source snapshot for long-term provenance.",
+    )
+    archive_parser.add_argument("source", help="HTTP(S) URL or local file path to archive.")
+    archive_parser.add_argument(
+        "--identifier",
+        help="Optional paper identifier to attach the archive to. Defaults to the source value.",
+    )
+    archive_parser.add_argument(
+        "--archive-root",
+        default=str(DEFAULT_ARCHIVE_DIR),
+        help="Root directory for archived source material.",
+    )
+
+    ingest_parser = subparsers.add_parser(
+        "ingest-paper",
+        help="Normalize a URL or PDF into a packet with scrape data, matches, and optional archive output.",
+    )
+    ingest_parser.add_argument("source", help="HTTP(S) URL or local PDF path to ingest.")
+    ingest_parser.add_argument("--slug", help="Optional slug for generated packet names.")
+    ingest_parser.add_argument(
+        "--archive",
+        action="store_true",
+        help="Archive the raw source alongside the ingest packet.",
+    )
+    ingest_parser.add_argument(
+        "--archive-root",
+        default=str(DEFAULT_ARCHIVE_DIR),
+        help="Root directory for archived source material.",
+    )
+    ingest_parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="Directory for generated ingest packets.",
+    )
+    ingest_parser.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="Maximum content matches to return.",
+    )
+
+    intake_parser = subparsers.add_parser(
+        "intake",
+        help="Scrape, deduplicate, match, and optionally archive a source without modifying content.",
+    )
+    intake_parser.add_argument("source", help="HTTP(S) URL or local PDF path to intake.")
+    intake_parser.add_argument("--slug", help="Optional slug for generated packet names.")
+    intake_parser.add_argument(
+        "--archive",
+        action="store_true",
+        help="Archive the raw source alongside the intake packet.",
+    )
+    intake_parser.add_argument(
+        "--archive-root",
+        default=str(DEFAULT_ARCHIVE_DIR),
+        help="Root directory for archived source material.",
+    )
+    intake_parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="Directory for generated intake packets.",
+    )
+    intake_parser.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="Maximum duplicate/match candidates to return.",
+    )
+
+    open_pr_parser = subparsers.add_parser(
+        "open-pr",
+        help="Open a PR from the mounted content repo using the gh CLI.",
+    )
+    open_pr_parser.add_argument("--base", default="main", help="Base branch for the PR.")
+    open_pr_parser.add_argument("--head", help="Head branch for the PR.")
+    open_pr_parser.add_argument("--title", help="PR title.")
+    open_pr_parser.add_argument("--body", help="PR body text.")
+    open_pr_parser.add_argument("--fill", action="store_true", help="Let gh fill the PR title/body from commits.")
+    open_pr_parser.add_argument("--draft", action="store_true", help="Create the PR as a draft.")
+
+    publish_pr_parser = subparsers.add_parser(
+        "publish-pr",
+        help="Create a branch, commit changed article files, push, and open a PR.",
+    )
+    publish_pr_parser.add_argument("--base", default="main", help="Base branch for the PR.")
+    publish_pr_parser.add_argument("--branch", help="Explicit branch name to create or reuse.")
+    publish_pr_parser.add_argument("--remote", default="origin", help="Git remote to push to.")
+    publish_pr_parser.add_argument("--title", help="Optional PR title override.")
+    publish_pr_parser.add_argument("--body", help="Optional PR body override.")
+    publish_pr_parser.add_argument(
+        "--fill",
+        action="store_true",
+        help="Let gh fill the PR title/body from commits instead of using generated values.",
+    )
+    publish_pr_parser.add_argument("--draft", action="store_true", help="Create the PR as a draft.")
+    publish_pr_parser.add_argument("--commit-message", help="Optional commit message override.")
+    publish_pr_parser.add_argument(
+        "--include-all",
+        action="store_true",
+        help="Stage all repository changes instead of only changed markdown articles.",
+    )
+    publish_pr_parser.add_argument(
+        "--path",
+        dest="paths",
+        action="append",
+        default=[],
+        help="Specific repo-relative article path to include. Repeatable.",
+    )
+
     return parser
 
 
@@ -1292,12 +2243,28 @@ def main(argv: list[str] | None = None) -> int:
             result = backlog_query(args)
         elif args.command == "tags":
             result = list_tags(args)
+        elif args.command == "audit-tags":
+            result = audit_tags(args)
+        elif args.command == "lint-frontmatter":
+            result = lint_frontmatter(args)
         elif args.command == "check-ref":
             result = check_ref(args)
+        elif args.command == "check-duplicate-paper":
+            result = check_duplicate_paper(args)
         elif args.command == "append":
             if args.commit:
                 args.apply = True  # --commit implies --apply
             result = append_research(args)
+        elif args.command == "archive-source":
+            result = archive_source_command(args)
+        elif args.command == "ingest-paper":
+            result = ingest_paper(args)
+        elif args.command == "intake":
+            result = intake_source(args)
+        elif args.command == "open-pr":
+            result = open_pull_request(args)
+        elif args.command == "publish-pr":
+            result = publish_pull_request(args)
         else:
             parser.error(f"Unsupported command: {args.command}")
             return 1

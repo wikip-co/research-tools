@@ -2,6 +2,49 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+load_dotenv() {
+  local candidate raw_line line key value
+  for candidate in "$REPO_ROOT/.env" "$PWD/.env"; do
+    if [[ -f "$candidate" ]]; then
+      while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+        line="${raw_line#"${raw_line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        if [[ -z "$line" || "$line" == \#* ]]; then
+          continue
+        fi
+        if [[ "$line" == export\ * ]]; then
+          line="${line#export }"
+        fi
+        if [[ "$line" != *=* ]]; then
+          continue
+        fi
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ ${#value} -ge 2 ]]; then
+          if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+            value="${value:1:${#value}-2}"
+          elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+            value="${value:1:${#value}-2}"
+          fi
+        fi
+        if [[ -n "$key" && -z "${!key:-}" ]]; then
+          export "$key=$value"
+        fi
+      done <"$candidate"
+      return
+    fi
+  done
+}
+
+load_dotenv
+
 require_command() {
   local cmd="$1"
   if ! command -v "$cmd" >/dev/null 2>&1; then
