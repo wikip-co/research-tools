@@ -157,6 +157,7 @@ Usage:
   agent-workflow archive-source "<source>" [wiki-automation archive-source args...]
   agent-workflow open-pr [wiki-automation open-pr args...]
   agent-workflow publish-pr [wiki-automation publish-pr args...]
+  agent-workflow triage-ui [gmail-reader-web args...]   # LAN web UI for SQLite triage
   agent-workflow help
 
 Authentication:
@@ -316,6 +317,27 @@ run_open_pr() {
 
 run_publish_pr() {
   run_wiki_command publish-pr "$@"
+}
+
+run_triage_ui() {
+  require_command uv
+  local args=("$@")
+  local i
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    if [[ "${args[$i]}" == "--db" && $((i + 1)) -lt ${#args[@]} ]]; then
+      if [[ "${args[$((i + 1))]}" != /* ]]; then
+        args[$((i + 1))]="$(cd "$(dirname "${args[$((i + 1))]}")" && pwd)/$(basename "${args[$((i + 1))]}")"
+      fi
+    fi
+  done
+  if [[ -n "${GMAIL_READER_DB:-}" ]]; then
+    local db_path="$GMAIL_READER_DB"
+    if [[ "$db_path" != /* ]]; then
+      db_path="$(cd "$(dirname "$db_path")" && pwd)/$(basename "$db_path")"
+    fi
+    args=(--db "$db_path" "${args[@]}")
+  fi
+  uv run --directory "$AGENT_TOOLS_ROOT/gmail-reader" gmail-reader-web "${args[@]}"
 }
 
 run_doctor() {
@@ -572,6 +594,9 @@ main() {
       ;;
     publish-pr)
       run_publish_pr "$@"
+      ;;
+    triage-ui)
+      run_triage_ui "$@"
       ;;
     help|-h|--help)
       usage

@@ -7,6 +7,7 @@ This repository separates the operational tooling from the markdown content repo
 ## Included Tools
 
 - `gmail-reader`: read Google Scholar alert mail via `gws` and store results in SQLite
+- `gmail-reader-web`: LAN web UI for browsing the SQLite intake DB, triaging rows, and launching Codex processing jobs
 - `wiki-automation`: build queues, search content, and prepare scrape packets
 - `image-upload`: upload article images to Cloudinary, including browser-captured screenshots
 - `web-scraper`: scrape source URLs into structured packets, with optional `agent-browser` fallback
@@ -153,6 +154,89 @@ source auth-bootstrap                     # Load Google credentials
 ./agent-workflow publish-pr --draft
 ```
 
+## Web Triage UI
+
+Run the local-area-network web UI from `research-tools`:
+
+```bash
+./agent-workflow triage-ui
+```
+
+By default it binds to:
+
+```text
+http://0.0.0.0:8765
+```
+
+Open it from another machine on the LAN with this computer's LAN IP address, for example:
+
+```text
+http://192.168.1.x:8765
+```
+
+The UI reads and writes the Gmail Reader SQLite DB. It supports:
+
+- filtering by status, processed state, alert name, score, and text search
+- marking rows as `selected`, `review`, `rejected`, or `invalid`
+- marking rows processed without deleting them
+- launching a background Codex job for selected rows
+- viewing job logs and any detected GitHub PR URL
+
+The Codex job runner uses:
+
+```bash
+codex exec -C <workspace-root> --sandbox danger-full-access --ask-for-approval never -
+```
+
+The generated prompt tells Codex to read `docs/research-publishing-style-guide.md`, process the selected rows through the existing tooling, update the `content` repo, and open a draft PR for review. When Codex exits successfully, the web runner sets `processed_at` on those article rows.
+
+Useful overrides:
+
+- `GMAIL_READER_DB=/path/to/scholar-alerts.db`
+- `GMAIL_READER_WEB_HOST=0.0.0.0`
+- `GMAIL_READER_WEB_PORT=8765`
+- `RESEARCH_WORKSPACE_ROOT=/home/anthony/Research`
+- `CODEX_BIN=/path/to/codex`
+- `CODEX_WEB_EXTRA_ARGS="--model gpt-5.4"`
+
+### User Service
+
+On the current workstation, the triage UI is installed as a user-level systemd service:
+
+```bash
+systemctl --user status research-triage-ui.service
+systemctl --user start research-triage-ui.service
+systemctl --user stop research-triage-ui.service
+systemctl --user restart research-triage-ui.service
+systemctl --user enable research-triage-ui.service
+```
+
+The service file is:
+
+```text
+~/.config/systemd/user/research-triage-ui.service
+```
+
+It runs `agent-workflow triage-ui` from this repo, binds to `0.0.0.0:8765`, and uses `gmail-reader/data/scholar-alerts.db`.
+
+A tracked copy of the current service definition is kept at:
+
+```text
+systemd/research-triage-ui.service
+```
+
+To install or reproduce the service on this host:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/research-triage-ui.service ~/.config/systemd/user/research-triage-ui.service
+systemctl --user daemon-reload
+systemctl --user enable research-triage-ui.service
+systemctl --user start research-triage-ui.service
+```
+
+If paths differ from `/home/anthony/Research`, edit the copied service file before `daemon-reload`.
+
 ## Publishing Through Content
 
 The intended workflow is:
@@ -209,6 +293,12 @@ The web-scraper now automatically detects study types (Review, Meta-Analysis, RC
 ### PR Publication Workflow
 - `wiki-automation publish-pr` creates or reuses a branch, commits changed article markdown, pushes, and opens a PR
 - The publish workflow advances matched papers from `drafted` to `committed` to `pr_open` based on the affected article paths
+
+### Web Triage and Agent Jobs
+- `gmail-reader-web` provides a LAN-accessible table UI for the SQLite intake DB
+- Rows can be marked `selected`, `review`, `rejected`, or `invalid` without deleting data
+- Selected rows can launch background Codex jobs that update `content` and submit draft PRs
+- Web job state is stored in `article_jobs` and `article_job_items`
 
 ### Workspace and CI
 - The repo now has a root `uv` workspace, root `uv.lock`, `Makefile`, and GitHub Actions CI

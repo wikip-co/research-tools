@@ -10,6 +10,7 @@ dependencies = [
 
 [project.scripts]
 gmail-reader = "gmail_reader.cli:main"
+gmail-reader-web = "gmail_reader.web:main"
 
 [build-system]
 requires = ["hatchling"]

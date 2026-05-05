@@ -22,6 +22,7 @@ That means:
 - `selected` means "looks promising"
 - `review` means "ambiguous, needs agent or human judgment"
 - `rejected` means "likely noisy or off-target," not "proven irrelevant"
+- `invalid` means "bad parse, malformed row, duplicate noise, or otherwise not useful"
 
 Do not assume every stored article is accurate, high quality, or appropriate for the wiki without a second pass.
 
@@ -159,6 +160,7 @@ Supported command patterns:
 - Sync Scholar alerts: `gmail-reader sync [--days-back N | --after YYYY-MM-DD] [--before YYYY-MM-DD] [--max-messages N] [--query QUERY] [--db PATH]`
 - List alert names: `gmail-reader alerts [--db PATH]`
 - List stored articles: `gmail-reader articles [--status selected|review|rejected|all] [--alert-name NAME] [--limit N] [--db PATH]`
+- Run the web triage UI: `gmail-reader-web [--db PATH] [--host 0.0.0.0] [--port 8765]`
 - Curate a recent topic-focused subset: `gmail-reader curate --topic "strawberry muscle mass" [--days-back N | --after YYYY-MM-DD] [--max-messages N] [--max-results N] [--query QUERY] [--db PATH]`
 - Search recent Scholar mail with arbitrary Gmail filters: `gmail-reader search [--gmail-query QUERY] [--topic TOPIC] [--days-back N | --after YYYY-MM-DD] [--before YYYY-MM-DD] [--max-messages N] [--max-results N] [--include-review] [--save] [--query QUERY] [--db PATH]`
 - List canonical papers: `gmail-reader papers [--status all|matched|unmatched|archived|unarchived] [--limit N] [--db PATH]`
@@ -181,7 +183,7 @@ Operational notes for agents:
 - The default database path in the standalone runtime is `/var/lib/content-agent/gmail-reader/scholar-alerts.db`.
 - The tool uses a Gmail search query scoped to Google Scholar alert messages by default.
 - `sync` stores both the source message metadata and every parsed article candidate.
-- Heuristic triage assigns each article one of `selected`, `review`, or `rejected`.
+- Heuristic triage assigns each article one of `selected`, `review`, or `rejected`; the web UI can also mark bad rows as `invalid`.
 - `selected` is the working queue for downstream article processing.
 - Alert occurrences remain separate, but canonical paper state is tracked in the `papers` table.
 - Workflow state now distinguishes `scraped`, `matched`, `drafted`, `committed`, `pr_open`, and `merged` instead of treating all downstream work as simply "processed".
@@ -192,11 +194,16 @@ Operational notes for agents:
 
 ## SQLite Schema Summary
 
-The database contains three main tables:
+The database contains three main intake tables:
 
 - `messages`: one row per ingested Gmail message
 - `articles`: one row per parsed Scholar result with triage fields and source links
 - `papers`: one row per canonical paper identity with publish/archive state
+
+The web UI adds two operational tables when first started:
+
+- `article_jobs`: one row per background Codex processing job
+- `article_job_items`: selected article rows attached to each job
 
 Useful article columns:
 
@@ -237,6 +244,18 @@ uv run gmail-reader sync --db "/mnt/nas/research/scholar-alerts.db" --days-back 
 ```
 
 For most setups, local primary DB plus NAS backup is safer than using the NAS file as the live primary database.
+
+## Web Triage UI
+
+Start the browser UI:
+
+```bash
+uv run gmail-reader-web --host 0.0.0.0 --port 8765
+```
+
+The UI is intended for a trusted LAN and does not include authentication. It can mark rows as `selected`, `review`, `rejected`, or `invalid`, and it can start a background Codex job for selected rows.
+
+When Codex exits successfully, selected rows are marked processed by setting `articles.processed_at`. Rows are not deleted.
 
 ## Backup Script
 

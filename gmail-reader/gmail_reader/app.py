@@ -235,7 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
     articles_parser = subparsers.add_parser("articles", help="List stored articles.")
     articles_parser.add_argument(
         "--status",
-        choices=["selected", "review", "rejected", "all"],
+        choices=["selected", "review", "rejected", "invalid", "all"],
         default="selected",
         help="Filter articles by triage status.",
     )
@@ -352,7 +352,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backlog_parser.add_argument(
         "--status",
-        choices=["selected", "review", "rejected", "all"],
+        choices=["selected", "review", "rejected", "invalid", "all"],
         default="selected",
         help="Filter articles by triage status (default: selected).",
     )
@@ -1154,7 +1154,8 @@ def list_alerts(db_path: Path) -> dict[str, Any]:
         SELECT alert_name, COUNT(*) AS article_count,
                SUM(CASE WHEN status = 'selected' THEN 1 ELSE 0 END) AS selected_count,
                SUM(CASE WHEN status = 'review' THEN 1 ELSE 0 END) AS review_count,
-               SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected_count
+               SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected_count,
+               SUM(CASE WHEN status = 'invalid' THEN 1 ELSE 0 END) AS invalid_count
         FROM articles
         GROUP BY alert_name
         ORDER BY selected_count DESC, article_count DESC, alert_name ASC

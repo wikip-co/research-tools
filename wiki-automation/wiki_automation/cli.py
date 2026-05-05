@@ -2083,7 +2083,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backlog_parser.add_argument(
         "--status",
-        choices=["selected", "review", "rejected", "all"],
+        choices=["selected", "review", "rejected", "invalid", "all"],
         default="selected",
     )
     backlog_parser.add_argument("--min-score", type=int, default=0)
