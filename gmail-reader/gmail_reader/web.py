@@ -297,6 +297,16 @@ def create_job(conn: sqlite3.Connection, articles: list[dict[str, Any]], prompt:
     return job_id
 
 
+def append_job_log(conn: sqlite3.Connection, job_id: int, chunk: str, *, max_chars: int = 200000) -> None:
+    if not chunk:
+        return
+    row = conn.execute("SELECT log FROM article_jobs WHERE job_id = ?", (job_id,)).fetchone()
+    current = row["log"] if row else ""
+    updated = (current + chunk)[-max_chars:]
+    conn.execute("UPDATE article_jobs SET log = ? WHERE job_id = ?", (updated, job_id))
+    conn.commit()
+
+
 def build_codex_prompt(
     *,
     workspace_root: Path,
@@ -378,30 +388,41 @@ def run_job(job_id: int, db_path: Path, workspace_root: Path, article_keys: list
             (utc_now_iso(), job_id),
         )
         conn.commit()
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
-            input=prompt,
             cwd=workspace_root,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            capture_output=True,
+            bufsize=1,
         )
-        log = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
+        if process.stdin is not None:
+            process.stdin.write(prompt)
+            process.stdin.close()
+        log_parts: list[str] = []
+        if process.stdout is not None:
+            for line in process.stdout:
+                log_parts.append(line)
+                append_job_log(conn, job_id, line)
+        return_code = process.wait()
+        log = "".join(log_parts).strip()
         pr_matches = PR_URL_PATTERN.findall(log)
         pr_url = pr_matches[-1] if pr_matches else ""
-        if result.returncode == 0:
+        if return_code == 0:
             mark_articles_processed(conn, article_keys)
             state = "completed"
             error = ""
         else:
             state = "failed"
-            error = f"Codex exited with {result.returncode}"
+            error = f"Codex exited with {return_code}"
         conn.execute(
             """
             UPDATE article_jobs
             SET state = ?, finished_at = ?, log = ?, exit_code = ?, pr_url = ?, error = ?
             WHERE job_id = ?
             """,
-            (state, utc_now_iso(), log[-200000:], result.returncode, pr_url, error, job_id),
+            (state, utc_now_iso(), log[-200000:], return_code, pr_url, error, job_id),
         )
         conn.commit()
     except Exception as exc:

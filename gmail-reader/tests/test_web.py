@@ -6,6 +6,7 @@ from pathlib import Path
 
 from gmail_reader.app import ensure_db, utc_now_iso
 from gmail_reader.web import (
+    append_job_log,
     build_codex_prompt,
     connect,
     codex_command,
@@ -146,6 +147,19 @@ class WebHelpersTests(unittest.TestCase):
         self.assertLess(command.index("--ask-for-approval"), command.index("exec"))
         self.assertLess(command.index("--sandbox"), command.index("exec"))
         self.assertEqual(command[-1], "-")
+
+    def test_append_job_log_keeps_recent_output(self) -> None:
+        conn = connect(self.db_path)
+        try:
+            articles = fetch_articles_by_key(conn, ["article-1"])
+            job_id = create_job(conn, articles, "prompt", ["codex", "exec", "-"])
+            append_job_log(conn, job_id, "abc", max_chars=5)
+            append_job_log(conn, job_id, "def", max_chars=5)
+            job = fetch_job(conn, job_id)
+        finally:
+            conn.close()
+
+        self.assertEqual(job["log"], "bcdef")
 
 
 if __name__ == "__main__":
