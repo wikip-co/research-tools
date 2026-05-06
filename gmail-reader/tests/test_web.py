@@ -8,6 +8,7 @@ from gmail_reader.app import ensure_db, utc_now_iso
 from gmail_reader.web import (
     build_codex_prompt,
     connect,
+    codex_command,
     create_job,
     fetch_articles,
     fetch_articles_by_key,
@@ -139,6 +140,12 @@ class WebHelpersTests(unittest.TestCase):
         self.assertIn("research-publishing-style-guide.md", prompt)
         self.assertEqual(updated, 1)
         self.assertEqual(len(rows), 1)
+
+    def test_codex_global_flags_precede_exec_subcommand(self) -> None:
+        command = codex_command(Path("/tmp/research"))
+        self.assertLess(command.index("--ask-for-approval"), command.index("exec"))
+        self.assertLess(command.index("--sandbox"), command.index("exec"))
+        self.assertEqual(command[-1], "-")
 
 
 if __name__ == "__main__":

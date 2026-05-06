@@ -185,7 +185,7 @@ The UI reads and writes the Gmail Reader SQLite DB. It supports:
 The Codex job runner uses:
 
 ```bash
-codex exec -C <workspace-root> --sandbox danger-full-access --ask-for-approval never -
+codex --sandbox danger-full-access --ask-for-approval never exec -C <workspace-root> -
 ```
 
 The generated prompt tells Codex to read `docs/research-publishing-style-guide.md`, process the selected rows through the existing tooling, update the `content` repo, and open a draft PR for review. When Codex exits successfully, the web runner sets `processed_at` on those article rows.

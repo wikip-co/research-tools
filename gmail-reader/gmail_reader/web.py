@@ -351,13 +351,13 @@ def codex_command(workspace_root: Path) -> list[str]:
     extra = os.environ.get("CODEX_WEB_EXTRA_ARGS", "").strip()
     command = [
         codex_bin,
-        "exec",
-        "-C",
-        str(workspace_root),
         "--sandbox",
         "danger-full-access",
         "--ask-for-approval",
         "never",
+        "exec",
+        "-C",
+        str(workspace_root),
     ]
     if extra:
         command.extend(extra.split())
