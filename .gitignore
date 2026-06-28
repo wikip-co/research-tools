@@ -6,5 +6,6 @@ __pycache__/
 .env
 out/
 runtime/
+archive/
 *.db
 *.sqlite*
