@@ -14,6 +14,7 @@ from gmail_reader.web import (
     fetch_articles,
     fetch_articles_by_key,
     fetch_job,
+    job_log_delta,
     mark_articles_processed,
     update_article_status,
 )
@@ -160,6 +161,35 @@ class WebHelpersTests(unittest.TestCase):
             conn.close()
 
         self.assertEqual(job["log"], "bcdef")
+
+    def test_job_log_delta_returns_appended_output(self) -> None:
+        conn = connect(self.db_path)
+        try:
+            articles = fetch_articles_by_key(conn, ["article-1"])
+            job_id = create_job(conn, articles, "prompt", ["codex", "exec", "-"])
+            append_job_log(conn, job_id, "first\n")
+            first = job_log_delta(conn, job_id, 0)
+            append_job_log(conn, job_id, "second\n")
+            second = job_log_delta(conn, job_id, first["offset"])
+        finally:
+            conn.close()
+
+        self.assertEqual(first["chunk"], "first\n")
+        self.assertEqual(second["chunk"], "second\n")
+        self.assertFalse(second["reset"])
+
+    def test_job_log_delta_resets_when_offset_is_past_truncated_log(self) -> None:
+        conn = connect(self.db_path)
+        try:
+            articles = fetch_articles_by_key(conn, ["article-1"])
+            job_id = create_job(conn, articles, "prompt", ["codex", "exec", "-"])
+            append_job_log(conn, job_id, "abc")
+            delta = job_log_delta(conn, job_id, 20)
+        finally:
+            conn.close()
+
+        self.assertEqual(delta["chunk"], "abc")
+        self.assertTrue(delta["reset"])
 
 
 if __name__ == "__main__":

@@ -83,6 +83,10 @@ def html_escape(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
 
+def json_script_data(value: Any) -> str:
+    return json.dumps(value).replace("</", "<\\/")
+
+
 def parse_int(value: str | None, default: int, *, minimum: int = 0, maximum: int = 500) -> int:
     try:
         number = int(value or default)
@@ -199,6 +203,29 @@ def fetch_jobs(conn: sqlite3.Connection, limit: int = 10) -> list[dict[str, Any]
 def fetch_job(conn: sqlite3.Connection, job_id: int) -> dict[str, Any] | None:
     row = conn.execute("SELECT * FROM article_jobs WHERE job_id = ?", (job_id,)).fetchone()
     return dict(row) if row else None
+
+
+def job_log_delta(conn: sqlite3.Connection, job_id: int, offset: int) -> dict[str, Any] | None:
+    job = fetch_job(conn, job_id)
+    if not job:
+        return None
+    log = job.get("log") or job.get("error") or ""
+    log_length = len(log)
+    safe_offset = max(0, offset)
+    reset = False
+    if safe_offset > log_length:
+        safe_offset = 0
+        reset = True
+    return {
+        "job_id": job_id,
+        "state": job.get("state") or "",
+        "offset": log_length,
+        "chunk": log[safe_offset:],
+        "reset": reset,
+        "exit_code": job.get("exit_code"),
+        "pr_url": job.get("pr_url") or "",
+        "error": job.get("error") or "",
+    }
 
 
 def fetch_job_items(conn: sqlite3.Connection, job_id: int) -> list[dict[str, Any]]:
@@ -460,6 +487,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def send_head_ok(self) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -482,6 +518,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_html(render_index(self.server.db_path, params))
         elif parsed.path == "/jobs":
             self.send_html(render_jobs(self.server.db_path))
+        elif (match := re.fullmatch(r"/jobs/(\d+)/log", parsed.path)):
+            job_id = parse_int(match.group(1), 0, minimum=0, maximum=1_000_000)
+            offset = parse_int(params.get("offset", ["0"])[0], 0, minimum=0, maximum=1_000_000)
+            conn = connect(self.server.db_path)
+            try:
+                payload = job_log_delta(conn, job_id, offset)
+            finally:
+                conn.close()
+            if payload is None:
+                self.send_json({"error": "Job not found"}, HTTPStatus.NOT_FOUND)
+            else:
+                self.send_json(payload)
         elif parsed.path.startswith("/jobs/"):
             job_id = parse_int(parsed.path.rsplit("/", 1)[-1], 0, minimum=0, maximum=1_000_000)
             self.send_html(render_job_detail(self.server.db_path, job_id))
@@ -578,6 +626,29 @@ def render_page(title: str, content: str) -> str:
     .links a {{ display: inline-block; margin-right: 8px; color: var(--accent); }}
     .pager {{ display: flex; gap: 8px; align-items: center; margin: 12px 0; }}
     pre {{ white-space: pre-wrap; overflow: auto; background: #f6f8fa; border: 1px solid var(--line); border-radius: 6px; padding: 12px; }}
+    .job-log-header {{ display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin: 20px 0 8px; }}
+    .job-log-controls {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }}
+    .job-terminal {{ min-height: 420px; max-height: 68vh; overflow: auto; border: 1px solid #30363d; border-radius: 6px; padding: 12px; background: #0d1117; color: #e6edf3; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }}
+    .job-terminal:focus {{ outline: 2px solid color-mix(in srgb, var(--accent), transparent 45%); outline-offset: 2px; }}
+    .ansi-bold {{ font-weight: 700; }}
+    .ansi-dim {{ opacity: .68; }}
+    .ansi-italic {{ font-style: italic; }}
+    .ansi-underline {{ text-decoration: underline; }}
+    .ansi-fg-black {{ color: #8b949e; }}
+    .ansi-fg-red {{ color: #ff7b72; }}
+    .ansi-fg-green {{ color: #7ee787; }}
+    .ansi-fg-yellow {{ color: #d29922; }}
+    .ansi-fg-blue {{ color: #79c0ff; }}
+    .ansi-fg-magenta {{ color: #d2a8ff; }}
+    .ansi-fg-cyan {{ color: #76e3ea; }}
+    .ansi-fg-white {{ color: #e6edf3; }}
+    .ansi-bg-red {{ background: #da3633; }}
+    .ansi-bg-green {{ background: #238636; }}
+    .ansi-bg-yellow {{ background: #9e6a03; }}
+    .ansi-bg-blue {{ background: #1f6feb; }}
+    .ansi-bg-magenta {{ background: #8957e5; }}
+    .ansi-bg-cyan {{ background: #0e7490; }}
+    .ansi-bg-white {{ background: #6e7681; }}
     @media (max-width: 900px) {{ form.filters {{ grid-template-columns: 1fr 1fr; }} th:nth-child(5), td:nth-child(5) {{ display: none; }} }}
   </style>
 </head>
@@ -755,6 +826,159 @@ def render_jobs(db_path: Path) -> str:
     return render_page("Jobs", content)
 
 
+def render_job_log_script() -> str:
+    return """
+<script>
+(function () {
+  const dataEl = document.getElementById("job-log-data");
+  const terminal = document.getElementById("job-log-terminal");
+  const plain = document.getElementById("job-log-plain");
+  const status = document.getElementById("job-live-status");
+  const pr = document.getElementById("job-live-pr");
+  const follow = document.getElementById("job-follow-tail");
+  const copy = document.getElementById("job-copy-log");
+  if (!dataEl || !terminal || !plain || !status) return;
+
+  const initial = JSON.parse(dataEl.textContent || "{}");
+  const activeClasses = new Set();
+  let offset = initial.offset || 0;
+  let fullLog = initial.log || "";
+
+  function removePrefix(prefix) {
+    for (const value of Array.from(activeClasses)) {
+      if (value.startsWith(prefix)) activeClasses.delete(value);
+    }
+  }
+
+  function setSgr(codes) {
+    if (!codes.length) codes = [0];
+    for (const code of codes) {
+      if (code === 0) activeClasses.clear();
+      else if (code === 1) activeClasses.add("ansi-bold");
+      else if (code === 2) activeClasses.add("ansi-dim");
+      else if (code === 3) activeClasses.add("ansi-italic");
+      else if (code === 4) activeClasses.add("ansi-underline");
+      else if (code === 22) {
+        activeClasses.delete("ansi-bold");
+        activeClasses.delete("ansi-dim");
+      } else if (code === 23) activeClasses.delete("ansi-italic");
+      else if (code === 24) activeClasses.delete("ansi-underline");
+      else if (code === 39) removePrefix("ansi-fg-");
+      else if (code === 49) removePrefix("ansi-bg-");
+      else if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) {
+        const names = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+        removePrefix("ansi-fg-");
+        activeClasses.add("ansi-fg-" + names[code % 10]);
+      } else if (code >= 40 && code <= 47) {
+        const names = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+        removePrefix("ansi-bg-");
+        activeClasses.add("ansi-bg-" + names[code - 40]);
+      }
+    }
+  }
+
+  function appendAnsi(text, reset) {
+    if (reset) {
+      terminal.textContent = "";
+      activeClasses.clear();
+    }
+    if (!text) return;
+
+    const stickToBottom = follow.checked || terminal.scrollTop + terminal.clientHeight >= terminal.scrollHeight - 24;
+    const fragment = document.createDocumentFragment();
+    let span = document.createElement("span");
+    let i = 0;
+
+    function syncSpanClass() {
+      span.className = Array.from(activeClasses).join(" ");
+    }
+
+    function flushSpan() {
+      if (span.childNodes.length) fragment.appendChild(span);
+      span = document.createElement("span");
+      syncSpanClass();
+    }
+
+    syncSpanClass();
+    while (i < text.length) {
+      if (text.charCodeAt(i) === 27 && text[i + 1] === "[") {
+        const end = text.indexOf("m", i + 2);
+        if (end !== -1) {
+          flushSpan();
+          const raw = text.slice(i + 2, end);
+          const codes = raw ? raw.split(";").map((part) => Number(part || "0")).filter((value) => Number.isFinite(value)) : [0];
+          setSgr(codes);
+          syncSpanClass();
+          i = end + 1;
+          continue;
+        }
+      }
+      const ch = text[i++];
+      if (ch === "\\r") continue;
+      span.appendChild(document.createTextNode(ch));
+    }
+    flushSpan();
+    terminal.appendChild(fragment);
+    if (stickToBottom) terminal.scrollTop = terminal.scrollHeight;
+  }
+
+  function setStatus(payload) {
+    const state = payload.state || "unknown";
+    status.textContent = state;
+    status.className = "pill job-" + state;
+    if (payload.pr_url && pr) {
+      pr.innerHTML = "";
+      const link = document.createElement("a");
+      link.href = payload.pr_url;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = payload.pr_url;
+      pr.appendChild(link);
+    }
+  }
+
+  async function poll() {
+    try {
+      const response = await fetch("/jobs/" + initial.job_id + "/log?offset=" + offset, { cache: "no-store" });
+      if (!response.ok) throw new Error("log request failed");
+      const payload = await response.json();
+      setStatus(payload);
+      if (payload.reset) {
+        fullLog = "";
+        plain.textContent = "";
+      }
+      if (payload.chunk) {
+        fullLog += payload.chunk;
+        plain.textContent = fullLog;
+        appendAnsi(payload.chunk, payload.reset);
+      }
+      offset = payload.offset || offset;
+      if (payload.state === "queued" || payload.state === "running") {
+        window.setTimeout(poll, 1000);
+      }
+    } catch (error) {
+      status.textContent = "log disconnected";
+      window.setTimeout(poll, 2500);
+    }
+  }
+
+  copy?.addEventListener("click", async () => {
+    await navigator.clipboard.writeText(fullLog);
+    copy.textContent = "Copied";
+    window.setTimeout(() => { copy.textContent = "Copy log"; }, 1200);
+  });
+
+  plain.textContent = fullLog;
+  appendAnsi(fullLog, true);
+  setStatus(initial);
+  if (initial.state === "queued" || initial.state === "running") {
+    window.setTimeout(poll, 1000);
+  }
+})();
+</script>
+"""
+
+
 def render_job_detail(db_path: Path, job_id: int) -> str:
     conn = connect(db_path)
     try:
@@ -764,6 +988,16 @@ def render_job_detail(db_path: Path, job_id: int) -> str:
         conn.close()
     if not job:
         return render_page("Job not found", "<p>Job not found.</p>")
+    log_text = job.get("log") or job.get("error") or ""
+    initial_log = {
+        "job_id": job_id,
+        "state": job.get("state") or "",
+        "offset": len(log_text),
+        "log": log_text,
+        "exit_code": job.get("exit_code"),
+        "pr_url": job.get("pr_url") or "",
+        "error": job.get("error") or "",
+    }
     item_rows = "\n".join(
         f"<tr><td>{html_escape(item['status'])}</td><td>{html_escape(item['title'])}</td><td>{html_escape(item['article_url'])}</td></tr>"
         for item in items
@@ -779,10 +1013,24 @@ def render_job_detail(db_path: Path, job_id: int) -> str:
 <p class="muted">Created {html_escape(job['created_at'])}; started {html_escape(job['started_at'])}; finished {html_escape(job['finished_at'])}</p>
 <h2>Rows</h2>
 <table><thead><tr><th>Status</th><th>Title</th><th>URL</th></tr></thead><tbody>{item_rows}</tbody></table>
-<h2>Log</h2>
-<pre>{html_escape(job.get('log') or job.get('error') or '')}</pre>
+<div class="job-log-header">
+  <h2>Live Log</h2>
+  <div class="job-log-controls">
+    <span id="job-live-status" class="pill job-{html_escape(job['state'])}">{html_escape(job['state'])}</span>
+    <label><input id="job-follow-tail" type="checkbox" checked> Follow tail</label>
+    <button id="job-copy-log" type="button">Copy log</button>
+    <span id="job-live-pr">{pr}</span>
+  </div>
+</div>
+<div id="job-log-terminal" class="job-terminal" tabindex="0" aria-label="Live Codex job log"></div>
+<details>
+  <summary>Plain log</summary>
+  <pre id="job-log-plain">{html_escape(log_text)}</pre>
+</details>
 <h2>Prompt</h2>
 <pre>{html_escape(job.get('prompt') or '')}</pre>
+<script id="job-log-data" type="application/json">{json_script_data(initial_log)}</script>
+{render_job_log_script()}
 """
     return render_page(f"Job {job_id}", content)
 
