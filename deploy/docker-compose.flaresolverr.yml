@@ -1,0 +1,42 @@
+# FlareSolverr — Cloudflare / DDoS-GUARD challenge solver for research-tools/web-scraper.
+#
+# API: POST http://localhost:8191/v1
+# Upstream: https://github.com/FlareSolverr/FlareSolverr
+#
+# Always pull the newest published image before start (stay ahead of CF changes):
+#   cd research-tools
+#   docker compose -f deploy/docker-compose.flaresolverr.yml pull
+#   docker compose -f deploy/docker-compose.flaresolverr.yml up -d
+#
+# Or one-shot:
+#   docker compose -f deploy/docker-compose.flaresolverr.yml up -d --pull always
+#
+# web-scraper env (optional overrides):
+#   FLARESOLVERR_URL=http://127.0.0.1:8191/v1
+#   WEB_SCRAPER_FLARESOLVERR_MODE=auto|off|force
+#   WEB_SCRAPER_FLARESOLVERR_TIMEOUT_MS=120000
+
+services:
+  flaresolverr:
+    # Track upstream latest; compose pull_policy keeps ser9 current on restart/up.
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    pull_policy: always
+    container_name: research-flaresolverr
+    environment:
+      - LOG_LEVEL=info
+      - LOG_HTML=false
+      - CAPTCHA_SOLVER=none
+      - TZ=America/Los_Angeles
+    ports:
+      - "8191:8191"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8191')\" || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

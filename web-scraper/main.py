@@ -104,6 +104,12 @@ AGENT_BROWSER_FORCE_DOMAINS = tuple(
     for pattern in os.getenv("WEB_SCRAPER_AGENT_BROWSER_DOMAINS", "").split(",")
     if pattern.strip()
 )
+# FlareSolverr (Cloudflare / DDoS-GUARD bypass proxy). Default matches local docker compose.
+FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://127.0.0.1:8191/v1").strip()
+FLARESOLVERR_MODE_DEFAULT = (
+    os.getenv("WEB_SCRAPER_FLARESOLVERR_MODE", "auto").strip().lower() or "auto"
+)
+FLARESOLVERR_MAX_TIMEOUT_MS = int(os.getenv("WEB_SCRAPER_FLARESOLVERR_TIMEOUT_MS", "120000"))
 
 WEAK_CONTENT_PATTERNS = {
     "javascript_required": _re.compile(r"enable\s+javascript|javascript\s+(is\s+)?required", _re.IGNORECASE),
@@ -347,6 +353,57 @@ def resolve_agent_browser_mode(cli_mode: str | None) -> str:
     if mode not in {"auto", "off", "force"}:
         raise ValueError(f"Unsupported agent-browser mode: {mode}")
     return mode
+
+
+def resolve_flaresolverr_mode(cli_mode: str | None) -> str:
+    mode = (cli_mode or FLARESOLVERR_MODE_DEFAULT or "auto").lower()
+    if mode not in {"auto", "off", "force"}:
+        raise ValueError(f"Unsupported flaresolverr mode: {mode}")
+    return mode
+
+
+def flaresolverr_configured() -> bool:
+    return bool(FLARESOLVERR_URL)
+
+
+def fetch_with_flaresolverr(url: str) -> tuple[str, str]:
+    """Fetch URL HTML via FlareSolverr (solves Cloudflare challenges when possible)."""
+    if not FLARESOLVERR_URL:
+        raise RuntimeError("FLARESOLVERR_URL is not configured")
+
+    payload = {
+        "cmd": "request.get",
+        "url": url,
+        "maxTimeout": FLARESOLVERR_MAX_TIMEOUT_MS,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = Request(
+        FLARESOLVERR_URL,
+        data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    # Allow long CF solves; urllib default can be tight.
+    timeout_s = max(30.0, FLARESOLVERR_MAX_TIMEOUT_MS / 1000.0 + 15.0)
+    with urlopen(req, timeout=timeout_s) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+    data = json.loads(raw)
+    if data.get("status") != "ok":
+        raise RuntimeError(
+            f"FlareSolverr failed: {data.get('message') or data.get('status') or 'unknown error'}"
+        )
+    solution = data.get("solution") or {}
+    html = solution.get("response") or ""
+    final_url = solution.get("url") or url
+    if not isinstance(html, str) or not html.strip():
+        raise RuntimeError("FlareSolverr returned empty HTML")
+    # Still stuck on challenge page?
+    low = html.lower()
+    if "just a moment" in low and "cloudflare" in low and len(html) < 20000:
+        raise RuntimeError("FlareSolverr returned Cloudflare challenge page")
+    if not isinstance(final_url, str) or not final_url.strip():
+        final_url = url
+    return final_url, html
 
 
 def fetch_with_agent_browser(url: str) -> tuple[str, str]:
@@ -616,9 +673,10 @@ def fetch_pubmed_metadata(doi: str, title: str, url: str) -> dict[str, Any]:
         )
         pmid = first_item(payload.get("esearchresult", {}).get("idlist", []))
     if not pmid and title:
+        title_term = quote(f'"{title}"[Title]')
         payload = fetch_json(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-            f"?db=pubmed&retmode=json&term={quote(f'\"{title}\"[Title]')}"
+            f"?db=pubmed&retmode=json&term={title_term}"
         )
         pmid = first_item(payload.get("esearchresult", {}).get("idlist", []))
     if not pmid:
@@ -1025,70 +1083,124 @@ def scrape_with_scrapling(url: str) -> dict[str, Any]:
     return extract_article_data(url, page.html_content, retrieval_backend="scrapling")
 
 
-def scrape_article(source: str, agent_browser_mode: str | None = None) -> dict[str, Any]:
+def _primary_needs_fallback(primary_data: dict[str, Any] | None, primary_error: Exception | None) -> bool:
+    if primary_error is not None:
+        return True
+    if primary_data is None:
+        return True
+    return bool(primary_data.get("retrieval_issues"))
+
+
+def _fallback_trigger_reasons(
+    primary_data: dict[str, Any] | None,
+    primary_error: Exception | None,
+    forced: bool,
+) -> list[str]:
+    if forced:
+        return ["forced"]
+    if primary_error is not None:
+        return [f"primary_fetch_failed: {primary_error}"]
+    if primary_data is not None:
+        return list(primary_data.get("retrieval_issues", [])) or ["quality_check"]
+    return ["no_primary_data"]
+
+
+def scrape_article(
+    source: str,
+    agent_browser_mode: str | None = None,
+    flaresolverr_mode: str | None = None,
+) -> dict[str, Any]:
     if looks_like_pdf_source(source):
         return scrape_pdf_source(source)
 
     if not looks_like_url(source):
         raise ValueError("source must be an HTTP(S) URL or a local PDF path")
 
-    mode = resolve_agent_browser_mode(agent_browser_mode)
-    force_fallback = mode == "force" or force_agent_browser_for_url(source)
+    ab_mode = resolve_agent_browser_mode(agent_browser_mode)
+    fs_mode = resolve_flaresolverr_mode(flaresolverr_mode)
+    force_ab = ab_mode == "force" or force_agent_browser_for_url(source)
+    force_fs = fs_mode == "force"
+    force_any = force_ab or force_fs
     binary = resolve_agent_browser_binary(AGENT_BROWSER_COMMAND)
 
     primary_data: dict[str, Any] | None = None
     primary_error: Exception | None = None
+    best: dict[str, Any] | None = None
+    errors: list[str] = []
 
-    if not force_fallback:
+    if not force_any:
         try:
             primary_data = scrape_with_scrapling(source)
             primary_data["retrieval_issues"] = extraction_issues(primary_data)
+            best = primary_data
         except Exception as exc:
             primary_error = exc
+            errors.append(f"scrapling: {exc}")
 
-    should_try_agent_browser = mode != "off" and binary and (
-        force_fallback
-        or primary_error is not None
-        or bool(primary_data and primary_data.get("retrieval_issues"))
+    needs_fallback = force_any or _primary_needs_fallback(primary_data, primary_error)
+    trigger_reasons = _fallback_trigger_reasons(primary_data, primary_error, forced=force_any)
+
+    # Prefer FlareSolverr for Cloudflare / weak primary content (proven on Sage etc.).
+    should_try_fs = (
+        fs_mode != "off"
+        and flaresolverr_configured()
+        and (
+            force_fs
+            or needs_fallback
+        )
     )
+    if should_try_fs:
+        try:
+            final_url, html = fetch_with_flaresolverr(source)
+            fs_data = extract_article_data(final_url, html, retrieval_backend="flaresolverr")
+            fs_data["requested_url"] = source
+            fs_data["retrieval_issues"] = extraction_issues(fs_data)
+            fs_data["fallback_used"] = True
+            fs_data["fallback_trigger"] = trigger_reasons
+            if best is None or extraction_score(fs_data) >= extraction_score(best):
+                best = fs_data
+            elif primary_data is not None:
+                primary_data["flaresolverr_attempted"] = True
+                primary_data["flaresolverr_kept_primary"] = True
+        except Exception as fs_exc:
+            errors.append(f"flaresolverr: {fs_exc}")
+            if primary_data is not None:
+                primary_data["flaresolverr_error"] = str(fs_exc)
 
-    if should_try_agent_browser:
-        trigger_reasons = ["forced"]
-        if primary_error is not None:
-            trigger_reasons = [f"primary_fetch_failed: {primary_error}"]
-        elif primary_data is not None:
-            trigger_reasons = list(primary_data.get("retrieval_issues", [])) or ["quality_check"]
-
+    # Still weak? Try agent-browser next.
+    still_weak = best is None or bool(best.get("retrieval_issues")) or force_ab
+    should_try_ab = ab_mode != "off" and binary and still_weak
+    if should_try_ab:
         try:
             final_url, rendered_html = fetch_with_agent_browser(source)
-            fallback_data = extract_article_data(final_url, rendered_html, retrieval_backend="agent-browser")
-            fallback_data["requested_url"] = source
-            fallback_data["retrieval_issues"] = extraction_issues(fallback_data)
-            fallback_data["fallback_used"] = True
-            fallback_data["fallback_trigger"] = trigger_reasons
+            ab_data = extract_article_data(final_url, rendered_html, retrieval_backend="agent-browser")
+            ab_data["requested_url"] = source
+            ab_data["retrieval_issues"] = extraction_issues(ab_data)
+            ab_data["fallback_used"] = True
+            ab_data["fallback_trigger"] = trigger_reasons
+            if best is None or extraction_score(ab_data) >= extraction_score(best):
+                best = ab_data
+            elif best is not None:
+                best["agent_browser_attempted"] = True
+                best["agent_browser_kept_other"] = True
+        except Exception as ab_exc:
+            errors.append(f"agent-browser: {ab_exc}")
+            if best is not None:
+                best["agent_browser_error"] = str(ab_exc)
 
-            if primary_data is None or extraction_score(fallback_data) >= extraction_score(primary_data):
-                return fallback_data
-
-            primary_data["agent_browser_attempted"] = True
-            primary_data["agent_browser_kept_primary"] = True
-            primary_data["agent_browser_trigger"] = trigger_reasons
-            return primary_data
-        except Exception as fallback_exc:
-            if primary_data is None:
-                raise RuntimeError(
-                    f"Primary scrape failed and agent-browser fallback also failed: {fallback_exc}"
-                ) from fallback_exc
-            primary_data["agent_browser_error"] = str(fallback_exc)
-            return primary_data
-
-    if primary_data is not None:
-        return primary_data
+    if best is not None:
+        if errors:
+            best.setdefault("retrieval_errors", errors)
+        return best
 
     if primary_error is not None:
-        raise primary_error
+        detail = "; ".join(errors) if errors else str(primary_error)
+        raise RuntimeError(f"All retrieval paths failed: {detail}") from primary_error
 
-    raise RuntimeError("No retrieval path produced data")
+    raise RuntimeError(
+        "No retrieval path produced data"
+        + (f" ({'; '.join(errors)})" if errors else "")
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1116,6 +1228,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "off", "force"],
         help="Fallback mode for agent-browser: auto, off, or force.",
     )
+    parser.add_argument(
+        "--flaresolverr-mode",
+        choices=["auto", "off", "force"],
+        help="Cloudflare bypass via FlareSolverr: auto, off, or force.",
+    )
     return parser
 
 
@@ -1125,7 +1242,11 @@ def main(argv: list[str] | None = None) -> int:
     output_path = args.output or args.legacy_output
 
     try:
-        data = scrape_article(args.source, agent_browser_mode=args.agent_browser_mode)
+        data = scrape_article(
+            args.source,
+            agent_browser_mode=args.agent_browser_mode,
+            flaresolverr_mode=args.flaresolverr_mode,
+        )
         packet = markdown_packet(data)
 
         if output_path:

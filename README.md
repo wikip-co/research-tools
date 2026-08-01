@@ -10,7 +10,7 @@ This repository separates the operational tooling from the markdown content repo
 - `gmail-reader-web`: LAN web UI for browsing the SQLite intake DB, triaging rows, and launching Codex processing jobs
 - `wiki-automation`: build queues, search content, and prepare scrape packets
 - `image-upload`: upload article images to Cloudinary, including browser-captured screenshots
-- `web-scraper`: scrape source URLs into structured packets, with optional `agent-browser` fallback
+- `web-scraper`: scrape source URLs into structured packets, with optional FlareSolverr (Cloudflare) and `agent-browser` fallbacks
 
 ## Runtime Model
 
@@ -276,6 +276,11 @@ Check if a URL is already referenced in any article in the content repo.
 The web-scraper now automatically detects study types (Review, Meta-Analysis, RCT, In Vivo, In Vitro, etc.) from article metadata.
 
 ### Browser Fallback and Screenshots
+- `web-scraper` fallback order on weak/blocked HTML: **scrapling → FlareSolverr → agent-browser**
+- `--flaresolverr-mode auto|off|force` solves Cloudflare / bot interstitials via local FlareSolverr (`FLARESOLVERR_URL`, default `http://127.0.0.1:8191/v1`)
+- Full text when available; **abstract-only is acceptable** for paywalled publisher pages
+- Deploy/update FlareSolverr (always pulls `latest`): see `deploy/README.md` and `deploy/docker-compose.flaresolverr.yml`
+  - `docker compose -f deploy/docker-compose.flaresolverr.yml up -d --pull always`
 - `web-scraper` supports `--agent-browser-mode auto|off|force` for pages that need a browser-rendered fallback
 - `image-upload --capture-url "<url>"` captures a browser screenshot, uploads it to Cloudinary, and returns the hosted URLs in JSON
 
