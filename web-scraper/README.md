@@ -58,6 +58,7 @@ uv run web-scraper "https://journals.sagepub.com/doi/full/10.1177/25151355251387
 - The JSON payload includes `footnote_markdown`, which follows this repo's numbered-footnote style.
 - Local PDFs and remote PDF URLs are supported through a `pypdf` extraction path.
 - **Content quality bar:** prefer full text; **abstract-only is acceptable** for paywalled articles.
+- Publisher PDF / paywall-direct URLs (e.g. Sage `/doi/pdf/`, Wiley `pdfdirect`, OUP `advance-article-pdf`) are **rewritten to HTML landing pages** before scrape via `canonicalize_article_url`.
 - When possible, the scraper enriches missing metadata from Crossref, PubMed, and Unpaywall to improve DOI/PMID/open-access coverage.
 
 ## Retrieval fallbacks

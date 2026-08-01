@@ -241,6 +241,198 @@ def looks_like_pdf_source(value: str) -> bool:
     return Path(value).expanduser().suffix.lower() == ".pdf"
 
 
+def canonicalize_article_url(source: str) -> tuple[str, list[str]]:
+    """Rewrite common publisher PDF / paywall-direct links to HTML landing pages.
+
+    Scholar alerts often point at ``/doi/pdf`` or ``advance-article-pdf`` URLs that
+    403 or return empty shells through automation. Prefer the HTML article/abstract
+    page so FlareSolverr can recover full text or at least the abstract.
+
+    Local file paths and non-HTTP sources are returned unchanged.
+    """
+    if not looks_like_url(source):
+        return source, []
+
+    original = source
+    parsed = urlparse(source)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path or ""
+    query = parsed.query or ""
+    notes: list[str] = []
+
+    def rebuild(new_path: str, *, clear_query: bool = False) -> str:
+        return parsed._replace(
+            path=new_path,
+            query="" if clear_query else query,
+            fragment="",
+        ).geturl()
+
+    # --- Sage ---
+    if "sagepub.com" in host:
+        for old, new, label in (
+            ("/doi/pdfdirect/", "/doi/full/", "sage pdfdirect->full"),
+            ("/doi/pdf/", "/doi/full/", "sage pdf->full"),
+            ("/doi/epdf/", "/doi/full/", "sage epdf->full"),
+        ):
+            if old in path:
+                source = rebuild(path.replace(old, new, 1), clear_query=True)
+                notes.append(label)
+                break
+
+    # --- Wiley family ---
+    elif "wiley.com" in host or "onlinelibrary.wiley.com" in host:
+        for old, new, label in (
+            ("/doi/pdfdirect/", "/doi/abs/", "wiley pdfdirect->abs"),
+            ("/doi/epdf/", "/doi/abs/", "wiley epdf->abs"),
+            ("/doi/pdf/", "/doi/abs/", "wiley pdf->abs"),
+        ):
+            if old in path:
+                source = rebuild(path.replace(old, new, 1), clear_query=True)
+                notes.append(label)
+                break
+
+    # --- Taylor & Francis ---
+    elif "tandfonline.com" in host:
+        for old, new, label in (
+            ("/doi/pdf/", "/doi/full/", "tandf pdf->full"),
+            ("/doi/epdf/", "/doi/full/", "tandf epdf->full"),
+            ("/doi/pdfdirect/", "/doi/full/", "tandf pdfdirect->full"),
+        ):
+            if old in path:
+                source = rebuild(path.replace(old, new, 1), clear_query=True)
+                notes.append(label)
+                break
+
+    # --- ACS ---
+    elif "acs.org" in host:
+        for old, new, label in (
+            ("/doi/pdf/", "/doi/abs/", "acs pdf->abs"),
+            ("/doi/epdf/", "/doi/abs/", "acs epdf->abs"),
+        ):
+            if old in path:
+                source = rebuild(path.replace(old, new, 1), clear_query=True)
+                notes.append(label)
+                break
+
+    # --- Science / AAAS ---
+    elif host.endswith("science.org") or host == "www.science.org":
+        for old, new, label in (
+            ("/doi/pdf/", "/doi/abs/", "science pdf->abs"),
+            ("/doi/epdf/", "/doi/abs/", "science epdf->abs"),
+        ):
+            if old in path:
+                source = rebuild(path.replace(old, new, 1), clear_query=True)
+                notes.append(label)
+                break
+
+    # --- SpringerLink content/pdf ---
+    elif "springer.com" in host or "springeropen.com" in host:
+        # /content/pdf/10.1007/s11694-025-03155-3.pdf -> /article/10.1007/s11694-025-03155-3
+        m = _re.search(r"/content/pdf/(10\.[^?]+?)\.pdf$", path, _re.IGNORECASE)
+        if m:
+            source = rebuild(f"/article/{m.group(1)}", clear_query=True)
+            notes.append("springer content/pdf->article")
+        elif path.lower().endswith(".pdf") and "/article/" in path:
+            source = rebuild(path[: -4], clear_query=True)
+            notes.append("springer strip .pdf")
+
+    # --- Nature ---
+    elif "nature.com" in host:
+        if path.lower().endswith(".pdf"):
+            source = rebuild(path[: -4], clear_query=True)
+            notes.append("nature strip .pdf")
+
+    # --- ScienceDirect ---
+    elif "sciencedirect.com" in host:
+        new_path = path
+        if new_path.endswith("/pdfft"):
+            new_path = new_path[: -len("/pdfft")]
+            notes.append("sciencedirect strip /pdfft")
+        if "/pdfft/" in new_path:
+            new_path = new_path.split("/pdfft/", 1)[0]
+            notes.append("sciencedirect strip pdfft segment")
+        # drop pdf query flags
+        if "pdf" in query.lower() and new_path != path:
+            source = rebuild(new_path, clear_query=True)
+        elif new_path != path:
+            source = rebuild(new_path, clear_query=True)
+
+    # --- OUP advance-article-pdf ---
+    elif "oup.com" in host or "academic.oup.com" in host:
+        # .../advance-article-pdf/doi/10.1093/pnasnexus/pgaf078/62307.../file.pdf
+        marker = "/advance-article-pdf/doi/"
+        lower_path = path.lower()
+        idx = lower_path.find(marker)
+        if idx >= 0:
+            rest = path[idx + len(marker) :]
+            doi_parts: list[str] = []
+            for part in rest.split("/"):
+                if not part:
+                    continue
+                if part.lower().endswith(".pdf"):
+                    break
+                # OUP inserts a numeric article id after the DOI path
+                if part.isdigit():
+                    break
+                doi_parts.append(part)
+            if doi_parts and doi_parts[0].startswith("10."):
+                doi = "/".join(doi_parts)
+                source = f"https://doi.org/{doi}"
+                notes.append("oup advance-article-pdf->doi.org")
+        elif path.lower().endswith(".pdf") and "/article" in path:
+            source = rebuild(path[: -4], clear_query=True)
+            notes.append("oup strip article .pdf")
+
+    # --- MDPI trailing /pdf ---
+    elif "mdpi.com" in host:
+        if path.lower().endswith("/pdf"):
+            source = rebuild(path[: -4], clear_query=True)
+            notes.append("mdpi strip /pdf")
+
+    # --- Frontiers ---
+    elif "frontiersin.org" in host:
+        if path.lower().endswith("/pdf"):
+            # /articles/10.../pdf -> /articles/10.../full
+            base = path[: -4]
+            if not base.endswith("/full"):
+                base = base.rstrip("/") + "/full"
+            source = rebuild(base, clear_query=True)
+            notes.append("frontiers /pdf->/full")
+
+    # --- Cell Press ---
+    elif "cell.com" in host:
+        if "/pdf/" in path.lower() or path.lower().endswith(".pdf"):
+            # /heliyon/pdf/S2405-... -> try fulltext
+            m = _re.search(r"/pdf/(S\d[^/?#]+)", path, _re.IGNORECASE)
+            if m and "/heliyon/" in path.lower():
+                source = rebuild(f"/heliyon/fulltext/{m.group(1)}", clear_query=True)
+                notes.append("cell heliyon pdf->fulltext")
+            elif path.lower().endswith(".pdf"):
+                source = rebuild(path[: -4], clear_query=True)
+                notes.append("cell strip .pdf")
+
+    # --- BMC / BioMed Central ---
+    elif "biomedcentral.com" in host or host.endswith(".bmc.com"):
+        if path.lower().endswith(".pdf"):
+            source = rebuild(path[: -4], clear_query=True)
+            notes.append("bmc strip .pdf")
+
+    # --- Generic: bare DOI pdfdirect style query ---
+    if not notes and "pdfdirect" in path.lower():
+        # last-resort: replace pdfdirect with abs when /doi/ present
+        if "/doi/" in path:
+            source = rebuild(
+                _re.sub(r"/doi/pdfdirect/", "/doi/abs/", path, count=1, flags=_re.I),
+                clear_query=True,
+            )
+            notes.append("generic doi/pdfdirect->abs")
+
+    if source != original and not notes:
+        notes.append("url rewritten")
+
+    return source, notes
+
+
 def unique_nonempty(values: list[str]) -> list[str]:
     unique: list[str] = []
     seen: set[str] = set()
@@ -1110,8 +1302,19 @@ def scrape_article(
     agent_browser_mode: str | None = None,
     flaresolverr_mode: str | None = None,
 ) -> dict[str, Any]:
+    original_source = source
+    source, url_rewrites = canonicalize_article_url(source)
+
+    def _annotate(data: dict[str, Any]) -> dict[str, Any]:
+        data.setdefault("requested_url", original_source)
+        if url_rewrites:
+            data["url_rewrites"] = list(url_rewrites)
+            data["canonical_url"] = source
+        return data
+
+    # Local PDFs and remote PDFs that were not rewritten (e.g. open bioRxiv PDF).
     if looks_like_pdf_source(source):
-        return scrape_pdf_source(source)
+        return _annotate(scrape_pdf_source(source))
 
     if not looks_like_url(source):
         raise ValueError("source must be an HTTP(S) URL or a local PDF path")
@@ -1153,7 +1356,7 @@ def scrape_article(
         try:
             final_url, html = fetch_with_flaresolverr(source)
             fs_data = extract_article_data(final_url, html, retrieval_backend="flaresolverr")
-            fs_data["requested_url"] = source
+            fs_data["requested_url"] = original_source
             fs_data["retrieval_issues"] = extraction_issues(fs_data)
             fs_data["fallback_used"] = True
             fs_data["fallback_trigger"] = trigger_reasons
@@ -1174,7 +1377,7 @@ def scrape_article(
         try:
             final_url, rendered_html = fetch_with_agent_browser(source)
             ab_data = extract_article_data(final_url, rendered_html, retrieval_backend="agent-browser")
-            ab_data["requested_url"] = source
+            ab_data["requested_url"] = original_source
             ab_data["retrieval_issues"] = extraction_issues(ab_data)
             ab_data["fallback_used"] = True
             ab_data["fallback_trigger"] = trigger_reasons
@@ -1191,7 +1394,7 @@ def scrape_article(
     if best is not None:
         if errors:
             best.setdefault("retrieval_errors", errors)
-        return best
+        return _annotate(best)
 
     if primary_error is not None:
         detail = "; ".join(errors) if errors else str(primary_error)
