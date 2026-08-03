@@ -6,13 +6,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_TOOLS_ROOT="${AGENT_TOOLS_ROOT:-$SCRIPT_DIR}"
 WIKI_AUTOMATION_DIR="$AGENT_TOOLS_ROOT/wiki-automation"
 DEFAULT_OUTPUT_DIR="${AGENT_OUTPUT_DIR:-$AGENT_TOOLS_ROOT/out}"
-CONTENT_REPO_MANAGED_ROOT="${CONTENT_REPO_MANAGED_ROOT:-$AGENT_TOOLS_ROOT/runtime/content-repo}"
-CONTENT_REPO_SOURCE_PATH="${CONTENT_REPO_SOURCE_PATH:-}"
-CONTENT_REPO_GIT_URL="${CONTENT_REPO_GIT_URL:-}"
-CONTENT_REPO_REF="${CONTENT_REPO_REF:-main}"
-CONTENT_REPO_ROOT="${CONTENT_REPO_ROOT:-}"
 
 load_dotenv() {
+  # Tests/CI can set AGENT_WORKFLOW_SKIP_DOTENV=1 so a host .env (e.g. production
+  # CONTENT_REPO_ROOT) cannot override intentionally configured temp paths.
+  if [[ "${AGENT_WORKFLOW_SKIP_DOTENV:-}" == "1" ]]; then
+    return 0
+  fi
   local candidate raw_line line key value
   for candidate in "$SCRIPT_DIR/.env" "$PWD/.env"; do
     if [[ -f "$candidate" ]]; then
@@ -41,7 +41,10 @@ load_dotenv() {
             value="${value:1:${#value}-2}"
           fi
         fi
-        if [[ -n "$key" && -z "${!key:-}" ]]; then
+        # Only fill variables that are unset in this process. Do not treat an
+        # intentionally empty value (e.g. CONTENT_REPO_ROOT="") as missing, or
+        # .env production paths will clobber managed-clone test/config mode.
+        if [[ -n "$key" && ! -v "$key" ]]; then
           export "$key=$value"
         fi
       done <"$candidate"
@@ -50,7 +53,15 @@ load_dotenv() {
   done
 }
 
+# Load .env before binding defaults so unset vars can come from the file, while
+# caller-provided values (including empty CONTENT_REPO_ROOT) always win.
 load_dotenv
+
+CONTENT_REPO_MANAGED_ROOT="${CONTENT_REPO_MANAGED_ROOT:-$AGENT_TOOLS_ROOT/runtime/content-repo}"
+CONTENT_REPO_SOURCE_PATH="${CONTENT_REPO_SOURCE_PATH:-}"
+CONTENT_REPO_GIT_URL="${CONTENT_REPO_GIT_URL:-}"
+CONTENT_REPO_REF="${CONTENT_REPO_REF:-main}"
+CONTENT_REPO_ROOT="${CONTENT_REPO_ROOT:-}"
 
 default_content_source_path() {
   local candidate="$SCRIPT_DIR/../content"

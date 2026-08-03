@@ -8,6 +8,30 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# Host shells and research-tools/.env often set a direct production CONTENT_REPO_ROOT
+# (e.g. /home/anthony/Research/content). That path must not leak into managed-clone tests.
+_CONTENT_ENV_KEYS = (
+    "CONTENT_REPO_ROOT",
+    "CONTENT_REPO_SOURCE_PATH",
+    "CONTENT_REPO_MANAGED_ROOT",
+    "CONTENT_REPO_GIT_URL",
+    "CONTENT_REPO_HOST_PATH",
+    "CONTENT_REPO_REF",
+)
+
+
+def _isolated_content_env(source_repo: Path, managed_repo: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    for key in _CONTENT_ENV_KEYS:
+        env.pop(key, None)
+    # Prevent load_dotenv from reintroducing production CONTENT_REPO_ROOT from .env
+    env["AGENT_WORKFLOW_SKIP_DOTENV"] = "1"
+    # Explicit empty root selects managed-clone mode in ensure_content_repo_ready
+    env["CONTENT_REPO_ROOT"] = ""
+    env["CONTENT_REPO_SOURCE_PATH"] = str(source_repo)
+    env["CONTENT_REPO_MANAGED_ROOT"] = str(managed_repo)
+    return env
+
 
 class AgentWorkflowTests(unittest.TestCase):
     def test_doctor_reports_configured_paths(self) -> None:
@@ -33,9 +57,7 @@ class AgentWorkflowTests(unittest.TestCase):
                 capture_output=True,
             )
 
-            env = os.environ.copy()
-            env["CONTENT_REPO_SOURCE_PATH"] = str(source_repo)
-            env["CONTENT_REPO_MANAGED_ROOT"] = str(managed_repo)
+            env = _isolated_content_env(source_repo, managed_repo)
 
             result = subprocess.run(
                 ["./agent-workflow", "doctor"],
@@ -49,6 +71,11 @@ class AgentWorkflowTests(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertEqual(
                 payload["result"]["paths"]["managed_content_repo_root"],
+                str(managed_repo),
+            )
+            # Direct root should not be the host production path when testing managed mode
+            self.assertEqual(
+                payload["result"]["paths"]["content_repo_root"],
                 str(managed_repo),
             )
 
@@ -75,9 +102,7 @@ class AgentWorkflowTests(unittest.TestCase):
                 capture_output=True,
             )
 
-            env = os.environ.copy()
-            env["CONTENT_REPO_SOURCE_PATH"] = str(source_repo)
-            env["CONTENT_REPO_MANAGED_ROOT"] = str(managed_repo)
+            env = _isolated_content_env(source_repo, managed_repo)
 
             result = subprocess.run(
                 ["./agent-workflow", "search", "Alpha pipeline"],
