@@ -4,6 +4,8 @@ Standalone runtime for the `content` repo's agent tooling.
 
 This repository separates the operational tooling from the markdown content repository so you can run agents on a stable machine instead of a laptop. It packages the current tools into one image and expects the content repo to be mounted at runtime.
 
+**Operators / Hermes handoff:** see [`RELEASE_NOTES.md`](./RELEASE_NOTES.md) for current host layout (iconium), recent fixes, services, and pickup checklist.
+
 ## Included Tools
 
 - `gmail-reader`: read Google Scholar alert mail via `gws` and store results in SQLite
