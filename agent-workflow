@@ -158,7 +158,7 @@ Usage:
   agent-workflow search "<query>" [wiki-automation search args...]
   agent-workflow prepare "<url>" [wiki-automation prepare args...]
   agent-workflow intake "<url-or-pdf>" [wiki-automation intake args...]
-  agent-workflow local-publish "<url-or-pdf>" [--publish] [local model args...]
+  agent-workflow local-publish "<url-or-pdf>" [--critic-mode required|advisory|off] [--publish]
   agent-workflow enqueue-local "<article-key-or-url>"
   agent-workflow enqueue-local-backlog [--min-score N] [--limit N]
   agent-workflow local-worker [--max-jobs N] [--publish]

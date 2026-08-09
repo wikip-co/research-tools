@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
@@ -36,6 +37,42 @@ ALLOWED_EVIDENCE_SCOPES = {
     "in_vitro",
     "mechanistic",
 }
+DOI_PATTERN = re.compile(r"^10\.\d{4,9}/[-._;()/:a-z0-9]+$", re.IGNORECASE)
+CRITIC_MODES = {"required", "advisory", "off"}
+CRITIC_SEVERITIES = {"warning", "review", "blocking"}
+CRITIC_SEVERITY_RANK = {"warning": 0, "review": 1, "blocking": 2}
+PLACEMENT_ISSUE_CODES = {
+    "wrong_target_page",
+    "wrong_heading",
+    "existing_content_conflict",
+    "duplicate_content",
+    "unsafe_context_inference",
+}
+EVIDENCE_ISSUE_CODES = {
+    "unsupported_claim",
+    "medical_overclaim",
+    "study_type_inflation",
+    "merged_ideas",
+    "source_integrity_concern",
+    "limitation_omitted",
+}
+MINIMUM_CRITIC_SEVERITY = {
+    "wrong_target_page": "review",
+    "wrong_heading": "review",
+    "existing_content_conflict": "review",
+    "duplicate_content": "review",
+    "unsafe_context_inference": "review",
+    "unsupported_claim": "review",
+    "medical_overclaim": "review",
+    "study_type_inflation": "review",
+    "source_integrity_concern": "review",
+    "limitation_omitted": "review",
+}
+PLACEHOLDER_METADATA = {
+    "authors": {"author", "authors", "author s", "authors and affiliations", "unknown", "n a"},
+    "journal": {"journal", "ovid", "publisher", "source", "unknown", "n a"},
+    "pub_date": {"date", "published", "unknown", "n a"},
+}
 
 
 @dataclass
@@ -46,6 +83,15 @@ class ValidationResult:
 
 def normalize_evidence(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def valid_http_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def placeholder_metadata(key: str, value: str) -> bool:
+    return not value.strip() or normalize_evidence(value) in PLACEHOLDER_METADATA.get(key, set())
 
 
 def source_evidence(packet: dict[str, Any]) -> str:
@@ -71,7 +117,70 @@ def validate_source_packet(packet: dict[str, Any]) -> ValidationResult:
     authors = str(packet.get("authors") or "")
     if len(authors) > 1200:
         issues.append("polluted_authors")
+    issues.extend(str(issue) for issue in packet.get("citation_metadata_issues") or [])
+    doi = str(packet.get("doi") or "").strip()
+    if doi and not DOI_PATTERN.fullmatch(doi):
+        issues.append("invalid_doi")
+    for key in ("authors", "journal", "pub_date"):
+        if placeholder_metadata(key, str(packet.get(key) or "")):
+            issues.append(f"missing_or_placeholder_{key}")
+    reference_url = str(packet.get("reference_url") or "").strip()
+    if not valid_http_url(reference_url):
+        issues.append("invalid_reference_url")
+    elif doi and reference_url.lower() != f"https://doi.org/{doi}".lower():
+        issues.append("doi_reference_url_mismatch")
+    if abstract.endswith(("...", "…")):
+        issues.append("truncated_abstract")
     return ValidationResult(not issues, sorted(set(issues)))
+
+
+def duplicate_identifiers(packet: dict[str, Any], source: str) -> list[str]:
+    doi = str(packet.get("doi") or "").strip()
+    values = [
+        f"https://doi.org/{doi}" if DOI_PATTERN.fullmatch(doi) else "",
+        doi if DOI_PATTERN.fullmatch(doi) else "",
+        str(packet.get("reference_url") or "").strip(),
+        str(packet.get("url") or "").strip(),
+        str(packet.get("requested_url") or "").strip(),
+        source.strip(),
+    ]
+    unique: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = value.lower().rstrip("/")
+        if value and key not in seen:
+            seen.add(key)
+            unique.append(value)
+    return unique
+
+
+def merge_duplicate_checks(checks: list[dict[str, Any]]) -> dict[str, Any]:
+    content_hits: list[dict[str, Any]] = []
+    seen_hits: set[tuple[str, str, str]] = set()
+    paper_result: dict[str, Any] | None = None
+    active_states = {"drafted", "committed", "pr_open", "merged"}
+    for check in checks:
+        for hit in check.get("content_hits") or []:
+            key = (
+                str(hit.get("path") or ""),
+                str(hit.get("ref_num") or ""),
+                str(hit.get("ref_url") or ""),
+            )
+            if key not in seen_hits:
+                seen_hits.add(key)
+                content_hits.append(hit)
+        candidate_paper = check.get("paper_result")
+        candidate_state = str(((candidate_paper or {}).get("paper") or {}).get("workflow_state") or "")
+        current_state = str(((paper_result or {}).get("paper") or {}).get("workflow_state") or "")
+        if candidate_paper and (paper_result is None or candidate_state in active_states and current_state not in active_states):
+            paper_result = candidate_paper
+    return {
+        "identifiers": [str(check.get("identifier") or "") for check in checks],
+        "checks": checks,
+        "content_hit_count": len(content_hits),
+        "content_hits": content_hits,
+        "paper_result": paper_result,
+    }
 
 
 def extract_json_object(value: str) -> dict[str, Any]:
@@ -414,37 +523,322 @@ def draft_prompt(
     }
     source = dict(packet)
     source["body_markdown"] = str(source.get("body_markdown") or "")[:50000]
+    repair_hints: list[str] = []
+    issues = prior_issues or []
+    if any(re.match(r"bullet_\d+_invalid_text$", issue) for issue in issues):
+        repair_hints.append("For bullet text, remove every leading dash and every [^n] citation marker; the renderer adds both.")
+    if "preclinical_heading_scope_missing" in issues:
+        repair_hints.append("Put 'Animal Evidence', 'Animal Models', or 'Preclinical Evidence' literally in the proposed heading.")
+    if any("quote_not_in_source" in issue for issue in issues):
+        repair_hints.append("Copy source_quote as one exact contiguous span from SOURCE_PACKET without ellipses or repairs.")
+    if any("not_near_verbatim" in issue for issue in issues):
+        repair_hints.append("Make bullet text equal source_quote except for removing a section/list label.")
     return "\n\n".join(
         [
             "Return only one JSON object matching this contract:\n" + json.dumps(contract, indent=2),
-            "Rules: For Natural Healing use concise one-idea bullets as close to the source wording as possible. The bullet text should normally equal source_quote exactly, except that a list number or section label may be removed. Do not add citation markers; the renderer does that. Every source_quote must be copied exactly from SOURCE_PACKET. Preserve study limitations and never turn a review, animal, in-vitro, or mechanistic statement into a human treatment claim. For animal or preclinical evidence, the proposed heading must explicitly contain 'Animal Evidence', 'Animal Models', or 'Preclinical Evidence' so the surrounding Disease / Symptom Treatment section cannot imply human efficacy. Omit any source sentence that appears internally contradictory, corrupted, dangerously mistyped, or statistically misleading; do not silently repair it. Choose only a clearly appropriate existing content home. If uncertain, return needs_review. Do not create a new article.",
+            "Rules: For Natural Healing use concise one-idea bullets as close to the source wording as possible. The bullet text should normally equal source_quote exactly, except that a list number or section label may be removed. Do not add citation markers; the renderer does that. Every source_quote must be copied exactly from SOURCE_PACKET. Preserve study limitations and never turn a review, animal, in-vitro, or mechanistic statement into a human treatment claim. For animal or preclinical evidence, the proposed heading must explicitly contain 'Animal Evidence', 'Animal Models', or 'Preclinical Evidence' so the surrounding Disease / Symptom Treatment section cannot imply human efficacy. Omit any source sentence that appears internally contradictory, corrupted, dangerously mistyped, or statistically misleading; do not silently repair it. A source may study several entities (for example a broad botanical, a named cultivar, and an isolated compound), but one append plan has one target: include only bullets whose main subject belongs on that target. Do not place isolated-compound mechanisms on a broader botanical/beverage page unless the supplied target already materially covers that compound. Restrict the bullets to the selected entity or return needs_review. Choose only a clearly appropriate existing content home. If uncertain, return needs_review. Do not create a new article.",
             "SOURCE_PACKET:\n" + json.dumps(source, indent=2),
             "MATCH_CANDIDATES:\n" + json.dumps(candidates, indent=2),
             "CANDIDATE_DOCUMENTS:\n" + json.dumps(candidate_documents, indent=2),
             "PREVIOUS_VALIDATION_ISSUES:\n" + json.dumps(prior_issues or []),
+            "DETERMINISTIC_REPAIR_HINTS:\n" + json.dumps(repair_hints),
             "PREVIOUS_PLAN_TO_REVISE:\n" + json.dumps(previous_plan or {}, indent=2),
             "PREVIOUS_CRITIC_FEEDBACK:\n" + json.dumps(previous_critic or {}, indent=2),
         ]
     )
 
 
-def critic_prompt(
+def critic_issue_contract(codes: set[str]) -> dict[str, Any]:
+    return {
+        "issues": [
+            {
+                "code": " | ".join(sorted(codes)),
+                "severity": "warning | review | blocking",
+                "bullet_index": "integer or null",
+                "explanation": "concise objection; no external facts",
+                "source_quote": "exact contiguous quote from SOURCE_PACKET, or empty",
+                "target_quote": "exact contiguous quote from SELECTED_TARGET_MARKDOWN, or empty",
+            }
+        ]
+    }
+
+
+def placement_critic_prompt(
     *,
     packet: dict[str, Any],
     plan: dict[str, Any],
+    selected_candidate: dict[str, Any],
+    selected_target_markdown: str,
+    deterministic_issues: list[str],
+) -> str:
+    source = dict(packet)
+    source["body_markdown"] = str(source.get("body_markdown") or "")[:12000]
+    return "\n\n".join(
+        [
+            "Review only target-page and heading placement. Return one JSON object matching this contract:\n"
+            + json.dumps(critic_issue_contract(PLACEMENT_ISSUE_CODES), indent=2),
+            "Use only the supplied source, selected candidate metadata, and selected target Markdown. Do not use outside botanical or medical knowledge. Check whether a multi-entity plan puts named-cultivar or isolated-compound claims onto a broader page that does not materially cover that entity; require the planner to restrict bullets to the selected target or return needs_review. Every issue must cite exact contiguous text from the source packet or selected target page; wrong_target_page must cite both. Use warning for useful non-gating notes, review for a human placement decision, and blocking only for a clearly unsafe placement. Return an empty issues list when there is no grounded objection. Deterministic checks are authoritative for candidate membership, headings, exact source containment, near-verbatim similarity, and required preclinical heading labels; never recommend removing a required Animal Evidence/Animal Models/Preclinical Evidence label.",
+            "SOURCE_PACKET:\n" + json.dumps(source, indent=2),
+            "DRAFT_PLAN:\n" + json.dumps(plan, indent=2),
+            "SELECTED_CANDIDATE_METADATA:\n" + json.dumps(selected_candidate, indent=2),
+            "SELECTED_TARGET_MARKDOWN:\n" + selected_target_markdown[:30000],
+            "DETERMINISTIC_ISSUES:\n" + json.dumps(deterministic_issues),
+        ]
+    )
+
+
+def evidence_critic_prompt(
+    *,
+    packet: dict[str, Any],
+    plan: dict[str, Any],
+    selected_candidate: dict[str, Any],
+    selected_target_markdown: str,
     deterministic_issues: list[str],
 ) -> str:
     source = dict(packet)
     source["body_markdown"] = str(source.get("body_markdown") or "")[:50000]
     return "\n\n".join(
         [
-            "Audit this proposed Natural Healing research update. Return only JSON: {\"approved\": boolean, \"issues\": [{\"code\": string, \"bullet_index\": integer_or_null, \"explanation\": string}], \"recommendation\": \"approve|revise|needs_review\"}.",
-            "Reject unsupported claims, medical overclaims, study-type inflation, merged ideas, wrong target pages, and any claim whose source_quote does not support it. Treat the deterministic validator as authoritative for literal source containment and near-verbatim similarity; do not invent a near-verbatim issue when that validator reports none. Animal/preclinical findings may be included only when the heading explicitly scopes them as animal or preclinical evidence. If the source itself appears internally contradictory, statistically misleading, or dangerously mistyped, require omission of that claim rather than silently correcting it.",
+            "Review only evidence support, claim strength, study scope, one-idea bullets, source integrity, and material limitations. Return one JSON object matching this contract:\n"
+            + json.dumps(critic_issue_contract(EVIDENCE_ISSUE_CODES), indent=2),
+            "Every issue must cite an exact contiguous source_quote from SOURCE_PACKET; target_quote may additionally quote the selected page when surrounding context creates an overclaim. Do not object merely because a near-verbatim bullet does not repeat context already made explicit by its preclinical heading or evidence scope. Do not state that a claim is unsupported and then admit that the source supports it. Use no outside facts. Use warning for useful non-gating notes, review for ambiguity requiring human judgment, and blocking for a materially unsupported or unsafe claim. Return an empty issues list when there is no grounded objection. Deterministic checks are authoritative for exact source containment and near-verbatim similarity.",
             "SOURCE_PACKET:\n" + json.dumps(source, indent=2),
             "DRAFT_PLAN:\n" + json.dumps(plan, indent=2),
+            "SELECTED_CANDIDATE_METADATA:\n" + json.dumps(selected_candidate, indent=2),
+            "SELECTED_TARGET_MARKDOWN:\n" + selected_target_markdown[:30000],
             "DETERMINISTIC_ISSUES:\n" + json.dumps(deterministic_issues),
         ]
     )
+
+
+def critic_issue_is_self_contradictory(code: str, explanation: str) -> bool:
+    lowered = normalize_evidence(explanation)
+    contradictions = {
+        "unsupported_claim": (
+            "source supports",
+            "is supported by the source",
+            "source supported",
+            "text is supported",
+            "claim is supported",
+            "it is supported",
+        ),
+        "medical_overclaim": ("does not overclaim", "appropriately scoped", "correctly scoped"),
+        "study_type_inflation": ("properly scoped", "correctly scoped", "evidence scope is correct"),
+        "merged_ideas": ("ideas are separate", "draft separates", "does not merge"),
+        "wrong_target_page": ("target is appropriate", "correct target", "page is appropriate"),
+    }
+    return any(normalize_evidence(phrase) in lowered for phrase in contradictions.get(code, ()))
+
+
+def validate_critic_review(
+    review: dict[str, Any],
+    *,
+    review_kind: str,
+    packet: dict[str, Any],
+    plan: dict[str, Any],
+    selected_target_markdown: str,
+) -> dict[str, Any]:
+    allowed_codes = PLACEMENT_ISSUE_CODES if review_kind == "placement" else EVIDENCE_ISSUE_CODES
+    source = source_evidence(packet)
+    bullets = plan.get("bullets") if isinstance(plan.get("bullets"), list) else []
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    raw_issues = review.get("issues")
+    response_valid = isinstance(raw_issues, list)
+    if not response_valid:
+        raw_issues = []
+    for raw in raw_issues:
+        errors: list[str] = []
+        if not isinstance(raw, dict):
+            rejected.append({"issue": raw, "validation_errors": ["issue_not_object"]})
+            continue
+        code = str(raw.get("code") or "")
+        severity = str(raw.get("severity") or "")
+        explanation = str(raw.get("explanation") or "").strip()
+        source_quote = str(raw.get("source_quote") or "")
+        target_quote = str(raw.get("target_quote") or "")
+        bullet_index = raw.get("bullet_index")
+        validation_warnings: list[str] = []
+        if code not in allowed_codes:
+            errors.append("invalid_issue_code")
+        if severity not in CRITIC_SEVERITIES:
+            errors.append("invalid_severity")
+        if not explanation:
+            errors.append("missing_explanation")
+        if bullet_index is not None and (
+            not isinstance(bullet_index, int) or isinstance(bullet_index, bool) or bullet_index < 0 or bullet_index >= len(bullets)
+        ):
+            errors.append("invalid_bullet_index")
+        source_quote_exact = bool(source_quote and source_quote in source)
+        target_quote_exact = bool(target_quote and target_quote in selected_target_markdown)
+        if source_quote and not source_quote_exact:
+            if review_kind == "evidence" or code == "wrong_target_page" or not target_quote_exact:
+                errors.append("source_quote_not_exact")
+            else:
+                source_quote = ""
+                validation_warnings.append("discarded_optional_nonexact_source_quote")
+        if target_quote and not target_quote_exact:
+            if code == "wrong_target_page" or not source_quote_exact:
+                errors.append("target_quote_not_exact")
+            else:
+                target_quote = ""
+                validation_warnings.append("discarded_optional_nonexact_target_quote")
+        if not source_quote and not target_quote:
+            errors.append("missing_evidence_quote")
+        if review_kind == "evidence" and not source_quote:
+            errors.append("evidence_review_requires_source_quote")
+        if code == "wrong_target_page" and (not source_quote or not target_quote):
+            errors.append("wrong_target_requires_source_and_target_quotes")
+        if critic_issue_is_self_contradictory(code, explanation):
+            errors.append("self_contradictory_issue")
+        source_kind = normalize_evidence(
+            " ".join(str(packet.get(key) or "") for key in ("title", "abstract", "study_type"))
+        )
+        heading = normalize_evidence(str(plan.get("heading") or ""))
+        if (
+            code == "wrong_heading"
+            and re.search(r"\b(?:animal|animals|preclinical|in vivo)\b", source_kind)
+            and re.search(r"\b(?:animal evidence|animal models|preclinical evidence)\b", heading)
+            and re.search(r"\b(?:redundant|overly specific|non standard|remove|omit)\b", normalize_evidence(explanation))
+        ):
+            errors.append("contradicts_deterministic_preclinical_scope")
+        minimum_severity = MINIMUM_CRITIC_SEVERITY.get(code)
+        if (
+            severity in CRITIC_SEVERITY_RANK
+            and minimum_severity
+            and CRITIC_SEVERITY_RANK[severity] < CRITIC_SEVERITY_RANK[minimum_severity]
+        ):
+            validation_warnings.append(f"severity_promoted_from_{severity}")
+            severity = minimum_severity
+        normalized = {
+            "code": code,
+            "severity": severity,
+            "bullet_index": bullet_index,
+            "explanation": explanation,
+            "source_quote": source_quote,
+            "target_quote": target_quote,
+        }
+        if validation_warnings:
+            normalized["validation_warnings"] = validation_warnings
+        if errors:
+            rejected.append({"issue": normalized, "validation_errors": sorted(set(errors))})
+        else:
+            accepted.append(normalized)
+    return {
+        "kind": review_kind,
+        "response_valid": response_valid,
+        "issues": accepted,
+        "rejected_issues": rejected,
+    }
+
+
+def combine_critic_reviews(placement: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
+    issues = [*(placement.get("issues") or []), *(evidence.get("issues") or [])]
+    actionable = [issue for issue in issues if issue.get("severity") in {"review", "blocking"}]
+    responses_valid = placement.get("response_valid") is True and evidence.get("response_valid") is True
+    approved = responses_valid and not actionable
+    recommendation = "approve" if approved else "needs_review" if any(
+        issue.get("severity") == "blocking" for issue in actionable
+    ) else "revise"
+    return {
+        "approved": approved,
+        "recommendation": recommendation,
+        "issues": issues,
+        "placement_review": placement,
+        "evidence_review": evidence,
+        "validation": {
+            "responses_valid": responses_valid,
+            "rejected_issue_count": len(placement.get("rejected_issues") or [])
+            + len(evidence.get("rejected_issues") or []),
+            "decision_derived_from_validated_issues": True,
+        },
+    }
+
+
+def deterministic_placement_review_issues(
+    *,
+    packet: dict[str, Any],
+    plan: dict[str, Any],
+    selected_target_markdown: str,
+) -> list[dict[str, Any]]:
+    """Require review before introducing a new isolated compound as a second entity."""
+    target_normalized = normalize_evidence(selected_target_markdown)
+    bullets = plan.get("bullets") if isinstance(plan.get("bullets"), list) else []
+    issues: list[dict[str, Any]] = []
+    sentences = [
+        sentence
+        for key in ("title", "abstract", "body_markdown")
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", str(packet.get(key) or ""))
+        if sentence.strip()
+    ]
+    seen: set[tuple[str, str]] = set()
+    for sentence in sentences:
+        if not re.search(r"\b(?:component|compound|metabolite|constituent|phytochemical)s?\b", sentence, re.IGNORECASE):
+            continue
+        for match in re.finditer(
+            r"\b([A-Za-z][A-Za-z-]{4,})\s+\(([A-Z][A-Z0-9-]{1,9})\)",
+            sentence,
+        ):
+            name, acronym = match.group(1), match.group(2)
+            following_context = sentence[match.end() : match.end() + 40]
+            if re.search(
+                r"\b(?:cells?|patients?|disease|malignancy|cancer|tumou?r|syndrome|models?)\b",
+                following_context,
+                re.IGNORECASE,
+            ):
+                continue
+            key = (name.lower(), acronym.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            if normalize_evidence(name) in target_normalized or re.search(
+                rf"\b{re.escape(acronym.lower())}\b", target_normalized
+            ):
+                continue
+            matching_indexes = [
+                index
+                for index, item in enumerate(bullets)
+                if isinstance(item, dict)
+                and re.search(
+                    rf"\b(?:{re.escape(name)}|{re.escape(acronym)})\b",
+                    str(item.get("text") or ""),
+                    re.IGNORECASE,
+                )
+            ]
+            if len(matching_indexes) < 2:
+                continue
+            target_quote = next(
+                (
+                    line.strip()
+                    for line in selected_target_markdown.splitlines()
+                    if line.strip().lower().startswith("title:")
+                    or line.strip().startswith("# ")
+                ),
+                "",
+            )
+            if not target_quote:
+                target_quote = next(
+                    (line.strip() for line in selected_target_markdown.splitlines() if line.strip()),
+                    "",
+                )
+            if not target_quote:
+                continue
+            issues.append(
+                {
+                    "code": "unsafe_context_inference",
+                    "severity": "review",
+                    "bullet_index": matching_indexes[0],
+                    "explanation": (
+                        f"The plan adds {len(matching_indexes)} {name} ({acronym})-specific bullets "
+                        f"to a target that does not currently mention {name} or {acronym}; "
+                        "restrict the plan to the selected target's entity or require human placement review."
+                    ),
+                    "source_quote": sentence,
+                    "target_quote": target_quote,
+                    "origin": "deterministic_placement_policy",
+                }
+            )
+    return issues
 
 
 def run_local_publish(
@@ -460,6 +854,10 @@ def run_local_publish(
     base_ref: str = "origin/main",
     max_candidates: int = 5,
     max_draft_attempts: int = 3,
+    critic_mode: str = "required",
+    allow_critic_rejection: bool = False,
+    override_reason: str = "",
+    passive_worker: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     # Imported lazily to keep the pure validators independently testable.
@@ -472,53 +870,101 @@ def run_local_publish(
     )
     import argparse
 
+    if critic_mode not in CRITIC_MODES:
+        raise ValueError(f"critic_mode must be one of: {', '.join(sorted(CRITIC_MODES))}")
+    if passive_worker and allow_critic_rejection:
+        raise ValueError("Critic rejection overrides are prohibited in the passive database worker")
+    if passive_worker and critic_mode != "required":
+        raise ValueError("The passive database worker requires --critic-mode required")
+    if allow_critic_rejection and critic_mode != "required":
+        raise ValueError("--allow-critic-rejection requires --critic-mode required")
+    if allow_critic_rejection and not override_reason.strip():
+        raise ValueError("--allow-critic-rejection requires a non-empty --override-reason")
+    if allow_critic_rejection and not publish:
+        raise ValueError("--allow-critic-rejection is only valid with --publish")
+    if publish and critic_mode == "off":
+        raise ValueError("--critic-mode off is manual dry-run only and cannot be used with --publish")
+
+    publication_suppressed = "critic_mode_advisory" if publish and critic_mode == "advisory" else ""
     output_dir.mkdir(parents=True, exist_ok=True)
     slug = slugify(Path(source).stem or "research") or "research"
     scrape_markdown = output_dir / f"{slug}-source.md"
+    report_path = output_dir / f"{slug}-local-publish-report.json"
     packet = scrape_source_packet(source, scrape_markdown)
     packet_validation = validate_source_packet(packet)
     if not packet_validation.ok:
-        raise ValueError(f"Invalid source packet: {', '.join(packet_validation.issues)}")
+        report = {
+            "source": source,
+            "status": "needs_review",
+            "reason": "invalid_source_packet",
+            "packet": packet,
+            "packet_validation": asdict(packet_validation),
+            "critic_mode": critic_mode,
+            "publication_requested": publish,
+            "publication_suppressed": publication_suppressed,
+            "report_path": str(report_path),
+        }
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        return report
     if progress:
         progress("matching")
 
-    if publish:
+    publication_enabled = publish and critic_mode == "required"
+    if publication_enabled:
         run_command(["git", "fetch", "origin", "main"], cwd=content_repo)
     base_snapshot_temp = materialize_git_ref(content_repo=content_repo, git_ref=base_ref)
     base_snapshot = Path(base_snapshot_temp.name)
 
-    duplicate = check_duplicate_paper(
-        argparse.Namespace(
-            identifier=packet.get("reference_url") or packet.get("url") or source,
-            limit=max_candidates,
-            repo_root=str(base_snapshot),
+    duplicate_checks = [
+        check_duplicate_paper(
+            argparse.Namespace(
+                identifier=identifier,
+                limit=max_candidates,
+                repo_root=str(base_snapshot),
+            )
         )
-    )
+        for identifier in duplicate_identifiers(packet, source)
+    ]
+    duplicate = merge_duplicate_checks(duplicate_checks)
     paper_result = duplicate.get("paper_result") or {}
     paper_state = str((paper_result.get("paper") or {}).get("workflow_state") or "")
     if duplicate.get("content_hit_count", 0) > 0 or paper_state in {
         "drafted", "committed", "pr_open", "merged"
     }:
-        return {
+        report = {
             "status": "duplicate",
             "source": source,
             "reason": "content_reference" if duplicate.get("content_hit_count", 0) else f"paper_state:{paper_state}",
             "duplicate": duplicate,
             "packet": packet,
+            "packet_validation": asdict(packet_validation),
+            "critic_mode": critic_mode,
+            "publication_requested": publish,
+            "publication_suppressed": publication_suppressed,
+            "report_path": str(report_path),
         }
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        return report
 
     articles = load_articles(base_snapshot)
     candidates = match_research_packet(
         articles, packet, alert_name=alert_name, limit=max_candidates
     )
     if not candidates:
-        return {
+        report = {
             "status": "needs_review",
             "reason": "no_content_candidates",
             "packet": packet,
+            "packet_validation": asdict(packet_validation),
+            "critic_mode": critic_mode,
+            "publication_requested": publish,
+            "publication_suppressed": publication_suppressed,
+            "report_path": str(report_path),
         }
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        return report
     candidate_documents: dict[str, str] = {}
-    for candidate in candidates[:3]:
+    for candidate in candidates:
         path = base_snapshot / candidate["path"]
         candidate_documents[candidate["path"]] = path.read_text(encoding="utf-8")[:30000]
 
@@ -531,7 +977,12 @@ def run_local_publish(
     )
     plan: dict[str, Any] = {}
     deterministic = ValidationResult(False, ["draft_not_attempted"])
-    critic: dict[str, Any] = {}
+    critic: dict[str, Any] = {
+        "approved": critic_mode == "off",
+        "recommendation": "skipped" if critic_mode == "off" else "not_run",
+        "issues": [],
+        "mode": critic_mode,
+    }
     prior_issues: list[str] = []
     previous_plan: dict[str, Any] = {}
     previous_critic: dict[str, Any] = {}
@@ -553,16 +1004,93 @@ def run_local_publish(
         deterministic = validate_draft_plan(
             plan, packet=packet, candidate_paths=candidate_paths
         )
-        critic = client.json_completion(
-            system="You are an independent evidence and medical-overclaim critic. Be strict and return only the requested JSON.",
-            user=critic_prompt(
+        if deterministic.ok and plan.get("decision") != "append_existing":
+            critic = {
+                "approved": False,
+                "recommendation": "not_run",
+                "issues": [],
+                "mode": critic_mode,
+                "skipped_reason": "non_append_decision",
+            }
+            break
+        if not deterministic.ok:
+            critic = {
+                "approved": False,
+                "recommendation": "not_run",
+                "issues": [],
+                "mode": critic_mode,
+                "skipped_reason": "deterministic_plan_invalid",
+            }
+            prior_issues = deterministic.issues
+            previous_plan = plan
+            previous_critic = critic
+            continue
+        if critic_mode == "off":
+            critic = {
+                "approved": True,
+                "recommendation": "skipped",
+                "issues": [],
+                "mode": "off",
+                "skipped_reason": "critic_mode_off",
+            }
+            critic_approved = True
+        else:
+            selected_path = str(plan.get("target_path") or "")
+            selected_target_markdown = candidate_documents.get(selected_path, "")
+            selected_candidate = next(
+                (candidate for candidate in candidates if str(candidate.get("path") or "") == selected_path),
+                {},
+            )
+            raw_placement = client.json_completion(
+                system="You are an independent target-placement reviewer. Use only supplied evidence and return only the requested JSON.",
+                user=placement_critic_prompt(
+                    packet=packet,
+                    plan=plan,
+                    selected_candidate=selected_candidate,
+                    selected_target_markdown=selected_target_markdown,
+                    deterministic_issues=deterministic.issues,
+                ),
+                max_tokens=2500,
+            )
+            raw_evidence = client.json_completion(
+                system="You are an independent evidence and medical-overclaim reviewer. Use only supplied evidence and return only the requested JSON.",
+                user=evidence_critic_prompt(
+                    packet=packet,
+                    plan=plan,
+                    selected_candidate=selected_candidate,
+                    selected_target_markdown=selected_target_markdown,
+                    deterministic_issues=deterministic.issues,
+                ),
+                max_tokens=3000,
+            )
+            placement = validate_critic_review(
+                raw_placement,
+                review_kind="placement",
                 packet=packet,
                 plan=plan,
-                deterministic_issues=deterministic.issues,
-            ),
-            max_tokens=2500,
-        )
-        critic_approved = critic.get("approved") is True and critic.get("recommendation") == "approve"
+                selected_target_markdown=selected_target_markdown,
+            )
+            placement["issues"].extend(
+                deterministic_placement_review_issues(
+                    packet=packet,
+                    plan=plan,
+                    selected_target_markdown=selected_target_markdown,
+                )
+            )
+            evidence_review = validate_critic_review(
+                raw_evidence,
+                review_kind="evidence",
+                packet=packet,
+                plan=plan,
+                selected_target_markdown=selected_target_markdown,
+            )
+            critic = combine_critic_reviews(placement, evidence_review)
+            critic["mode"] = critic_mode
+            critic["raw_reviews"] = {
+                "placement": raw_placement,
+                "evidence": raw_evidence,
+            }
+            critic_approved = critic.get("approved") is True
         if deterministic.ok and critic_approved:
             break
         prior_issues = deterministic.issues + [
@@ -580,22 +1108,40 @@ def run_local_publish(
         "plan": plan,
         "plan_validation": asdict(deterministic),
         "critic": critic,
+        "critic_mode": critic_mode,
+        "publication_requested": publish,
+        "publication_suppressed": publication_suppressed,
     }
     if progress:
         progress("validating")
-    report_path = output_dir / f"{slug}-local-publish-report.json"
     report["report_path"] = str(report_path)
     if plan.get("decision") != "append_existing":
         report["status"] = str(plan.get("decision") or "needs_review")
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         return report
-    if not deterministic.ok or critic.get("approved") is not True or critic.get("recommendation") != "approve":
+    critic_approved = critic.get("approved") is True
+    critic_override_applied = bool(
+        allow_critic_rejection
+        and deterministic.ok
+        and not critic_approved
+    )
+    report["critic_override"] = {
+        "requested": allow_critic_rejection,
+        "applied": critic_override_applied,
+        "reason": override_reason.strip() if allow_critic_rejection else "",
+    }
+    if not deterministic.ok:
         report["status"] = "needs_review"
-        report["reason"] = "quality_gate_failed"
+        report["reason"] = "deterministic_quality_gate_failed"
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        return report
+    if critic_mode == "required" and not critic_approved and not critic_override_applied:
+        report["status"] = "needs_review"
+        report["reason"] = "critic_quality_gate_failed"
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         return report
 
-    if publish and progress:
+    if publication_enabled and progress:
         progress("publishing")
     runtime_root = tools_root / "runtime" / "local-publisher"
     worktree, branch = create_isolated_worktree(
@@ -635,7 +1181,7 @@ def run_local_publish(
         }
     )
 
-    if publish:
+    if publication_enabled:
         run_command(["git", "add", "--", str(target_relative)], cwd=worktree)
         commit_title = f"Add research on {packet.get('title', 'source')}"[:72]
         run_command(["git", "commit", "-m", commit_title], cwd=worktree)
@@ -644,6 +1190,29 @@ def run_local_publish(
         gh = shutil.which("gh")
         if not gh:
             raise FileNotFoundError("gh CLI is required to publish a draft PR")
+        critic_findings = "\n".join(
+            f"- `{item.get('severity')}` `{item.get('code')}`"
+            + (f" (bullet {item.get('bullet_index')})" if item.get("bullet_index") is not None else "")
+            + f": {item.get('explanation')}"
+            for item in critic.get("issues") or []
+        ) or "- None"
+        if critic_override_applied:
+            critic_audit = (
+                "**Critic rejection override applied after human review.**\n\n"
+                f"Override reason: {override_reason.strip()}\n\n"
+                f"Validated critic findings retained for review:\n{critic_findings}"
+            )
+        else:
+            critic_audit = f"Validated critic findings:\n{critic_findings}"
+        pr_body = (
+            "Local research publisher update.\n\n"
+            f"Source: {source}\n\n"
+            f"Changed: `{target_relative}`\n\n"
+            "The deterministic packet, citation metadata, exact-quotation, near-verbatim, and rendered-Markdown gates passed.\n\n"
+            f"Critic mode: `{critic_mode}`\n\n"
+            f"{critic_audit}\n\n"
+            "This pull request is intentionally a draft and is never auto-merged."
+        )
         pr_url = run_command(
             [
                 gh,
@@ -657,7 +1226,7 @@ def run_local_publish(
                 "--title",
                 commit_title,
                 "--body",
-                f"Local research publisher update.\n\nSource: {source}\n\nChanged: `{target_relative}`\n\nThe deterministic evidence gate and local-model critic both approved this draft.",
+                pr_body,
             ],
             cwd=worktree,
         )

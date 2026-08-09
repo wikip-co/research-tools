@@ -15,9 +15,18 @@ contains the requested and resolved URLs, title, DOI/PMID, authors, journal,
 date, study type, abstract, extracted body, scraper backend, citation metadata,
 and retrieval/consistency warnings.
 
-The packet gate rejects CAPTCHA, robot, challenge, access-error, and publisher
-error pages regardless of body length. It also rejects a DOI when its Crossref
-title is inconsistent with the scraped article title. FlareSolverr receives the
+The scraper accepts only a syntactically valid bare DOI, recovers one from the
+article URL or extracted body when publisher fields contain labels such as
+`DOI:`, discards placeholder authors/journals/dates, and uses Crossref or PubMed
+to fill missing citation metadata. A complete abstract in the article body is
+preferred over an ellipsized metadata preview. Repairs and remaining
+`citation_metadata_issues` are recorded in the packet.
+
+The packet gate rejects unresolved placeholder citation metadata, truncated
+abstracts, malformed DOI/reference pairs, CAPTCHA, robot, challenge,
+access-error, and publisher error pages regardless of body length. It also
+rejects a DOI when its Crossref title is inconsistent with the scraped article
+title. FlareSolverr receives the
 original article URL as a fallback; CAPTCHA HTML from an earlier scraper is not
 passed into FlareSolverr. A challenge response returned by FlareSolverr is still
 invalid and can fall through to agent-browser.
@@ -27,18 +36,32 @@ invalid and can fall through to agent-browser.
 The publisher:
 
 1. scrapes with the existing Scrapling → FlareSolverr → agent-browser path;
-2. validates the packet before enrichment or model use;
-3. checks URL/DOI duplicates;
+2. validates retrieval plus enriched citation metadata before model use;
+3. checks duplicates using the DOI, DOI URL, resolved URL, requested URL, and
+   original intake URL rather than trusting one identifier;
 4. retrieves candidate content homes using title, abstract, keywords, alert
    topic, tags, paths, and article bodies;
 5. asks the local model for a structured append plan;
 6. requires each proposed bullet to carry an exact source quote and checks that
    the bullet remains near-verbatim;
-7. runs a separate critic pass for support, study-type inflation, and medical
-   overclaiming;
-8. applies only a validated plan in an isolated git worktree based on
+7. runs separate target-placement and evidence-support reviews against the
+   selected candidate metadata and selected target Markdown only after the
+   structured plan passes deterministic validation;
+8. accepts critic issues only from fixed code/severity sets and only when each
+   objection contains an exact source or target-page quotation; self-
+   contradictory or ungrounded findings are recorded but cannot gate a draft;
+9. applies only a validated plan in an isolated git worktree based on
    `origin/main`; and
-9. opens a draft PR only when `--publish` is supplied and every gate passes.
+10. opens a draft PR only when `--publish` is supplied and every gate passes.
+
+A single plan has one target. When a study spans a broad botanical, a named
+cultivar, and an isolated compound, the plan must restrict bullets to the entity
+that belongs on the selected page or return `needs_review`; compound-specific
+mechanisms are not silently folded into a broader page that does not already
+cover that compound. Two or more bullets about a newly introduced isolated
+compound produce a deterministic `unsafe_context_inference` placement-review
+finding. Required mode must revise it or use the audited human override; the
+publisher still does not create new articles autonomously.
 
 For paths under `Natural Healing/`,
 `Research/docs/natural-healing-content-style-guide.md` is authoritative. Its
@@ -60,6 +83,44 @@ After reviewing pilot output, allow a validated draft PR:
 ./agent-workflow local-publish "https://example.org/article" \
   --alert-name "Quercetin" --publish
 ```
+
+### Critic modes
+
+`required` is the default and is the only mode that can publish normally:
+
+```bash
+./agent-workflow local-publish URL --critic-mode required
+```
+
+`advisory` still runs both reviews and records their findings. It may produce a
+validated patch after deterministic gates pass, but it suppresses commit, push,
+and PR creation even when `--publish` is present:
+
+```bash
+./agent-workflow local-publish URL --critic-mode advisory --publish
+```
+
+`off` skips both critic calls and is limited to manual ad-hoc dry runs. Combining
+it with `--publish` is an error:
+
+```bash
+./agent-workflow local-publish URL --critic-mode off
+```
+
+After a human reviews the packet, selected target, plan, deterministic results,
+and critic findings, a required-mode rejection can be overridden only with both
+an explicit flag and audit reason:
+
+```bash
+./agent-workflow local-publish URL --critic-mode required --publish \
+  --allow-critic-rejection \
+  --override-reason "Human reviewed target and evidence"
+```
+
+The override does not bypass packet/citation metadata, duplicate, exact-quote,
+near-verbatim, preclinical-placement, or rendered-Markdown gates. The report and
+draft PR retain the critic findings and reason. It is unavailable to
+`local-worker`, and no path auto-merges.
 
 ## Database Queue
 
@@ -94,6 +155,10 @@ uv run --directory gmail-reader gmail-reader \
 `retry` carries an attempt count and `next_run_at`; `failed` means the retry
 budget was exhausted. Every transition is appended to
 `publication_job_events`.
+
+The passive worker always uses `critic-mode=required`. It exposes no critic
+override flags, and the publisher also rejects an override when invoked with
+the internal passive-worker context.
 
 Historical article rows can be linked to canonical papers in bounded batches.
 The command is a dry run unless `--apply` is explicit:

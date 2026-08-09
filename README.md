@@ -13,7 +13,7 @@ This repository separates the operational tooling from the markdown content repo
 - `wiki-automation`: build queues, search content, and prepare scrape packets
 - `image-upload`: upload article images to Cloudinary, including browser-captured screenshots
 - `web-scraper`: scrape source URLs into structured packets, with optional FlareSolverr (Cloudflare) and `agent-browser` fallbacks
-- local llama.cpp publisher: guarded ad-hoc URL processing plus a durable SQLite queue, structured draft/critic passes, deterministic gates, isolated worktrees, and optional draft PRs
+- local llama.cpp publisher: guarded ad-hoc URL processing plus a durable SQLite queue, a structured draft with separate placement/evidence reviews, deterministic gates, isolated worktrees, and optional draft PRs
 
 ## Runtime Model
 
@@ -319,8 +319,14 @@ The web-scraper now automatically detects study types (Review, Meta-Analysis, RC
 ### Local llama.cpp Publisher
 
 - `agent-workflow local-publish URL` runs an ad-hoc dry-run through packet,
-  retrieval, draft, critic, deterministic validation, and isolated-worktree gates.
+  retrieval, draft, split placement/evidence critics, deterministic validation,
+  and isolated-worktree gates.
 - Add `--publish` to open a draft PR after every gate passes.
+- Use `--critic-mode advisory` for patch-only review or `--critic-mode off` for
+  a manual ad-hoc dry run. Only default `required` mode can publish normally.
+- A required critic rejection can be published only with the explicit audited
+  `--allow-critic-rejection --override-reason "..."` pair; passive workers can
+  never use it, and deterministic/citation gates still apply.
 - `enqueue-local`, `enqueue-local-backlog`, and `local-worker` provide the durable
   SQLite queue used by the passive database workflow.
 - See [docs/local-research-publisher.md](docs/local-research-publisher.md) for

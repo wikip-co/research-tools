@@ -14,7 +14,7 @@ It does several things:
 - audit tags and lint markdown frontmatter
 - open a PR from the mounted content repo with `gh`
 - publish a PR end-to-end by creating a branch, committing article changes, pushing, and opening the PR
-- run the production local llama.cpp publisher for ad-hoc URLs or durable SQLite jobs, with structured draft/critic passes and deterministic quality gates
+- run the production local llama.cpp publisher for ad-hoc URLs or durable SQLite jobs, with a structured draft, separate placement/evidence reviews, and deterministic quality gates
 
 ## Setup
 
@@ -177,3 +177,10 @@ uses an isolated worktree based on `origin/main` and opens a draft PR only when
 packet, duplicate, match, evidence, critic, render, and Git-scope gates all
 pass. It does not auto-merge or autonomously create a new article. See
 [`../docs/local-research-publisher.md`](../docs/local-research-publisher.md).
+
+The default `--critic-mode required` runs independent placement and evidence
+reviews grounded in exact source/target quotations. `advisory` can produce a
+review patch but suppresses publishing; `off` is ad-hoc dry-run only. A human
+can override a required-mode critic rejection only with `--publish`,
+`--allow-critic-rejection`, and an `--override-reason`; deterministic and
+citation-metadata gates remain mandatory. The passive worker has no override.

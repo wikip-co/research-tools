@@ -1795,6 +1795,9 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
         base_ref=args.base_ref,
         max_candidates=args.limit,
         max_draft_attempts=args.max_draft_attempts,
+        critic_mode=args.critic_mode,
+        allow_critic_rejection=args.allow_critic_rejection,
+        override_reason=args.override_reason,
     )
     candidates = result.get("candidates") or []
     return {
@@ -1811,6 +1814,9 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
         "plan_validation": result.get("plan_validation"),
         "rendered_validation": result.get("rendered_validation"),
         "critic": result.get("critic"),
+        "critic_mode": result.get("critic_mode"),
+        "critic_override": result.get("critic_override"),
+        "publication_suppressed": result.get("publication_suppressed"),
         "top_candidate": candidates[0] if candidates else None,
         "duplicate": result.get("duplicate"),
     }
@@ -1913,6 +1919,10 @@ def local_worker_command(args: argparse.Namespace) -> dict[str, Any]:
                 base_ref=args.base_ref,
                 max_candidates=args.limit,
                 max_draft_attempts=args.max_draft_attempts,
+                critic_mode="required",
+                allow_critic_rejection=False,
+                override_reason="",
+                passive_worker=True,
                 progress=progress,
             )
             status = str(report.get("status") or "needs_review")
@@ -2499,6 +2509,22 @@ def build_parser() -> argparse.ArgumentParser:
     local_publish_parser.add_argument("--base-ref", default="origin/main", help="Git ref for the isolated content worktree.")
     local_publish_parser.add_argument("--limit", type=int, default=5, help="Maximum target candidates.")
     local_publish_parser.add_argument("--max-draft-attempts", type=int, default=3, help="Maximum draft/critic repair passes.")
+    local_publish_parser.add_argument(
+        "--critic-mode",
+        choices=["required", "advisory", "off"],
+        default="required",
+        help="required gates publication; advisory writes a patch but suppresses publication; off is manual dry-run only.",
+    )
+    local_publish_parser.add_argument(
+        "--allow-critic-rejection",
+        action="store_true",
+        help="Allow a required-mode critic rejection only after explicit human review; requires --publish and --override-reason.",
+    )
+    local_publish_parser.add_argument(
+        "--override-reason",
+        default="",
+        help="Human audit reason recorded in the report and draft PR when overriding a critic rejection.",
+    )
     local_publish_parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Packet, report, and patch directory.")
     local_publish_parser.add_argument(
         "--publish",

@@ -37,6 +37,7 @@ It supports four complementary modes:
    - Produce a normalized packet rather than trusting raw HTML
    - Reject CAPTCHA, robot, login, rate-limit, and error pages regardless of body length
    - Use Scrapling, then FlareSolverr with the original URL, then agent-browser
+   - Reject DOI labels/placeholders, recover complete citation metadata and abstracts, and record repairs
    - Verify scraped title and DOI enrichment describe the same paper
 
 4. **Image Upload**
@@ -48,7 +49,8 @@ It supports four complementary modes:
    - If not, set the markdown frontmatter image field explicitly, for example `image: goatberry`
 
 5. **Local model and quality gates**
-   - Ask llama.cpp for a structured append plan and then a critic pass
+   - Ask llama.cpp for a structured append plan, target-placement review, and evidence-support review
+   - Require fixed critic issue codes/severities plus exact source or target-page quotations
    - Require exact source quotations and near-verbatim Natural Healing bullets
    - Preserve study design, species, limitations, and claim strength
    - Fail closed on uncertain article placement
@@ -122,6 +124,10 @@ uv run gmail-reader search --gmail-query 'label:inbox newer_than:1d' --include-r
 5. Scrape, validate, deduplicate, match, draft, critique, and validate the patch.
 6. In dry-run mode, inspect the report and patch; in publication mode, open a draft PR.
 7. Record every state transition in `publication_job_events` and require human review before merge.
+
+The passive worker always uses required critic mode. Critic rejection overrides
+are intentionally unavailable in the queue path; they are an audited ad-hoc
+human action only.
 
 The tracked Scholar and publisher timer units implement this loop, but they are
 not installed or enabled by default. See `../docs/local-research-publisher.md`.

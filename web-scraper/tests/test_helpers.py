@@ -96,6 +96,65 @@ class WebScraperHelperTests(unittest.TestCase):
             "https://doi.org/10.1000/xyz123",
         )
 
+    def test_doi_labels_are_not_accepted_as_identifiers(self) -> None:
+        self.assertEqual(main.normalize_doi("DOI:"), "")
+        self.assertEqual(
+            main.normalize_doi("https://doi.org/10.1097/MS9.0000000000005494"),
+            "10.1097/MS9.0000000000005494",
+        )
+
+    def test_ovid_style_placeholders_and_truncation_are_recovered(self) -> None:
+        url = (
+            "https://www.ovid.com/jnls/example/fulltext/"
+            "10.1097/ms9.0000000000005494~significant-anti-myeloma"
+        )
+        full_title = (
+            "Significant anti-myeloma potential of green tea infusion and its "
+            "component dihydromyricetin"
+        )
+        full_abstract = (
+            "Multiple myeloma is a hematological malignancy. This study compared "
+            "four green tea infusions in cell and xenograft mouse models and found "
+            "that Biluochun showed the strongest preclinical activity."
+        )
+        html = f"""
+        <html><head>
+          <meta property="og:title" content="Significant anti-myeloma potential... : Journal">
+          <meta property="og:description" content="Multiple myeloma is a hematological malignancy...">
+          <meta property="og:site_name" content="Ovid">
+        </head><body><article>
+          <h1>{full_title}</h1>
+          <div class="author">Authors and Affiliations</div>
+          <p>Annals of Medicine &amp; Surgery, August 06, 2026. DOI: 10.1097/MS9.0000000000005494</p>
+          <div>Abstract</div><div>In Brief</div><p>{full_abstract}</p>
+          <h2>Introduction</h2><p>{'body evidence ' * 100}</p>
+        </article></body></html>
+        """
+        crossref = {
+            "doi": "10.1097/MS9.0000000000005494",
+            "title": full_title,
+            "authors": "Juan Xiao, Hongyu Zhu",
+            "journal": "Annals of Medicine & Surgery",
+            "pub_date": "2026-08-06",
+            "abstract": "",
+        }
+        with (
+            patch.object(main, "fetch_crossref_metadata", return_value=crossref),
+            patch.object(main, "fetch_pubmed_metadata", return_value={}),
+            patch.object(main, "fetch_unpaywall_metadata", return_value={}),
+        ):
+            data = main.extract_article_data(url, html, retrieval_backend="fixture")
+
+        self.assertEqual(data["title"], full_title)
+        self.assertEqual(data["doi"], "10.1097/ms9.0000000000005494")
+        self.assertEqual(data["reference_url"], "https://doi.org/10.1097/ms9.0000000000005494")
+        self.assertEqual(data["authors"], "Juan Xiao, Hongyu Zhu")
+        self.assertEqual(data["journal"], "Annals of Medicine & Surgery")
+        self.assertEqual(data["pub_date"], "2026-08-06")
+        self.assertEqual(data["abstract"], full_abstract)
+        self.assertEqual(data["citation_metadata_issues"], [])
+        self.assertIn("authors:recovered_from_crossref", data["metadata_repairs"])
+
     def test_extract_pmid_from_pubmed_url(self) -> None:
         self.assertEqual(
             main.extract_pmid("https://pubmed.ncbi.nlm.nih.gov/40878114/"),

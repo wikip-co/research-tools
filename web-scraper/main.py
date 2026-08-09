@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import html as _html
 import json
 import os
 import re as _re
@@ -155,6 +156,27 @@ FATAL_RETRIEVAL_ISSUES = frozenset(
 )
 
 DOI_PATTERN = _re.compile(r"\b10\.\d{4,9}/[-._;()/:a-z0-9]+\b", _re.IGNORECASE)
+TRUNCATED_TEXT_PATTERN = _re.compile(r"(?:\.\.\.|…)$")
+METADATA_PLACEHOLDERS = {
+    "authors": {
+        "author",
+        "authors",
+        "author s",
+        "authors and affiliations",
+        "unknown",
+        "n a",
+    },
+    "journal": {
+        "journal",
+        "ovid",
+        "publisher",
+        "source",
+        "unknown",
+        "n a",
+    },
+    "pub_date": {"date", "published", "unknown", "n a"},
+    "doi": {"doi", "unknown", "n a"},
+}
 PMID_URL_PATTERN = _re.compile(
     r"(?:pubmed\.ncbi\.nlm\.nih\.gov|ncbi\.nlm\.nih\.gov/pubmed)/(\d+)",
     _re.IGNORECASE,
@@ -248,7 +270,20 @@ STUDY_TYPE_PATTERNS = {
 def normalize_whitespace(value: str | None) -> str:
     if not value:
         return ""
-    return " ".join(value.split())
+    return _html.unescape(" ".join(value.split()))
+
+
+def normalize_placeholder_key(value: str | None) -> str:
+    return _re.sub(r"[^a-z0-9]+", " ", normalize_whitespace(value).lower()).strip()
+
+
+def is_placeholder_metadata(key: str, value: str | None) -> bool:
+    cleaned = normalize_placeholder_key(value)
+    return not cleaned or cleaned in METADATA_PLACEHOLDERS.get(key, set())
+
+
+def is_truncated_text(value: str | None) -> bool:
+    return bool(TRUNCATED_TEXT_PATTERN.search(normalize_whitespace(value)))
 
 
 def normalize_block_whitespace(value: str | None) -> str:
@@ -773,6 +808,95 @@ def extract_first_doi(*values: str) -> str:
     return ""
 
 
+def normalize_doi(*values: str) -> str:
+    """Return a bare syntactically valid DOI or an empty string.
+
+    Publisher pages frequently expose labels such as ``DOI:`` or complete
+    ``https://doi.org/...`` links in fields intended to contain a bare DOI.
+    Only the DOI-pattern match is allowed into the packet contract.
+    """
+    return extract_first_doi(*values)
+
+
+def choose_complete_text(*values: str, max_chars: int = 1000) -> str:
+    candidates = [
+        normalize_whitespace(value)
+        for value in values
+        if normalize_whitespace(value)
+        and len(normalize_whitespace(value)) <= max_chars
+    ]
+    if not candidates:
+        return ""
+    complete = [value for value in candidates if not is_truncated_text(value)]
+    return max(complete or candidates, key=len)
+
+
+def recover_abstract_from_body(body_markdown: str) -> str:
+    """Recover the first full paragraph following an Abstract label/heading."""
+    lines = body_markdown.splitlines()
+    for index, line in enumerate(lines):
+        if normalize_placeholder_key(line.lstrip("# ")) != "abstract":
+            continue
+        for candidate in lines[index + 1 : index + 12]:
+            cleaned = normalize_whitespace(candidate.lstrip("# "))
+            if not cleaned or normalize_placeholder_key(cleaned) in {
+                "abstract",
+                "in brief",
+            }:
+                continue
+            if len(cleaned) >= MIN_ABSTRACT_CHARS and not is_truncated_text(cleaned):
+                return cleaned
+        break
+    return ""
+
+
+def choose_abstract(
+    *,
+    citation: str,
+    body_recovery: str,
+    selectors: list[str],
+    descriptions: list[str],
+) -> str:
+    """Prefer a complete article abstract over previews and generated summaries."""
+    priority_groups = ([citation], [body_recovery], selectors, descriptions)
+    truncated_fallback = ""
+    for values in priority_groups:
+        cleaned_values: list[str] = []
+        for value in values:
+            cleaned = normalize_whitespace(value)
+            if "Text is machine generated" in cleaned:
+                cleaned = cleaned.split("Text is machine generated", 1)[0].strip()
+            if cleaned:
+                cleaned_values.append(cleaned)
+        complete = [
+            value
+            for value in cleaned_values
+            if len(value) >= MIN_ABSTRACT_CHARS and not is_truncated_text(value)
+        ]
+        if complete:
+            return max(complete, key=len)
+        if cleaned_values and not truncated_fallback:
+            truncated_fallback = max(cleaned_values, key=len)
+    return truncated_fallback
+
+
+def metadata_quality_issues(data: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    doi = normalize_whitespace(str(data.get("doi", "")))
+    if doi and normalize_doi(doi) != doi:
+        issues.append("invalid_doi")
+    for key in ("authors", "journal", "pub_date"):
+        if is_placeholder_metadata(key, str(data.get(key, ""))):
+            issues.append(f"missing_or_placeholder_{key}")
+    abstract = normalize_whitespace(str(data.get("abstract", "")))
+    if abstract and is_truncated_text(abstract):
+        issues.append("truncated_abstract")
+    reference_url = normalize_whitespace(str(data.get("reference_url", "")))
+    if not looks_like_url(reference_url):
+        issues.append("invalid_reference_url")
+    return unique_nonempty(issues)
+
+
 def extract_pmid(value: str) -> str:
     match = PMID_URL_PATTERN.search(value or "")
     return match.group(1) if match else ""
@@ -866,9 +990,9 @@ def crossref_summary(work: dict[str, Any]) -> dict[str, Any]:
     journal_values = work.get("container-title") or []
     return {
         "doi": normalize_whitespace(work.get("DOI", "")),
-        "title": first_item(title_values),
+        "title": normalize_whitespace(first_item(title_values)),
         "authors": normalize_whitespace(authors),
-        "journal": first_item(journal_values),
+        "journal": normalize_whitespace(first_item(journal_values)),
         "pub_date": first_nonempty(
             normalize_date_parts(work.get("published-print", {}).get("date-parts", [])),
             normalize_date_parts(work.get("published-online", {}).get("date-parts", [])),
@@ -976,6 +1100,24 @@ def enrich_metadata(data: dict[str, Any]) -> dict[str, Any]:
     external_metadata: dict[str, Any] = {}
     enrichment_sources: list[str] = []
     enrichment_errors: list[str] = []
+    metadata_repairs: list[str] = list(data.get("metadata_repairs") or [])
+
+    raw_doi = normalize_whitespace(str(data.get("doi", "")))
+    normalized_doi = normalize_doi(
+        raw_doi,
+        str(data.get("url", "")),
+        str(data.get("requested_url", "")),
+        str(data.get("body_markdown", ""))[:5000],
+    )
+    if raw_doi != normalized_doi:
+        metadata_repairs.append("doi:discarded_placeholder_or_normalized")
+    data["doi"] = normalized_doi
+
+    for key in ("authors", "journal", "pub_date"):
+        if is_placeholder_metadata(key, str(data.get(key, ""))):
+            if normalize_whitespace(str(data.get(key, ""))):
+                metadata_repairs.append(f"{key}:discarded_placeholder")
+            data[key] = ""
 
     crossref_data: dict[str, Any] = {}
     try:
@@ -1024,11 +1166,12 @@ def enrich_metadata(data: dict[str, Any]) -> dict[str, Any]:
         external_metadata["unpaywall"] = unpaywall_data
         enrichment_sources.append("unpaywall")
 
-    def fill_if_missing(key: str, value: str) -> None:
+    def fill_if_missing(key: str, value: str, source: str) -> None:
         if value and not normalize_whitespace(str(data.get(key, ""))):
             data[key] = value
+            metadata_repairs.append(f"{key}:recovered_from_{source}")
 
-    def replace_if_polluted(key: str, value: str) -> None:
+    def replace_if_polluted(key: str, value: str, source: str) -> None:
         if not value:
             return
         current = normalize_whitespace(str(data.get(key, "")))
@@ -1041,8 +1184,9 @@ def enrich_metadata(data: dict[str, Any]) -> dict[str, Any]:
         )
         if polluted:
             data[key] = value
+            metadata_repairs.append(f"{key}:replaced_polluted_from_{source}")
 
-    def replace_truncated_abstract(value: str) -> None:
+    def replace_truncated_abstract(value: str, source: str) -> None:
         if not value:
             return
         current = normalize_whitespace(str(data.get("abstract", "")))
@@ -1051,23 +1195,25 @@ def enrich_metadata(data: dict[str, Any]) -> dict[str, Any]:
         )
         if truncated:
             data["abstract"] = value
+            metadata_repairs.append(f"abstract:recovered_from_{source}")
 
-    fill_if_missing("doi", crossref_data.get("doi", ""))
-    fill_if_missing("doi", pubmed_data.get("doi", ""))
-    fill_if_missing("title", crossref_data.get("title", ""))
-    fill_if_missing("title", pubmed_data.get("title", ""))
-    fill_if_missing("authors", crossref_data.get("authors", ""))
-    fill_if_missing("authors", pubmed_data.get("authors", ""))
+    fill_if_missing("doi", normalize_doi(str(crossref_data.get("doi", ""))), "crossref")
+    fill_if_missing("doi", normalize_doi(str(pubmed_data.get("doi", ""))), "pubmed")
+    fill_if_missing("title", crossref_data.get("title", ""), "crossref")
+    fill_if_missing("title", pubmed_data.get("title", ""), "pubmed")
+    fill_if_missing("authors", crossref_data.get("authors", ""), "crossref")
+    fill_if_missing("authors", pubmed_data.get("authors", ""), "pubmed")
     replace_if_polluted(
         "authors",
         crossref_data.get("authors", "") or pubmed_data.get("authors", ""),
+        "external_metadata",
     )
-    fill_if_missing("journal", crossref_data.get("journal", ""))
-    fill_if_missing("journal", pubmed_data.get("journal", ""))
-    fill_if_missing("pub_date", crossref_data.get("pub_date", ""))
-    fill_if_missing("pub_date", pubmed_data.get("pub_date", ""))
-    fill_if_missing("abstract", crossref_data.get("abstract", ""))
-    replace_truncated_abstract(crossref_data.get("abstract", ""))
+    fill_if_missing("journal", crossref_data.get("journal", ""), "crossref")
+    fill_if_missing("journal", pubmed_data.get("journal", ""), "pubmed")
+    fill_if_missing("pub_date", crossref_data.get("pub_date", ""), "crossref")
+    fill_if_missing("pub_date", pubmed_data.get("pub_date", ""), "pubmed")
+    fill_if_missing("abstract", crossref_data.get("abstract", ""), "crossref")
+    replace_truncated_abstract(crossref_data.get("abstract", ""), "crossref")
 
     data["pmid"] = normalize_whitespace(
         str(data.get("pmid", "")) or pubmed_data.get("pmid", "")
@@ -1085,6 +1231,8 @@ def enrich_metadata(data: dict[str, Any]) -> dict[str, Any]:
         data["external_metadata"] = external_metadata
     if enrichment_errors:
         data["enrichment_errors"] = enrichment_errors
+    if metadata_repairs:
+        data["metadata_repairs"] = unique_nonempty(metadata_repairs)
     return data
 
 
@@ -1189,6 +1337,7 @@ def scrape_pdf_source(source: str) -> dict[str, Any]:
     }
     enrich_metadata(data)
     data["reference_url"] = citation_url(data)
+    data["citation_metadata_issues"] = metadata_quality_issues(data)
     data["footnote_markdown"] = footnote_markdown(data)
     data["retrieval_issues"] = extraction_issues(data)
     return data
@@ -1197,13 +1346,14 @@ def scrape_pdf_source(source: str) -> dict[str, Any]:
 def extract_article_data(url: str, raw_html: str, retrieval_backend: str) -> dict[str, Any]:
     soup = BeautifulSoup(raw_html, "html.parser")
 
-    title = first_nonempty(
+    title = choose_complete_text(
         first_item(meta_values(soup, "name", "citation_title")),
+        *selector_texts(soup, "h1"),
         first_item(meta_values(soup, "property", "og:title")),
-        first_item(selector_texts(soup, "h1")),
         soup.title.get_text(" ", strip=True) if soup.title else "",
-        "Unknown Title",
+        max_chars=600,
     )
+    title = title or "Unknown Title"
 
     author_tags = meta_values(soup, "name", "citation_author")
     if author_tags:
@@ -1213,11 +1363,17 @@ def extract_article_data(url: str, raw_html: str, retrieval_backend: str) -> dic
             soup,
             '[class*="author"] [class*="name"], [class*="author"], [rel="author"]',
         )
-        authors = ", ".join(author_candidates)
+        authors = ", ".join(
+            candidate
+            for candidate in author_candidates
+            if not is_placeholder_metadata("authors", candidate)
+        )
 
-    doi = first_nonempty(
+    doi = normalize_doi(
         first_item(meta_values(soup, "name", "citation_doi")),
-        first_item(selector_texts(soup, '[class*="doi"]')),
+        *selector_texts(soup, '[class*="doi"]'),
+        url,
+        raw_html,
     )
     journal = first_nonempty(
         first_item(meta_values(soup, "name", "citation_journal_title")),
@@ -1235,11 +1391,15 @@ def extract_article_data(url: str, raw_html: str, retrieval_backend: str) -> dic
     )
     keyword_tags = meta_values(soup, "name", "citation_keywords") or meta_values(soup, "name", "keywords")
     keywords = ", ".join(keyword_tags)
-    abstract = first_nonempty(
-        first_item(meta_values(soup, "name", "citation_abstract")),
-        first_item(meta_values(soup, "name", "description")),
-        first_item(meta_values(soup, "property", "og:description")),
-        first_item(selector_texts(soup, ".abstract, [class*='abstract']")),
+    body_markdown, body_selector = extract_best_body_markdown(raw_html)
+    abstract = choose_abstract(
+        citation=first_item(meta_values(soup, "name", "citation_abstract")),
+        body_recovery=recover_abstract_from_body(body_markdown),
+        selectors=selector_texts(soup, ".abstract, [class*='abstract']"),
+        descriptions=[
+            first_item(meta_values(soup, "name", "description")),
+            first_item(meta_values(soup, "property", "og:description")),
+        ],
     )
     if abstract:
         abstract = BeautifulSoup(abstract, "html.parser").get_text(" ", strip=True)
@@ -1250,8 +1410,6 @@ def extract_article_data(url: str, raw_html: str, retrieval_backend: str) -> dic
         publication_types = meta_values(soup, "property", "og:type")
 
     mesh_terms = selector_texts(soup, '[data-ga-label="mesh_terms"] a')
-    body_markdown, body_selector = extract_best_body_markdown(raw_html)
-
     study_type = detect_study_type(
         title=title,
         abstract=abstract,
@@ -1290,6 +1448,7 @@ def extract_article_data(url: str, raw_html: str, retrieval_backend: str) -> dic
     else:
         enrich_metadata(data)
     data["reference_url"] = citation_url(data)
+    data["citation_metadata_issues"] = metadata_quality_issues(data)
     data["footnote_markdown"] = footnote_markdown(data)
     return data
 
@@ -1339,9 +1498,9 @@ def extraction_score(data: dict[str, Any]) -> int:
 
 
 def citation_url(data: dict[str, str]) -> str:
-    doi = data.get("doi", "").strip()
+    doi = normalize_doi(data.get("doi", ""))
     if doi:
-        return doi if doi.startswith("http") else f"https://doi.org/{doi}"
+        return f"https://doi.org/{doi}"
     return data.get("url", "").strip()
 
 

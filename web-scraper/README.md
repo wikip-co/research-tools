@@ -63,6 +63,16 @@ uv run web-scraper "https://journals.sagepub.com/doi/full/10.1177/25151355251387
 - A research packet is the normalized metadata, abstract/body, provenance, and warnings handed to downstream automation; it is not the raw response body.
 - Fatal-page detection rejects CAPTCHA, robot, challenge, login, rate-limit, and publisher error packets regardless of body length.
 - DOI enrichment is accepted only when the external title is consistent with the scraped title.
+- DOI fields are syntax-checked. Labels such as `DOI:` are discarded, while a
+  valid DOI can be recovered from the article URL or extracted body before
+  Crossref/PubMed enrichment.
+- Placeholder citation values such as `Authors and Affiliations`, `Ovid`, and
+  `Unknown` are treated as missing. Recovery actions are listed in
+  `metadata_repairs`; unresolved problems are listed in
+  `citation_metadata_issues` for the publisher packet gate.
+- A complete abstract recovered from the article body takes precedence over an
+  ellipsized OpenGraph/description preview. A remaining truncated abstract is a
+  citation metadata issue rather than silently becoming a footnote abstract.
 
 ## Retrieval fallbacks
 
