@@ -10,6 +10,65 @@ FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 
 class WebScraperHelperTests(unittest.TestCase):
+    def test_large_captcha_packet_is_always_invalid(self) -> None:
+        data = {
+            "title": "Are you a robot?",
+            "abstract": "",
+            "body_markdown": (
+                "Please confirm you are a human by completing the captcha challenge.\n"
+                "Enable JavaScript and cookies to continue.\n"
+                + ("bundled javascript " * 20000)
+            ),
+        }
+
+        issues = main.extraction_issues(data)
+
+        self.assertIn("invalid_title", issues)
+        self.assertIn("captcha_page", issues)
+        self.assertTrue(main.has_fatal_extraction_issue(data))
+        self.assertLess(main.extraction_score(data), 0)
+
+    def test_bad_interstitial_skips_crossref_enrichment(self) -> None:
+        html = """
+        <html><head><title>Are you a robot?</title></head>
+        <body><h1>Are you a robot?</h1>
+        <p>Please confirm you are a human by completing the captcha challenge below.</p>
+        </body></html>
+        """
+
+        with patch.object(main, "fetch_json") as fetch_json:
+            data = main.extract_article_data(
+                "https://example.org/article",
+                html,
+                retrieval_backend="fixture",
+            )
+
+        fetch_json.assert_not_called()
+        self.assertEqual(data["enrichment_skipped"], "fatal_retrieval_issue")
+        self.assertFalse(data.get("doi"))
+
+    def test_doi_metadata_title_mismatch_invalidates_packet(self) -> None:
+        data = {
+            "url": "https://example.org/article",
+            "title": "Quercetin and preeclampsia prevention",
+            "doi": "10.1000/example",
+            "abstract": "A sufficiently detailed abstract about quercetin.",
+            "body_markdown": "article body " * 100,
+        }
+        unrelated = {
+            "doi": "10.1000/example",
+            "title": "Continuous delivery practices in software teams",
+        }
+        with (
+            patch.object(main, "fetch_crossref_metadata", return_value=unrelated),
+            patch.object(main, "fetch_pubmed_metadata", return_value={}),
+            patch.object(main, "fetch_unpaywall_metadata", return_value={}),
+        ):
+            main.enrich_metadata(data)
+
+        self.assertIn("doi_title_mismatch", main.extraction_issues(data))
+        self.assertTrue(main.has_fatal_extraction_issue(data))
+
     def test_looks_like_pdf_source_for_url_and_file(self) -> None:
         self.assertTrue(main.looks_like_pdf_source("https://example.com/paper.pdf"))
         self.assertTrue(main.looks_like_pdf_source("/tmp/paper.pdf"))
@@ -35,6 +94,12 @@ class WebScraperHelperTests(unittest.TestCase):
         self.assertEqual(
             main.citation_url({"doi": "10.1000/xyz123", "url": "https://example.com"}),
             "https://doi.org/10.1000/xyz123",
+        )
+
+    def test_extract_pmid_from_pubmed_url(self) -> None:
+        self.assertEqual(
+            main.extract_pmid("https://pubmed.ncbi.nlm.nih.gov/40878114/"),
+            "40878114",
         )
 
     def test_canonicalize_article_url_publisher_pdf_gates(self) -> None:

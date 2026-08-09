@@ -11,7 +11,32 @@ Read this before changing production paths, dotenv behavior, backups, or FlareSo
 
 ---
 
-## Current HEAD (as of 2026-08-03)
+## Local publisher implementation (2026-08-09, working tree)
+
+The production path now includes:
+
+- packet rejection for bot/CAPTCHA/login/error responses regardless of length;
+- Scrapling → FlareSolverr (original URL) → agent-browser fallback with
+  validation after every retrieval;
+- Crossref title/DOI identity checks and hybrid content matching;
+- local llama.cpp structured draft and critic passes;
+- exact-source-quote, near-verbatim Natural Healing, study-design, render, and
+  Git-scope gates;
+- isolated content worktrees based on `origin/main` and optional draft PRs;
+- durable `publication_jobs` and `publication_job_events` queues with atomic
+  leases, retries, terminal outcomes, and deduplication; and
+- Scholar-sync and local-publisher systemd templates.
+
+The Natural Healing guide is unchanged and remains authoritative. The new
+timers are tracked but were not installed or enabled on iconium as of the
+observation date. The active dependencies were the Qwen3.6 35B A3B Q8_0
+llama.cpp service on port 8080, `research-flaresolverr` on port 8191, the
+triage UI on port 8765, and the enabled nightly database backup timer.
+
+See `docs/local-research-publisher.md` and the workspace-level
+`../docs/research-production-operations.md` before enabling automation.
+
+## Current committed baseline (as of 2026-08-03)
 
 | Commit | Summary |
 |--------|---------|
@@ -20,8 +45,9 @@ Read this before changing production paths, dotenv behavior, backups, or FlareSo
 | `4f2f721` | Rewrite publisher PDF gate URLs to HTML before scrape |
 | `9dd2fb4` | Add FlareSolverr Cloudflare fallback for web-scraper |
 
-Working tree on iconium should be **clean** and match `origin/main`.  
-Ser9 also keeps a checkout at `~/Research/research-tools` (not the production runtime).
+The commits below are the baseline beneath the 2026-08-09 implementation.
+Do not assume the working tree is clean while that implementation is under
+review. Ser9 is not the production runtime.
 
 ---
 
@@ -57,6 +83,9 @@ DB backups:
 | `research-db-backup.timer` / `.service` | Nightly SQLite backup to NAS |
 | `container-research-flaresolverr.service` | FlareSolverr container (see footnote) |
 | `hermes-gateway.service` | Iconium Hermes messaging gateway |
+| `qwen-moe-server-q8.service` | Active local llama.cpp OpenAI-compatible API |
+| `research-scholar-sync.timer` | Tracked template; not installed as observed 2026-08-09 |
+| `research-local-publisher.timer` | Tracked template; not installed as observed 2026-08-09 |
 
 Check: `systemctl --user status research-triage-ui research-db-backup.timer`
 

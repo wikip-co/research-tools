@@ -93,6 +93,22 @@ WORKFLOW_STATE_TIMESTAMP_COLUMNS = {
     "pr_open": "pr_opened_at",
     "merged": "merged_at",
 }
+PUBLICATION_JOB_STATES = (
+    "queued",
+    "leased",
+    "scraping",
+    "matching",
+    "drafting",
+    "validating",
+    "needs_review",
+    "publishing",
+    "pr_open",
+    "duplicate",
+    "rejected",
+    "retry",
+    "failed",
+)
+PUBLICATION_JOB_TERMINAL_STATES = {"pr_open", "duplicate", "rejected", "failed"}
 
 
 def utc_now_iso() -> str:
@@ -392,6 +408,68 @@ def build_parser() -> argparse.ArgumentParser:
         help="The article_url to mark as processed.",
     )
 
+    enqueue_parser = subparsers.add_parser(
+        "enqueue-publication",
+        help="Queue one stored article for the local publishing worker.",
+    )
+    enqueue_parser.add_argument("identifier", help="Article key or article URL.")
+    enqueue_parser.add_argument("--max-attempts", type=int, default=3)
+
+    enqueue_backlog_parser = subparsers.add_parser(
+        "enqueue-publication-backlog",
+        help="Queue the highest-scoring unprocessed Scholar backlog rows.",
+    )
+    enqueue_backlog_parser.add_argument("--status", default="selected", choices=["selected", "review"])
+    enqueue_backlog_parser.add_argument("--min-score", type=int, default=12)
+    enqueue_backlog_parser.add_argument("--limit", type=int, default=10)
+    enqueue_backlog_parser.add_argument("--max-attempts", type=int, default=3)
+
+    claim_parser = subparsers.add_parser(
+        "claim-publication",
+        help="Atomically lease the next eligible local publishing job.",
+    )
+    claim_parser.add_argument("--worker", required=True, help="Stable worker identifier.")
+    claim_parser.add_argument("--lease-seconds", type=int, default=3600)
+
+    jobs_parser = subparsers.add_parser(
+        "publication-jobs",
+        help="List local publishing jobs.",
+    )
+    jobs_parser.add_argument("--state", choices=["all", *PUBLICATION_JOB_STATES], default="all")
+    jobs_parser.add_argument("--limit", type=int, default=20)
+
+    update_job_parser = subparsers.add_parser(
+        "set-publication-job-state",
+        help="Record a local publishing job transition and its outputs.",
+    )
+    update_job_parser.add_argument("job_id", type=int)
+    update_job_parser.add_argument("--state", required=True, choices=PUBLICATION_JOB_STATES)
+    update_job_parser.add_argument("--worker", default="")
+    update_job_parser.add_argument("--paper-key", default="")
+    update_job_parser.add_argument("--packet-path", default="")
+    update_job_parser.add_argument("--target-path", default="")
+    update_job_parser.add_argument("--branch", default="")
+    update_job_parser.add_argument("--commit", default="")
+    update_job_parser.add_argument("--pr", default="")
+    update_job_parser.add_argument("--error", default="")
+    update_job_parser.add_argument("--result-json", default="")
+
+    backfill_parser = subparsers.add_parser(
+        "backfill-paper-keys",
+        help="Link historical article rows to canonical paper records.",
+    )
+    backfill_parser.add_argument(
+        "--status",
+        choices=["selected", "review", "rejected", "invalid", "all"],
+        default="selected",
+    )
+    backfill_parser.add_argument("--limit", type=int, default=1000)
+    backfill_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write links; without this flag the command is a dry run.",
+    )
+
     papers_parser = subparsers.add_parser(
         "papers",
         help="List canonical paper records and publishing state.",
@@ -575,6 +653,48 @@ def ensure_db(path: Path) -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS publication_jobs (
+            job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            article_key TEXT NOT NULL,
+            paper_key TEXT,
+            source_url TEXT NOT NULL,
+            alert_name TEXT,
+            state TEXT NOT NULL DEFAULT 'queued',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            packet_path TEXT,
+            target_path TEXT,
+            branch TEXT,
+            commit_sha TEXT,
+            pr_url TEXT,
+            result_json TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            FOREIGN KEY (article_key) REFERENCES articles(article_key),
+            FOREIGN KEY (paper_key) REFERENCES papers(paper_key)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS publication_job_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL,
+            from_state TEXT,
+            to_state TEXT NOT NULL,
+            detail_json TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (job_id) REFERENCES publication_jobs(job_id)
+        )
+        """
+    )
     # Migrations for existing databases
     for migration in (
         "ALTER TABLE articles ADD COLUMN paper_key TEXT",
@@ -614,6 +734,26 @@ def ensure_db(path: Path) -> sqlite3.Connection:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_papers_workflow_state ON papers(workflow_state)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_publication_jobs_state ON publication_jobs(state, lease_expires_at, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_publication_job_events_job ON publication_job_events(job_id, event_id)"
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_publication_jobs_active_article
+        ON publication_jobs(article_key)
+        WHERE state NOT IN ('pr_open', 'duplicate', 'rejected', 'failed')
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_publication_jobs_active_source
+        ON publication_jobs(source_url)
+        WHERE state NOT IN ('pr_open', 'duplicate', 'rejected', 'failed')
+        """
     )
     conn.commit()
     return conn
@@ -1764,6 +1904,377 @@ def search_recent(
     }
 
 
+def enqueue_publication_job(
+    *,
+    db_path: Path,
+    identifier: str,
+    max_attempts: int,
+) -> dict[str, Any]:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    conn = ensure_db(db_path)
+    row = conn.execute(
+        """
+        SELECT article_key, paper_key, article_url, scholar_url, alert_name, title
+        FROM articles
+        WHERE article_key = ? OR article_url = ? OR scholar_url = ?
+        ORDER BY CASE WHEN article_key = ? THEN 0 ELSE 1 END
+        LIMIT 1
+        """,
+        (identifier, identifier, identifier, identifier),
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise ValueError(f"Article not found: {identifier}")
+    source_url = (row["article_url"] or row["scholar_url"] or "").strip()
+    if not source_url:
+        conn.close()
+        raise ValueError("Article has no source URL")
+    now = utc_now_iso()
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO publication_jobs (
+                article_key, paper_key, source_url, alert_name, state,
+                max_attempts, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
+            """,
+            (
+                row["article_key"],
+                row["paper_key"],
+                source_url,
+                row["alert_name"],
+                max_attempts,
+                now,
+                now,
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        active = conn.execute(
+            """
+            SELECT * FROM publication_jobs
+            WHERE (article_key = ? OR source_url = ?)
+              AND state NOT IN ('pr_open', 'duplicate', 'rejected', 'failed')
+            ORDER BY job_id DESC LIMIT 1
+            """,
+            (row["article_key"], source_url),
+        ).fetchone()
+        conn.close()
+        if active:
+            return {"created": False, "job": dict(active)}
+        raise exc
+    job_id = int(cursor.lastrowid)
+    conn.execute(
+        """
+        INSERT INTO publication_job_events (job_id, from_state, to_state, detail_json, created_at)
+        VALUES (?, NULL, 'queued', ?, ?)
+        """,
+        (job_id, json.dumps({"title": row["title"]}), now),
+    )
+    conn.commit()
+    job = conn.execute("SELECT * FROM publication_jobs WHERE job_id = ?", (job_id,)).fetchone()
+    conn.close()
+    return {"created": True, "job": dict(job)}
+
+
+def enqueue_publication_backlog(
+    *,
+    db_path: Path,
+    status: str,
+    min_score: int,
+    limit: int,
+    max_attempts: int,
+) -> dict[str, Any]:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    conn = ensure_db(db_path)
+    rows = conn.execute(
+        """
+        SELECT a.article_key, a.paper_key, a.article_url, a.scholar_url,
+               a.alert_name, a.title, a.score
+        FROM articles a
+        LEFT JOIN papers p ON p.paper_key = a.paper_key
+        WHERE a.status = ?
+          AND a.score >= ?
+          AND a.processed_at IS NULL
+          AND COALESCE(p.workflow_state, 'discovered') NOT IN
+              ('drafted', 'committed', 'pr_open', 'merged')
+          AND NOT EXISTS (
+              SELECT 1 FROM publication_jobs j
+              WHERE j.article_key = a.article_key
+                 OR j.source_url = a.article_url
+                 OR j.source_url = a.scholar_url
+          )
+        ORDER BY a.score DESC, a.created_at, a.article_key
+        LIMIT ?
+        """,
+        (status, min_score, max(limit, 0) * 5),
+    ).fetchall()
+    now = utc_now_iso()
+    queued: list[dict[str, Any]] = []
+    seen_source_urls: set[str] = set()
+    skipped = 0
+    for row in rows:
+        if len(queued) >= max(limit, 0):
+            break
+        source_url = (row["article_url"] or row["scholar_url"] or "").strip()
+        if not source_url:
+            skipped += 1
+            continue
+        canonical_source = canonicalize_url(source_url)
+        if canonical_source in seen_source_urls:
+            continue
+        seen_source_urls.add(canonical_source)
+        cursor = conn.execute(
+            """
+            INSERT INTO publication_jobs (
+                article_key, paper_key, source_url, alert_name, state,
+                max_attempts, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
+            """,
+            (
+                row["article_key"], row["paper_key"], source_url,
+                row["alert_name"], max_attempts, now, now,
+            ),
+        )
+        job_id = int(cursor.lastrowid)
+        conn.execute(
+            """
+            INSERT INTO publication_job_events
+                (job_id, from_state, to_state, detail_json, created_at)
+            VALUES (?, NULL, 'queued', ?, ?)
+            """,
+            (job_id, json.dumps({"source": "backlog", "score": row["score"]}), now),
+        )
+        queued.append({"job_id": job_id, "article_key": row["article_key"], "title": row["title"], "score": row["score"]})
+    conn.commit()
+    conn.close()
+    return {"queued_count": len(queued), "skipped_without_url": skipped, "jobs": queued}
+
+
+def claim_publication_job(
+    *,
+    db_path: Path,
+    worker: str,
+    lease_seconds: int,
+) -> dict[str, Any]:
+    if not worker.strip():
+        raise ValueError("worker must not be empty")
+    if lease_seconds < 60:
+        raise ValueError("lease_seconds must be at least 60")
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+    expires = (now_dt + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    conn = ensure_db(db_path)
+    conn.execute("BEGIN IMMEDIATE")
+    row = conn.execute(
+        """
+        SELECT * FROM publication_jobs
+        WHERE attempt_count < max_attempts
+          AND (
+            state IN ('queued', 'retry')
+            OR (
+              state NOT IN ('pr_open', 'duplicate', 'rejected', 'failed', 'needs_review')
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at <= ?
+            )
+          )
+        ORDER BY created_at, job_id
+        LIMIT 1
+        """,
+        (now,),
+    ).fetchone()
+    if not row:
+        conn.commit()
+        conn.close()
+        return {"claimed": False, "job": None}
+    conn.execute(
+        """
+        UPDATE publication_jobs
+        SET state = 'leased', attempt_count = attempt_count + 1,
+            lease_owner = ?, lease_expires_at = ?, updated_at = ?,
+            started_at = COALESCE(started_at, ?), error = NULL
+        WHERE job_id = ?
+        """,
+        (worker, expires, now, now, row["job_id"]),
+    )
+    conn.execute(
+        """
+        INSERT INTO publication_job_events (job_id, from_state, to_state, detail_json, created_at)
+        VALUES (?, ?, 'leased', ?, ?)
+        """,
+        (row["job_id"], row["state"], json.dumps({"worker": worker, "lease_expires_at": expires}), now),
+    )
+    conn.commit()
+    claimed = conn.execute("SELECT * FROM publication_jobs WHERE job_id = ?", (row["job_id"],)).fetchone()
+    conn.close()
+    return {"claimed": True, "job": dict(claimed)}
+
+
+def set_publication_job_state(
+    *,
+    db_path: Path,
+    job_id: int,
+    state: str,
+    worker: str = "",
+    **updates: str,
+) -> dict[str, Any]:
+    if state not in PUBLICATION_JOB_STATES:
+        raise ValueError(f"Invalid publication job state: {state}")
+    conn = ensure_db(db_path)
+    row = conn.execute("SELECT * FROM publication_jobs WHERE job_id = ?", (job_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise ValueError(f"Publication job not found: {job_id}")
+    if worker and row["lease_owner"] and worker != row["lease_owner"]:
+        conn.close()
+        raise ValueError(f"Publication job {job_id} is leased by another worker")
+
+    now = utc_now_iso()
+    column_map = {
+        "paper_key": "paper_key",
+        "packet_path": "packet_path",
+        "target_path": "target_path",
+        "branch": "branch",
+        "commit": "commit_sha",
+        "pr": "pr_url",
+        "error": "error",
+        "result_json": "result_json",
+    }
+    assignments = ["state = ?", "updated_at = ?"]
+    params: list[Any] = [state, now]
+    detail: dict[str, Any] = {"worker": worker} if worker else {}
+    for key, column in column_map.items():
+        value = updates.get(key, "")
+        if not value:
+            continue
+        if key == "result_json":
+            json.loads(value)
+        assignments.append(f"{column} = ?")
+        params.append(value)
+        detail[key] = value
+    if state in PUBLICATION_JOB_TERMINAL_STATES:
+        assignments.extend(["finished_at = ?", "lease_owner = NULL", "lease_expires_at = NULL"])
+        params.append(now)
+    elif state in {"retry", "needs_review"}:
+        assignments.extend(["lease_owner = NULL", "lease_expires_at = NULL"])
+    params.append(job_id)
+    conn.execute(
+        f"UPDATE publication_jobs SET {', '.join(assignments)} WHERE job_id = ?",
+        params,
+    )
+    conn.execute(
+        """
+        INSERT INTO publication_job_events (job_id, from_state, to_state, detail_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (job_id, row["state"], state, json.dumps(detail), now),
+    )
+    if state in {"pr_open", "duplicate", "rejected"}:
+        conn.execute(
+            """
+            UPDATE articles SET processed_at = COALESCE(processed_at, ?), updated_at = ?
+            WHERE article_key = ?
+            """,
+            (now, now, row["article_key"]),
+        )
+    conn.commit()
+    updated = conn.execute("SELECT * FROM publication_jobs WHERE job_id = ?", (job_id,)).fetchone()
+    conn.close()
+    return {"job": dict(updated)}
+
+
+def list_publication_jobs(*, db_path: Path, state: str, limit: int) -> dict[str, Any]:
+    conn = ensure_db(db_path)
+    where = "" if state == "all" else "WHERE j.state = ?"
+    params: tuple[Any, ...] = () if state == "all" else (state,)
+    rows = conn.execute(
+        f"""
+        SELECT j.*, a.title, a.score, a.status AS article_status
+        FROM publication_jobs j
+        JOIN articles a ON a.article_key = j.article_key
+        {where}
+        ORDER BY j.job_id DESC
+        LIMIT ?
+        """,
+        (*params, max(limit, 0)),
+    ).fetchall()
+    conn.close()
+    return {"state": state, "jobs": [dict(row) for row in rows]}
+
+
+def backfill_paper_keys(
+    *,
+    db_path: Path,
+    status: str,
+    limit: int,
+    apply: bool,
+) -> dict[str, Any]:
+    conn = ensure_db(db_path)
+    where = "paper_key IS NULL"
+    params: list[Any] = []
+    if status != "all":
+        where += " AND status = ?"
+        params.append(status)
+    rows = conn.execute(
+        f"""
+        SELECT article_key, title, article_url, scholar_url, status
+        FROM articles
+        WHERE {where}
+        ORDER BY score DESC, created_at, article_key
+        LIMIT ?
+        """,
+        (*params, max(limit, 0)),
+    ).fetchall()
+    preview: list[dict[str, str]] = []
+    linked = 0
+    skipped = 0
+    for row in rows:
+        source_url = (row["article_url"] or row["scholar_url"] or "").strip()
+        if not source_url:
+            skipped += 1
+            continue
+        key, canonical_url, _doi, _pmid = paper_identity(
+            title=row["title"],
+            article_url=source_url,
+        )
+        if len(preview) < 20:
+            preview.append(
+                {
+                    "article_key": row["article_key"],
+                    "paper_key": key,
+                    "canonical_url": canonical_url,
+                    "title": row["title"],
+                }
+            )
+        if apply:
+            paper = upsert_paper_record(
+                conn,
+                title=row["title"],
+                article_url=source_url,
+            )
+            conn.execute(
+                "UPDATE articles SET paper_key = ?, updated_at = ? WHERE article_key = ?",
+                (paper["paper_key"], utc_now_iso(), row["article_key"]),
+            )
+        linked += 1
+    if apply:
+        conn.commit()
+    remaining = conn.execute(
+        f"SELECT COUNT(*) AS count FROM articles WHERE {where}", params
+    ).fetchone()["count"]
+    conn.close()
+    return {
+        "applied": apply,
+        "status": status,
+        "examined": len(rows),
+        "linkable": linked,
+        "skipped_without_url": skipped,
+        "remaining_after_apply" if apply else "remaining": remaining,
+        "preview": preview,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1873,6 +2384,54 @@ def main(argv: list[str] | None = None) -> int:
             result = mark_article_processed(
                 db_path=db_path,
                 article_url=args.article_url,
+            )
+        elif args.command == "enqueue-publication":
+            result = enqueue_publication_job(
+                db_path=db_path,
+                identifier=args.identifier,
+                max_attempts=args.max_attempts,
+            )
+        elif args.command == "enqueue-publication-backlog":
+            result = enqueue_publication_backlog(
+                db_path=db_path,
+                status=args.status,
+                min_score=args.min_score,
+                limit=args.limit,
+                max_attempts=args.max_attempts,
+            )
+        elif args.command == "claim-publication":
+            result = claim_publication_job(
+                db_path=db_path,
+                worker=args.worker,
+                lease_seconds=args.lease_seconds,
+            )
+        elif args.command == "publication-jobs":
+            result = list_publication_jobs(
+                db_path=db_path,
+                state=args.state,
+                limit=args.limit,
+            )
+        elif args.command == "set-publication-job-state":
+            result = set_publication_job_state(
+                db_path=db_path,
+                job_id=args.job_id,
+                state=args.state,
+                worker=args.worker,
+                paper_key=args.paper_key,
+                packet_path=args.packet_path,
+                target_path=args.target_path,
+                branch=args.branch,
+                commit=args.commit,
+                pr=args.pr,
+                error=args.error,
+                result_json=args.result_json,
+            )
+        elif args.command == "backfill-paper-keys":
+            result = backfill_paper_keys(
+                db_path=db_path,
+                status=args.status,
+                limit=args.limit,
+                apply=args.apply,
             )
         else:
             parser.error(f"Unsupported command: {args.command}")

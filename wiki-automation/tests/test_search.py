@@ -1,6 +1,6 @@
 import unittest
 
-from wiki_automation.cli import ArticleRecord, search_articles
+from wiki_automation.cli import ArticleRecord, research_match_candidates, search_articles
 
 
 class SearchArticlesTests(unittest.TestCase):
@@ -63,6 +63,33 @@ class SearchArticlesTests(unittest.TestCase):
 
         self.assertEqual([match["title"] for match in title_matches], ["Hypertension"])
         self.assertEqual([match["title"] for match in tag_matches], ["Resveratrol"])
+
+    def test_research_match_prefers_source_entity_over_paper_title_shape(self) -> None:
+        articles = [
+            ArticleRecord(
+                path="Natural Healing/Chemicals/quercetin.md",
+                title="Quercetin",
+                stem="quercetin",
+                tags=["Antioxidant", "Inflammation"],
+                permalink=None,
+                body="Quercetin is a plant flavonol.",
+            ),
+            ArticleRecord(
+                path="Technology/continuous-delivery.md",
+                title="Continuous Delivery",
+                stem="continuous-delivery",
+                tags=["Software"],
+                permalink=None,
+                body="Signals and modulators in delivery systems.",
+            ),
+        ]
+        matches = research_match_candidates(
+            articles,
+            title="From antioxidant to signal modulator: the expanding role of quercetin",
+            abstract="Quercetin has antioxidant and anti-inflammatory effects.",
+            alert_name="Quercetin",
+        )
+        self.assertEqual(matches[0]["path"], "Natural Healing/Chemicals/quercetin.md")
 
 
 if __name__ == "__main__":

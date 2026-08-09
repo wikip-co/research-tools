@@ -14,6 +14,7 @@ It does several things:
 - audit tags and lint markdown frontmatter
 - open a PR from the mounted content repo with `gh`
 - publish a PR end-to-end by creating a branch, committing article changes, pushing, and opening the PR
+- run the production local llama.cpp publisher for ad-hoc URLs or durable SQLite jobs, with structured draft/critic passes and deterministic quality gates
 
 ## Setup
 
@@ -159,3 +160,20 @@ Other common manual commands:
 ```
 
 If you want scheduling later, use this launcher rather than scheduling a raw LLM prompt.
+
+## Local llama.cpp publisher
+
+Dry-run an ad-hoc source, enqueue selected backlog rows, or process one leased
+job:
+
+```bash
+./agent-workflow local-publish "https://example.org/article"
+./agent-workflow enqueue-local-backlog --status selected --min-score 12 --limit 10
+./agent-workflow local-worker --max-jobs 1
+```
+
+Add `--publish` only after reviewing dry-run reports and patches. Publication
+uses an isolated worktree based on `origin/main` and opens a draft PR only when
+packet, duplicate, match, evidence, critic, render, and Git-scope gates all
+pass. It does not auto-merge or autonomously create a new article. See
+[`../docs/local-research-publisher.md`](../docs/local-research-publisher.md).

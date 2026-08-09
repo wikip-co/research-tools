@@ -118,7 +118,47 @@ WEAK_CONTENT_PATTERNS = {
     "access_denied": _re.compile(r"access\s+denied|request\s+blocked|forbidden", _re.IGNORECASE),
 }
 
+# These signals invalidate a retrieval regardless of how much HTML/markdown was
+# extracted. Bot interstitials frequently embed large application bundles, so a
+# character-count quality check alone can make a captcha page look richer than
+# a real abstract page.
+FATAL_CONTENT_PATTERNS = {
+    "captcha_page": _re.compile(
+        r"captcha\s+challenge|please\s+confirm\s+you\s+are\s+a\s+human",
+        _re.IGNORECASE,
+    ),
+    "robot_page": _re.compile(
+        r"(?:^|\n)\s*(?:are\s+you\s+a\s+robot\??|verify\s+you\s+are\s+human)\s*(?:$|\n)",
+        _re.IGNORECASE,
+    ),
+    "challenge_page": _re.compile(
+        r"checking\s+your\s+browser|enable\s+javascript\s+and\s+cookies\s+to\s+continue",
+        _re.IGNORECASE,
+    ),
+    "publisher_error_page": _re.compile(
+        r"there\s+was\s+a\s+problem\s+providing\s+the\s+content\s+you\s+requested",
+        _re.IGNORECASE,
+    ),
+}
+FATAL_TITLE_PATTERNS = (
+    _re.compile(r"^are\s+you\s+a\s+robot\??$", _re.IGNORECASE),
+    _re.compile(r"^access\s+denied$", _re.IGNORECASE),
+    _re.compile(r"^just\s+a\s+moment\.?$", _re.IGNORECASE),
+    _re.compile(r"^new\s+tab$", _re.IGNORECASE),
+    _re.compile(
+        r"^there\s+was\s+a\s+problem\s+providing\s+the\s+content\s+you\s+requested$",
+        _re.IGNORECASE,
+    ),
+)
+FATAL_RETRIEVAL_ISSUES = frozenset(
+    {"invalid_title", "doi_title_mismatch", *FATAL_CONTENT_PATTERNS.keys()}
+)
+
 DOI_PATTERN = _re.compile(r"\b10\.\d{4,9}/[-._;()/:a-z0-9]+\b", _re.IGNORECASE)
+PMID_URL_PATTERN = _re.compile(
+    r"(?:pubmed\.ncbi\.nlm\.nih\.gov|ncbi\.nlm\.nih\.gov/pubmed)/(\d+)",
+    _re.IGNORECASE,
+)
 PDF_ABSTRACT_PATTERN = _re.compile(
     r"\babstract\b[\s:.-]*(.+?)(?=\b(?:keywords?|introduction|background|methods?|materials|results?|discussion|conclusion|references)\b)",
     _re.IGNORECASE | _re.DOTALL,
@@ -733,6 +773,11 @@ def extract_first_doi(*values: str) -> str:
     return ""
 
 
+def extract_pmid(value: str) -> str:
+    match = PMID_URL_PATTERN.search(value or "")
+    return match.group(1) if match else ""
+
+
 def first_nonempty_line(text: str, fallback: str) -> str:
     for line in text.splitlines():
         cleaned = normalize_whitespace(line)
@@ -839,7 +884,13 @@ def fetch_crossref_metadata(doi: str, title: str) -> dict[str, Any]:
     if doi:
         payload = fetch_json(f"https://api.crossref.org/works/{quote(doi, safe='')}")
         message = payload.get("message", {})
-        return crossref_summary(message)
+        summary = crossref_summary(message)
+        returned_doi = normalize_whitespace(summary.get("doi", "")).lower()
+        if returned_doi and returned_doi != normalize_whitespace(doi).lower():
+            raise RuntimeError(
+                f"Crossref DOI mismatch: requested {doi}, received {returned_doi}"
+            )
+        return summary
 
     if not title:
         return {}
@@ -851,7 +902,9 @@ def fetch_crossref_metadata(doi: str, title: str) -> dict[str, Any]:
     items = payload.get("message", {}).get("items", [])
     for item in items:
         summary = crossref_summary(item)
-        if title_match_score(title, summary.get("title", "")) >= 0.75:
+        # Title-only enrichment must be conservative. A weak match can attach a
+        # real but unrelated DOI to a publisher error page.
+        if title_match_score(title, summary.get("title", "")) >= 0.90:
             return summary
     return {}
 
@@ -935,6 +988,15 @@ def enrich_metadata(data: dict[str, Any]) -> dict[str, Any]:
     if crossref_data:
         external_metadata["crossref"] = crossref_data
         enrichment_sources.append("crossref")
+        source_title = normalize_whitespace(str(data.get("title", "")))
+        crossref_title = normalize_whitespace(str(crossref_data.get("title", "")))
+        if data.get("doi") and source_title and crossref_title:
+            consistency_score = title_match_score(source_title, crossref_title)
+            data["doi_title_match_score"] = round(consistency_score, 4)
+            if consistency_score < 0.75:
+                data.setdefault("metadata_consistency_issues", []).append(
+                    "doi_title_mismatch"
+                )
 
     pubmed_data: dict[str, Any] = {}
     try:
@@ -966,17 +1028,46 @@ def enrich_metadata(data: dict[str, Any]) -> dict[str, Any]:
         if value and not normalize_whitespace(str(data.get(key, ""))):
             data[key] = value
 
+    def replace_if_polluted(key: str, value: str) -> None:
+        if not value:
+            return
+        current = normalize_whitespace(str(data.get(key, "")))
+        lowered = current.lower()
+        polluted = (
+            len(current) > 1200
+            or "highlights •" in lowered
+            or "abstract quercetin" in lowered
+            or "author links open overlay" in lowered
+        )
+        if polluted:
+            data[key] = value
+
+    def replace_truncated_abstract(value: str) -> None:
+        if not value:
+            return
+        current = normalize_whitespace(str(data.get("abstract", "")))
+        truncated = current.endswith(("…", "...")) or (
+            len(current) < MIN_ABSTRACT_CHARS and len(value) > len(current)
+        )
+        if truncated:
+            data["abstract"] = value
+
     fill_if_missing("doi", crossref_data.get("doi", ""))
     fill_if_missing("doi", pubmed_data.get("doi", ""))
     fill_if_missing("title", crossref_data.get("title", ""))
     fill_if_missing("title", pubmed_data.get("title", ""))
     fill_if_missing("authors", crossref_data.get("authors", ""))
     fill_if_missing("authors", pubmed_data.get("authors", ""))
+    replace_if_polluted(
+        "authors",
+        crossref_data.get("authors", "") or pubmed_data.get("authors", ""),
+    )
     fill_if_missing("journal", crossref_data.get("journal", ""))
     fill_if_missing("journal", pubmed_data.get("journal", ""))
     fill_if_missing("pub_date", crossref_data.get("pub_date", ""))
     fill_if_missing("pub_date", pubmed_data.get("pub_date", ""))
     fill_if_missing("abstract", crossref_data.get("abstract", ""))
+    replace_truncated_abstract(crossref_data.get("abstract", ""))
 
     data["pmid"] = normalize_whitespace(
         str(data.get("pmid", "")) or pubmed_data.get("pmid", "")
@@ -995,6 +1086,31 @@ def enrich_metadata(data: dict[str, Any]) -> dict[str, Any]:
     if enrichment_errors:
         data["enrichment_errors"] = enrichment_errors
     return data
+
+
+def fatal_extraction_issues(data: dict[str, Any]) -> list[str]:
+    title = normalize_whitespace(str(data.get("title", "")))
+    abstract = normalize_whitespace(str(data.get("abstract", "")))
+    body = normalize_whitespace(str(data.get("body_markdown", "")))
+    combined = f"{title}\n{abstract}\n{body}"
+    issues: list[str] = []
+
+    issues.extend(
+        issue
+        for issue in data.get("metadata_consistency_issues", [])
+        if issue in FATAL_RETRIEVAL_ISSUES
+    )
+
+    if any(pattern.search(title) for pattern in FATAL_TITLE_PATTERNS):
+        issues.append("invalid_title")
+    for issue_name, pattern in FATAL_CONTENT_PATTERNS.items():
+        if pattern.search(combined):
+            issues.append(issue_name)
+    return unique_nonempty(issues)
+
+
+def has_fatal_extraction_issue(data: dict[str, Any]) -> bool:
+    return bool(FATAL_RETRIEVAL_ISSUES.intersection(extraction_issues(data)))
 
 
 def scrape_pdf_source(source: str) -> dict[str, Any]:
@@ -1164,14 +1280,22 @@ def extract_article_data(url: str, raw_html: str, retrieval_backend: str) -> dic
         "source_kind": "html",
         "scraped_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
     }
-    enrich_metadata(data)
+    pre_enrichment_issues = fatal_extraction_issues(data)
+    if pre_enrichment_issues:
+        # Do not query Crossref by an interstitial/error title. Some generic bot
+        # titles are also titles of real publications, which can otherwise
+        # attach a credible but unrelated DOI to the bad packet.
+        data["enrichment_skipped"] = "fatal_retrieval_issue"
+        data["retrieval_issues"] = pre_enrichment_issues
+    else:
+        enrich_metadata(data)
     data["reference_url"] = citation_url(data)
     data["footnote_markdown"] = footnote_markdown(data)
     return data
 
 
 def extraction_issues(data: dict[str, Any]) -> list[str]:
-    issues: list[str] = []
+    issues: list[str] = fatal_extraction_issues(data)
     title = normalize_whitespace(str(data.get("title", "")))
     abstract = normalize_whitespace(str(data.get("abstract", "")))
     body = normalize_whitespace(str(data.get("body_markdown", "")))
@@ -1207,7 +1331,10 @@ def extraction_score(data: dict[str, Any]) -> int:
     for key in ("doi", "journal", "authors", "pub_date"):
         if normalize_whitespace(str(data.get(key, ""))):
             score += 50
-    score -= len(extraction_issues(data)) * 250
+    issues = extraction_issues(data)
+    score -= len(issues) * 250
+    if FATAL_RETRIEVAL_ISSUES.intersection(issues):
+        score -= 10000
     return score
 
 
@@ -1394,6 +1521,13 @@ def scrape_article(
     if best is not None:
         if errors:
             best.setdefault("retrieval_errors", errors)
+        if has_fatal_extraction_issue(best):
+            issues = ", ".join(extraction_issues(best))
+            detail = "; ".join(errors)
+            raise RuntimeError(
+                f"All retrieval paths produced an invalid publisher/interstitial packet ({issues})"
+                + (f": {detail}" if detail else "")
+            )
         return _annotate(best)
 
     if primary_error is not None:

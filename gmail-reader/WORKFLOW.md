@@ -6,11 +6,13 @@ This workflow turns Google Scholar alert emails into a practical research intake
 
 The resulting SQLite database should be treated as a broad intake layer. It is not a fully curated or quality-verified library of sources.
 
-It supports two modes:
+It supports four complementary modes:
 
 - **Backfill / queue building**: ingest many Scholar alert emails into SQLite so the project has a persistent backlog of candidate sources.
 - **On-demand curation**: search a narrow recent window, let the agent inspect the parsed candidates, and return a small list of promising URLs for immediate downstream work.
 - **On-demand mailbox search**: run a richer Gmail query against recent Scholar emails so the agent can satisfy specific requests from the inbox without depending only on the backlog.
+- **Ad-hoc local publication**: pass a chosen URL directly through the guarded local llama.cpp publisher.
+- **Passive local publication**: enqueue selected, unprocessed database rows and let a lease-based worker process one at a time.
 
 ## High-Level Flow
 
@@ -30,9 +32,12 @@ It supports two modes:
      - "Give me three good URLs from today: one health/nutrition and two DevOps"
    - Pick the best URLs instead of relying only on static score thresholds
 
-3. **Web Scraper**
+3. **Web Scraper and packet gate**
    - Pass the chosen URLs into the web scraping tool
-   - Convert the source page into markdown suitable for repo updates
+   - Produce a normalized packet rather than trusting raw HTML
+   - Reject CAPTCHA, robot, login, rate-limit, and error pages regardless of body length
+   - Use Scrapling, then FlareSolverr with the original URL, then agent-browser
+   - Verify scraped title and DOI enrichment describe the same paper
 
 4. **Image Upload**
    - Only needed when the pipeline creates a brand-new wiki article
@@ -42,13 +47,19 @@ It supports two modes:
    - If the uploaded public ID matches the article slug or title-derived name, that is enough
    - If not, set the markdown frontmatter image field explicitly, for example `image: goatberry`
 
-5. **Wiki Update**
+5. **Local model and quality gates**
+   - Ask llama.cpp for a structured append plan and then a critic pass
+   - Require exact source quotations and near-verbatim Natural Healing bullets
+   - Preserve study design, species, limitations, and claim strength
+   - Fail closed on uncertain article placement
+
+6. **Wiki Update**
    - Update an existing markdown article or create a new one
    - Add citations from the scraped source material
    - Keep references aligned with the source article
    - If the article is new, include the uploaded thumbnail metadata
 
-6. **Archive Step**
+7. **Archive Step**
    - Store downloaded PDFs or source snapshots for long-term provenance
    - Archive data now lives alongside canonical paper records so the agent can prove what source was used later
 
@@ -102,16 +113,18 @@ uv run gmail-reader search --gmail-query 'label:inbox newer_than:1d' --topic 'de
 uv run gmail-reader search --gmail-query 'label:inbox newer_than:1d' --include-review --save --max-results 20
 ```
 
-## Cron-Oriented Agent Loop
+## Passive Queue Loop
 
 1. Run a small recent sync to keep the backlog warm.
-2. Run one or more `search` commands for the day's content themes.
-3. Let the agent select one or two high-quality URLs from the returned candidates.
-4. Scrape those URLs into markdown.
-5. Match the scraped research against existing wiki articles.
-6. Update existing articles when there is overlap.
-7. Create a new article when the topic does not already exist.
-8. If a new article is created, attach a simple thumbnail and set frontmatter `image`.
+2. Curate candidates to `selected` in the UI or CLI.
+3. Enqueue a bounded score-ordered slice with `enqueue-local-backlog`.
+4. Let `local-worker` atomically lease one job.
+5. Scrape, validate, deduplicate, match, draft, critique, and validate the patch.
+6. In dry-run mode, inspect the report and patch; in publication mode, open a draft PR.
+7. Record every state transition in `publication_job_events` and require human review before merge.
+
+The tracked Scholar and publisher timer units implement this loop, but they are
+not installed or enabled by default. See `../docs/local-research-publisher.md`.
 
 ## Why Both Modes Exist
 

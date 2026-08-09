@@ -10,6 +10,7 @@ Small CLI tool for agent-friendly ingestion of Google Scholar alert emails from 
 - Stores message history and article candidates in SQLite for later processing
 - Maintains canonical `papers` records so publish/archive state can survive repeated Scholar alerts
 - Tracks each paper through a workflow lifecycle from discovery to merged PR
+- Maintains `publication_jobs` and `publication_job_events` for atomic local-publisher leases, retries, outcomes, and audit history
 
 ## Important Framing
 
@@ -170,6 +171,10 @@ Supported command patterns:
 - Advance a paper: `gmail-reader set-paper-state <identifier> --state discovered|scraped|matched|drafted|committed|pr_open|merged [--matched-content-path PATH] [--commit SHA] [--pr URL] [--archive-path PATH] [--db PATH]`
 - Mark a paper as published/matched: `gmail-reader mark-published <identifier> --matched-content-path PATH [--commit SHA] [--pr URL] [--db PATH]`
 - Attach an archive path: `gmail-reader attach-archive <identifier> --archive-path PATH [--db PATH]`
+- Enqueue a local publication: `gmail-reader enqueue-publication <article-key-or-url> [--max-attempts N] [--db PATH]`
+- Enqueue a bounded backlog: `gmail-reader enqueue-publication-backlog [--status selected|review] [--min-score N] [--limit N] [--db PATH]`
+- List local publication jobs: `gmail-reader publication-jobs [--state STATE] [--limit N] [--db PATH]`
+- Backfill canonical paper keys: `gmail-reader backfill-paper-keys [--status STATUS] [--limit N] [--apply] [--db PATH]`
 
 Response contract:
 
@@ -194,16 +199,22 @@ Operational notes for agents:
 
 ## SQLite Schema Summary
 
-The database contains three main intake tables:
+The database contains the following primary groups:
 
 - `messages`: one row per ingested Gmail message
 - `articles`: one row per parsed Scholar result with triage fields and source links
 - `papers`: one row per canonical paper identity with publish/archive state
+- `article_papers`: links alert occurrences to canonical papers
 
 The web UI adds two operational tables when first started:
 
 - `article_jobs`: one row per background Codex processing job
 - `article_job_items`: selected article rows attached to each job
+
+The local llama.cpp publisher adds two durable queue tables:
+
+- `publication_jobs`: source identity, state, lease owner/expiry, attempts, next run, report, patch, and PR outcome
+- `publication_job_events`: append-only transition and error history
 
 Useful article columns:
 
@@ -231,7 +242,6 @@ Recommended approach:
 
 - Keep the working database local for speed
 - Back it up to your NAS on a schedule
-- Or point `--db` directly at a synced/backed-up path if the NAS mount is reliable and low-latency
 
 Examples:
 
@@ -239,11 +249,8 @@ Examples:
 uv run gmail-reader sync --db "$HOME/research/scholar-alerts.db" --days-back 7
 ```
 
-```bash
-uv run gmail-reader sync --db "/mnt/nas/research/scholar-alerts.db" --days-back 7
-```
-
-For most setups, local primary DB plus NAS backup is safer than using the NAS file as the live primary database.
+For this production path, keep the primary local and use scheduled online
+backups. Do not point active writers at a network-mounted SQLite file.
 
 ## Web Triage UI
 
@@ -255,7 +262,7 @@ uv run gmail-reader-web --host 0.0.0.0 --port 8765
 
 The UI is intended for a trusted LAN and does not include authentication. It can mark rows as `selected`, `review`, `rejected`, or `invalid`, and it can start a background Codex job for selected rows.
 
-When Codex exits successfully, selected rows are marked processed by setting `articles.processed_at`. Rows are not deleted.
+Selected rows are marked processed only when the Codex job exits successfully **and reports a draft PR URL**. Rows are not deleted.
 
 ## Backup Script
 
@@ -272,7 +279,7 @@ cd gmail-reader
 bash ./backup-db.sh
 ```
 
-By default it copies:
+By default it backs up:
 
 - source DB: `./data/scholar-alerts.db`
 - backup folder: `/mnt/naspi5/content-agent-backups/gmail-reader`
@@ -281,6 +288,10 @@ It writes two files:
 
 - a timestamped snapshot such as `scholar-alerts-20260309-170000.db`
 - `scholar-alerts-latest.db`
+
+The script prefers SQLite's online backup API while readers/writers are active,
+publishes through a temporary file, checks integrity, reports row counts, and
+retains a bounded set of dated snapshots.
 
 You can also override both paths:
 

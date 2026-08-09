@@ -158,6 +158,10 @@ Usage:
   agent-workflow search "<query>" [wiki-automation search args...]
   agent-workflow prepare "<url>" [wiki-automation prepare args...]
   agent-workflow intake "<url-or-pdf>" [wiki-automation intake args...]
+  agent-workflow local-publish "<url-or-pdf>" [--publish] [local model args...]
+  agent-workflow enqueue-local "<article-key-or-url>"
+  agent-workflow enqueue-local-backlog [--min-score N] [--limit N]
+  agent-workflow local-worker [--max-jobs N] [--publish]
   agent-workflow ingest-paper "<source>" [wiki-automation ingest-paper args...]
   agent-workflow append "<url>" --target "<path>" [wiki-automation append args...]
   agent-workflow tags [--suggest "<query>"] [--limit N]
@@ -263,6 +267,32 @@ run_intake() {
   fi
 
   run_wiki_command intake "$@"
+}
+
+run_local_publish() {
+  if (($# < 1)); then
+    printf 'local-publish requires a source path or URL\n' >&2
+    exit 1
+  fi
+
+  run_wiki_command local-publish "$@"
+}
+
+run_enqueue_local() {
+  if (($# < 1)); then
+    printf 'enqueue-local requires an article key or URL\n' >&2
+    exit 1
+  fi
+
+  run_wiki_command enqueue-local "$@"
+}
+
+run_enqueue_local_backlog() {
+  run_wiki_command enqueue-local-backlog "$@"
+}
+
+run_local_worker() {
+  run_wiki_command local-worker "$@"
 }
 
 run_ingest_paper() {
@@ -575,6 +605,18 @@ main() {
       ;;
     intake)
       run_intake "$@"
+      ;;
+    local-publish)
+      run_local_publish "$@"
+      ;;
+    enqueue-local)
+      run_enqueue_local "$@"
+      ;;
+    enqueue-local-backlog)
+      run_enqueue_local_backlog "$@"
+      ;;
+    local-worker)
+      run_local_worker "$@"
       ;;
     ingest-paper)
       run_ingest_paper "$@"

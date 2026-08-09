@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically process the local research publishing queue
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

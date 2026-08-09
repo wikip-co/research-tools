@@ -9,9 +9,11 @@ import shutil
 import subprocess
 import sys
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from math import log
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -27,6 +29,15 @@ SEARCH_FIELD_WEIGHTS = {
     "permalink": 20.0,
     "path": 15.0,
     "body": 15.0,
+}
+RESEARCH_MATCH_STOPWORDS = {
+    "about", "after", "among", "analysis", "article", "based", "benefit",
+    "benefits", "clinical", "disease", "effect", "effects", "evidence",
+    "expanding", "findings", "health", "human", "mechanism", "mechanisms",
+    "meta", "model", "models", "potential", "research", "review", "role",
+    "signal", "study", "studies", "systematic", "therapy", "treatment",
+    "using", "with", "without", "from", "into", "this", "that", "their",
+    "these", "those", "were", "been", "have", "has", "and", "the", "for",
 }
 
 TOOL_DIR = Path(__file__).resolve().parents[1]
@@ -429,6 +440,118 @@ def top_matches(
         )
     matches.sort(key=lambda item: (-item["score"], item["path"].lower()))
     return matches[:limit]
+
+
+def research_match_candidates(
+    articles: list[ArticleRecord],
+    *,
+    title: str,
+    abstract: str = "",
+    keywords: str = "",
+    alert_name: str = "",
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Retrieve content homes using source entities, not only paper-title fuzziness.
+
+    Research paper titles are often descriptions rather than encyclopedia topics.
+    This scorer emphasizes rare compounds/conditions repeated in the title,
+    abstract, keywords, or Scholar alert name and searches titles, tags, paths,
+    and existing article bodies.
+    """
+
+    def useful_terms(value: str) -> list[str]:
+        return [
+            term
+            for term in normalize(value).split()
+            if len(term) >= 4 and term not in RESEARCH_MATCH_STOPWORDS
+        ]
+
+    title_terms = useful_terms(title)
+    abstract_terms = useful_terms(abstract)
+    keyword_terms = useful_terms(keywords)
+    alert_terms = useful_terms(alert_name)
+    query_counts: Counter[str] = Counter()
+    query_counts.update({term: 5 for term in alert_terms})
+    query_counts.update({term: 3 for term in title_terms})
+    query_counts.update({term: 3 for term in keyword_terms})
+    for term, count in Counter(abstract_terms).items():
+        query_counts[term] += min(count, 3)
+
+    if not query_counts:
+        return top_matches(articles, title, limit=limit)
+
+    article_fields: list[tuple[ArticleRecord, dict[str, set[str]]]] = []
+    document_frequency: Counter[str] = Counter()
+    for article in articles:
+        fields = {
+            "title": set(useful_terms(article.title)),
+            "tags": set(useful_terms(" ".join(article.tags))),
+            "path": set(useful_terms(article.path)),
+            "body": set(useful_terms(article.body)),
+        }
+        article_fields.append((article, fields))
+        document_frequency.update(set().union(*fields.values()) & query_counts.keys())
+
+    corpus_size = max(len(articles), 1)
+    field_weights = {"title": 9.0, "tags": 7.0, "path": 5.0, "body": 1.0}
+    alert_phrase = normalize(alert_name)
+    results: list[dict[str, Any]] = []
+    for article, fields in article_fields:
+        contributions: dict[str, float] = {}
+        matched_terms: set[str] = set()
+        score = 0.0
+        for field, field_terms in fields.items():
+            field_score = 0.0
+            for term in field_terms & query_counts.keys():
+                idf = log((corpus_size + 1) / (document_frequency[term] + 1)) + 1.0
+                field_score += query_counts[term] * idf * field_weights[field]
+                matched_terms.add(term)
+            if field_score:
+                contributions[field] = round(field_score, 2)
+                score += field_score
+
+        normalized_identity = " ".join(
+            [normalize(article.title), normalize(" ".join(article.tags)), normalize(article.path)]
+        )
+        if alert_phrase and alert_phrase in normalized_identity:
+            score += 100.0
+            contributions["alert_phrase"] = 100.0
+        if not matched_terms:
+            continue
+        results.append(
+            {
+                "path": article.path,
+                "title": article.title,
+                "tags": article.tags,
+                "permalink": article.permalink,
+                "route_key": article.route_key,
+                "score": round(score, 2),
+                "match_method": "research_hybrid",
+                "matched_terms": sorted(matched_terms),
+                "score_components": contributions,
+            }
+        )
+
+    results.sort(key=lambda item: (-item["score"], item["path"].lower()))
+    return results[:limit]
+
+
+def match_research_packet(
+    articles: list[ArticleRecord],
+    scrape: dict[str, Any],
+    *,
+    alert_name: str = "",
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Return topic-oriented homes for a normalized scraper result."""
+    return research_match_candidates(
+        articles,
+        title=str(scrape.get("title") or ""),
+        abstract=str(scrape.get("abstract") or ""),
+        keywords=str(scrape.get("keywords") or ""),
+        alert_name=alert_name,
+        limit=limit,
+    )
 
 
 def alert_name_matches_article(alert_name: str, article: ArticleRecord) -> bool:
@@ -1174,15 +1297,12 @@ def prepare_packet(args: argparse.Namespace) -> dict[str, Any]:
     scrape_output_path = output_dir / f"{source_slug}-source.md"
     scrape = scrape_source_packet(args.url, scrape_output_path)
 
-    if args.match_existing:
-        matches = top_matches_extended(
-            articles,
-            scrape["title"],
-            alert_name=getattr(args, "alert_name", "") or "",
-            limit=args.limit,
-        )
-    else:
-        matches = top_matches(articles, scrape["title"], limit=args.limit)
+    matches = match_research_packet(
+        articles,
+        scrape,
+        alert_name=getattr(args, "alert_name", "") or "",
+        limit=args.limit,
+    )
     image_result = None
     image_public_id = args.image_public_id
 
@@ -1324,7 +1444,14 @@ def queue_articles(args: argparse.Namespace) -> dict[str, Any]:
         enriched_articles.append(
             {
                 **item,
-                "matches": top_matches(articles, item["title"], limit=args.limit),
+                "matches": research_match_candidates(
+                    articles,
+                    title=str(item.get("title") or ""),
+                    abstract=str(item.get("abstract") or ""),
+                    keywords=str(item.get("keywords") or ""),
+                    alert_name=str(item.get("alert_name") or ""),
+                    limit=args.limit,
+                ),
             }
         )
 
@@ -1344,7 +1471,14 @@ def match_title(args: argparse.Namespace) -> dict[str, Any]:
     articles = load_articles(REPO_ROOT)
     return {
         "title": args.title,
-        "matches": top_matches(articles, args.title, limit=args.limit),
+        "matches": research_match_candidates(
+            articles,
+            title=args.title,
+            abstract=args.abstract,
+            keywords=args.keywords,
+            alert_name=args.alert_name,
+            limit=args.limit,
+        ),
     }
 
 
@@ -1492,7 +1626,8 @@ def lint_frontmatter(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def check_duplicate_paper(args: argparse.Namespace) -> dict[str, Any]:
-    articles = load_articles(REPO_ROOT)
+    repo_root = Path(getattr(args, "repo_root", REPO_ROOT)).expanduser().resolve()
+    articles = load_articles(repo_root)
     identifier = args.identifier.strip()
     normalized_identifier = normalize(identifier)
     canonical_identifier = canonicalize_url(identifier)
@@ -1558,7 +1693,12 @@ def ingest_paper(args: argparse.Namespace) -> dict[str, Any]:
     source_slug = slugify(args.slug or Path(args.source).stem or "source")
     scrape_output_path = output_dir / f"{source_slug}-source.md"
     scrape = scrape_source_packet(args.source, scrape_output_path)
-    matches = top_matches(articles, scrape["title"], limit=args.limit)
+    matches = match_research_packet(
+        articles,
+        scrape,
+        alert_name=args.alert_name,
+        limit=args.limit,
+    )
     archive_result = None
     if args.archive:
         archive_result = archive_source_material(
@@ -1594,7 +1734,12 @@ def intake_source(args: argparse.Namespace) -> dict[str, Any]:
     source_slug = slugify(args.slug or Path(args.source).stem or "source")
     scrape_output_path = output_dir / f"{source_slug}-source.md"
     scrape = scrape_source_packet(args.source, scrape_output_path)
-    matches = top_matches(articles, scrape["title"], limit=args.limit)
+    matches = match_research_packet(
+        articles,
+        scrape,
+        alert_name=args.alert_name,
+        limit=args.limit,
+    )
     duplicate = check_duplicate_paper(
         argparse.Namespace(identifier=scrape.get("reference_url") or scrape.get("url") or args.source, limit=args.limit)
     )
@@ -1632,6 +1777,178 @@ def intake_source(args: argparse.Namespace) -> dict[str, Any]:
     packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
     packet["packet_path"] = str(packet_path)
     return packet
+
+
+def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
+    from .local_publish import configured_client_values, run_local_publish
+
+    default_base_url, default_model = configured_client_values()
+    result = run_local_publish(
+        source=args.source,
+        alert_name=args.alert_name,
+        content_repo=REPO_ROOT,
+        tools_root=AGENT_TOOLS_ROOT,
+        output_dir=Path(args.output_dir).expanduser().resolve(),
+        base_url=args.base_url or default_base_url,
+        model=args.model or default_model,
+        publish=args.publish,
+        base_ref=args.base_ref,
+        max_candidates=args.limit,
+        max_draft_attempts=args.max_draft_attempts,
+    )
+    candidates = result.get("candidates") or []
+    return {
+        "status": result.get("status"),
+        "reason": result.get("reason"),
+        "report_path": result.get("report_path"),
+        "diff_path": result.get("diff_path"),
+        "target_path": result.get("target_path"),
+        "worktree": result.get("worktree"),
+        "branch": result.get("branch"),
+        "commit": result.get("commit"),
+        "pr_url": result.get("pr_url"),
+        "packet_validation": result.get("packet_validation"),
+        "plan_validation": result.get("plan_validation"),
+        "rendered_validation": result.get("rendered_validation"),
+        "critic": result.get("critic"),
+        "top_candidate": candidates[0] if candidates else None,
+        "duplicate": result.get("duplicate"),
+    }
+
+
+def update_local_job(job_id: int, state: str, worker: str, **values: str) -> dict[str, Any]:
+    command = gmail_reader_command(
+        "set-publication-job-state",
+        str(job_id),
+        "--state",
+        state,
+        "--worker",
+        worker,
+    )
+    option_names = {
+        "paper_key": "--paper-key",
+        "packet_path": "--packet-path",
+        "target_path": "--target-path",
+        "branch": "--branch",
+        "commit": "--commit",
+        "pr": "--pr",
+        "error": "--error",
+        "result_json": "--result-json",
+    }
+    for key, option in option_names.items():
+        if values.get(key):
+            command.extend([option, values[key]])
+    return run_json_tool(GMAIL_READER_DIR, command)
+
+
+def enqueue_local_command(args: argparse.Namespace) -> dict[str, Any]:
+    ensure_tool_dir(GMAIL_READER_DIR, "gmail-reader")
+    return run_json_tool(
+        GMAIL_READER_DIR,
+        gmail_reader_command(
+            "enqueue-publication",
+            args.identifier,
+            "--max-attempts",
+            str(args.max_attempts),
+        ),
+    )
+
+
+def enqueue_local_backlog_command(args: argparse.Namespace) -> dict[str, Any]:
+    ensure_tool_dir(GMAIL_READER_DIR, "gmail-reader")
+    return run_json_tool(
+        GMAIL_READER_DIR,
+        gmail_reader_command(
+            "enqueue-publication-backlog",
+            "--status",
+            args.status,
+            "--min-score",
+            str(args.min_score),
+            "--limit",
+            str(args.limit),
+            "--max-attempts",
+            str(args.max_attempts),
+        ),
+    )
+
+
+def local_worker_command(args: argparse.Namespace) -> dict[str, Any]:
+    from .local_publish import configured_client_values, run_local_publish
+
+    ensure_tool_dir(GMAIL_READER_DIR, "gmail-reader")
+    default_base_url, default_model = configured_client_values()
+    worker = args.worker or f"{os.uname().nodename}-{os.getpid()}"
+    processed: list[dict[str, Any]] = []
+    for _ in range(args.max_jobs):
+        claim = run_json_tool(
+            GMAIL_READER_DIR,
+            gmail_reader_command(
+                "claim-publication",
+                "--worker",
+                worker,
+                "--lease-seconds",
+                str(args.lease_seconds),
+            ),
+        )
+        if not claim.get("claimed"):
+            break
+        job = claim["job"]
+        job_id = int(job["job_id"])
+        job_output = Path(args.output_dir).expanduser().resolve() / f"job-{job_id}"
+
+        def progress(state: str) -> None:
+            update_local_job(job_id, state, worker)
+
+        try:
+            progress("scraping")
+            report = run_local_publish(
+                source=str(job["source_url"]),
+                alert_name=str(job.get("alert_name") or ""),
+                content_repo=REPO_ROOT,
+                tools_root=AGENT_TOOLS_ROOT,
+                output_dir=job_output,
+                base_url=args.base_url or default_base_url,
+                model=args.model or default_model,
+                publish=args.publish,
+                base_ref=args.base_ref,
+                max_candidates=args.limit,
+                max_draft_attempts=args.max_draft_attempts,
+                progress=progress,
+            )
+            status = str(report.get("status") or "needs_review")
+            terminal_state = {
+                "duplicate": "duplicate",
+                "needs_review": "needs_review",
+                "pr_open": "pr_open",
+                "validated_draft": "needs_review",
+            }.get(status, "needs_review")
+            summary = {
+                "status": status,
+                "reason": report.get("reason"),
+                "report_path": report.get("report_path"),
+                "diff_path": report.get("diff_path"),
+            }
+            update_local_job(
+                job_id,
+                terminal_state,
+                worker,
+                packet_path=str(report.get("report_path") or ""),
+                target_path=str(report.get("target_path") or ""),
+                branch=str(report.get("branch") or ""),
+                commit=str(report.get("commit") or ""),
+                pr=str(report.get("pr_url") or ""),
+                result_json=json.dumps(summary),
+            )
+            processed.append({"job_id": job_id, **summary})
+        except Exception as exc:
+            next_state = (
+                "retry"
+                if int(job["attempt_count"]) < int(job["max_attempts"])
+                else "failed"
+            )
+            update_local_job(job_id, next_state, worker, error=str(exc)[:4000])
+            processed.append({"job_id": job_id, "status": next_state, "error": str(exc)})
+    return {"worker": worker, "processed": processed, "idle": not processed}
 
 
 def create_pull_request(
@@ -1882,6 +2199,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     match_parser = subparsers.add_parser("match", help="Find likely existing article matches for a title.")
     match_parser.add_argument("title", help="Title or topic to match against the content repo.")
+    match_parser.add_argument("--abstract", default="", help="Optional abstract text for topic retrieval.")
+    match_parser.add_argument("--keywords", default="", help="Optional source keywords for topic retrieval.")
+    match_parser.add_argument("--alert-name", default="", help="Optional Scholar alert name for topic retrieval.")
     match_parser.add_argument("--limit", type=int, default=5, help="Maximum matches to return.")
 
     search_parser = subparsers.add_parser("search", help="Search local markdown articles by content and metadata.")
@@ -2116,6 +2436,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ingest_parser.add_argument("source", help="HTTP(S) URL or local PDF path to ingest.")
     ingest_parser.add_argument("--slug", help="Optional slug for generated packet names.")
+    ingest_parser.add_argument("--alert-name", default="", help="Optional Scholar alert name for topic retrieval.")
     ingest_parser.add_argument(
         "--archive",
         action="store_true",
@@ -2144,6 +2465,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     intake_parser.add_argument("source", help="HTTP(S) URL or local PDF path to intake.")
     intake_parser.add_argument("--slug", help="Optional slug for generated packet names.")
+    intake_parser.add_argument("--alert-name", default="", help="Optional Scholar alert name for topic retrieval.")
     intake_parser.add_argument(
         "--archive",
         action="store_true",
@@ -2164,6 +2486,59 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="Maximum duplicate/match candidates to return.",
+    )
+
+    local_publish_parser = subparsers.add_parser(
+        "local-publish",
+        help="Draft and validate a research update with the local llama.cpp model.",
+    )
+    local_publish_parser.add_argument("source", help="HTTP(S) article URL or PDF path.")
+    local_publish_parser.add_argument("--alert-name", default="", help="Optional Scholar alert topic.")
+    local_publish_parser.add_argument("--base-url", default="", help="OpenAI-compatible llama.cpp /v1 base URL.")
+    local_publish_parser.add_argument("--model", default="", help="Local llama.cpp model identifier.")
+    local_publish_parser.add_argument("--base-ref", default="origin/main", help="Git ref for the isolated content worktree.")
+    local_publish_parser.add_argument("--limit", type=int, default=5, help="Maximum target candidates.")
+    local_publish_parser.add_argument("--max-draft-attempts", type=int, default=3, help="Maximum draft/critic repair passes.")
+    local_publish_parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Packet, report, and patch directory.")
+    local_publish_parser.add_argument(
+        "--publish",
+        action="store_true",
+        help="Commit, push, and open a draft PR after all quality gates pass.",
+    )
+
+    enqueue_local_parser = subparsers.add_parser(
+        "enqueue-local",
+        help="Queue a stored Scholar article for the local publishing worker.",
+    )
+    enqueue_local_parser.add_argument("identifier", help="Article key or source URL.")
+    enqueue_local_parser.add_argument("--max-attempts", type=int, default=3)
+
+    enqueue_local_backlog_parser = subparsers.add_parser(
+        "enqueue-local-backlog",
+        help="Queue a high-scoring batch from the unprocessed Scholar database.",
+    )
+    enqueue_local_backlog_parser.add_argument("--status", choices=["selected", "review"], default="selected")
+    enqueue_local_backlog_parser.add_argument("--min-score", type=int, default=12)
+    enqueue_local_backlog_parser.add_argument("--limit", type=int, default=10)
+    enqueue_local_backlog_parser.add_argument("--max-attempts", type=int, default=3)
+
+    local_worker_parser = subparsers.add_parser(
+        "local-worker",
+        help="Lease and process queued research articles with the local model.",
+    )
+    local_worker_parser.add_argument("--worker", default="", help="Stable worker identifier.")
+    local_worker_parser.add_argument("--lease-seconds", type=int, default=3600)
+    local_worker_parser.add_argument("--max-jobs", type=int, default=1)
+    local_worker_parser.add_argument("--base-url", default="")
+    local_worker_parser.add_argument("--model", default="")
+    local_worker_parser.add_argument("--base-ref", default="origin/main")
+    local_worker_parser.add_argument("--limit", type=int, default=5)
+    local_worker_parser.add_argument("--max-draft-attempts", type=int, default=3)
+    local_worker_parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR / "local-jobs"))
+    local_worker_parser.add_argument(
+        "--publish",
+        action="store_true",
+        help="Open draft PRs for jobs that pass every quality gate.",
     )
 
     open_pr_parser = subparsers.add_parser(
@@ -2261,6 +2636,14 @@ def main(argv: list[str] | None = None) -> int:
             result = ingest_paper(args)
         elif args.command == "intake":
             result = intake_source(args)
+        elif args.command == "local-publish":
+            result = local_publish_command(args)
+        elif args.command == "enqueue-local":
+            result = enqueue_local_command(args)
+        elif args.command == "enqueue-local-backlog":
+            result = enqueue_local_backlog_command(args)
+        elif args.command == "local-worker":
+            result = local_worker_command(args)
         elif args.command == "open-pr":
             result = open_pull_request(args)
         elif args.command == "publish-pr":

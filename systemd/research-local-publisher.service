@@ -1,0 +1,16 @@
+[Unit]
+Description=Process one queued research article with the local llama.cpp model
+After=network-online.target research-scholar-sync.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/anthony/Research/research-tools
+Environment=PATH=/home/anthony/.local/bin:/home/anthony/n/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GMAIL_READER_DB=/home/anthony/Research/research-tools/gmail-reader/data/scholar-alerts.db
+Environment=CONTENT_REPO_ROOT=/home/anthony/Research/content
+Environment=LOCAL_LLM_BASE_URL=http://127.0.0.1:8080/v1
+Environment=LOCAL_LLM_MODEL=qwen3.6-35b-a3b-q8_0-mtp
+ExecStart=/home/anthony/Research/research-tools/agent-workflow enqueue-local-backlog --min-score 12 --limit 1
+ExecStart=/home/anthony/Research/research-tools/agent-workflow local-worker --max-jobs 1 --publish
+TimeoutStartSec=45min

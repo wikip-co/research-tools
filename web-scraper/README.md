@@ -60,6 +60,9 @@ uv run web-scraper "https://journals.sagepub.com/doi/full/10.1177/25151355251387
 - **Content quality bar:** prefer full text; **abstract-only is acceptable** for paywalled articles.
 - Publisher PDF / paywall-direct URLs (e.g. Sage `/doi/pdf/`, Wiley `pdfdirect`, OUP `advance-article-pdf`) are **rewritten to HTML landing pages** before scrape via `canonicalize_article_url`.
 - When possible, the scraper enriches missing metadata from Crossref, PubMed, and Unpaywall to improve DOI/PMID/open-access coverage.
+- A research packet is the normalized metadata, abstract/body, provenance, and warnings handed to downstream automation; it is not the raw response body.
+- Fatal-page detection rejects CAPTCHA, robot, challenge, login, rate-limit, and publisher error packets regardless of body length.
+- DOI enrichment is accepted only when the external title is consistent with the scraped title.
 
 ## Retrieval fallbacks
 
@@ -68,6 +71,12 @@ Order on weak/blocked HTML:
 1. **scrapling** (primary stealth fetch)
 2. **FlareSolverr** (Cloudflare / DDoS-GUARD challenges)
 3. **agent-browser** (headed/headless browser fallback)
+
+FlareSolverr receives the original requested article URL. It is not passed an
+earlier scraper's CAPTCHA HTML. Its result is validated again because a
+successful challenge request can still return a login, CAPTCHA, error page, or
+the wrong article; FlareSolverr solves transport challenges, not evidence
+identity or publisher paywalls.
 
 | Flag | Values | Purpose |
 |------|--------|---------|

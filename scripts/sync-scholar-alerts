@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOLS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+source "$TOOLS_ROOT/auth-bootstrap"
+
+exec uv run --directory "$TOOLS_ROOT/gmail-reader" gmail-reader \
+  --db "${GMAIL_READER_DB:-$TOOLS_ROOT/gmail-reader/data/scholar-alerts.db}" \
+  sync --days-back "${GMAIL_SYNC_DAYS_BACK:-3}" \
+  --max-messages "${GMAIL_SYNC_MAX_MESSAGES:-100}"

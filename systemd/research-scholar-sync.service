@@ -1,0 +1,13 @@
+[Unit]
+Description=Sync Google Scholar alert emails into the Research database
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/anthony/Research/research-tools
+Environment=PATH=/home/anthony/.local/bin:/home/anthony/n/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GMAIL_READER_DB=/home/anthony/Research/research-tools/gmail-reader/data/scholar-alerts.db
+Environment=GMAIL_SYNC_DAYS_BACK=3
+Environment=GMAIL_SYNC_MAX_MESSAGES=100
+ExecStart=/home/anthony/Research/research-tools/scripts/sync-scholar-alerts

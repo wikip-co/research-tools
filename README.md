@@ -4,7 +4,7 @@ Standalone runtime for the `content` repo's agent tooling.
 
 This repository separates the operational tooling from the markdown content repository so you can run agents on a stable machine instead of a laptop. It packages the current tools into one image and expects the content repo to be mounted at runtime.
 
-**Operators / Hermes handoff:** see [`RELEASE_NOTES.md`](./RELEASE_NOTES.md) for current host layout (iconium), recent fixes, services, and pickup checklist.
+**Operators / Hermes handoff:** see [`RELEASE_NOTES.md`](./RELEASE_NOTES.md) for current host layout and [`docs/local-research-publisher.md`](docs/local-research-publisher.md) for the production local-model path. The canonical cross-repository administration guide is [`../docs/research-production-operations.md`](../docs/research-production-operations.md).
 
 ## Included Tools
 
@@ -13,6 +13,7 @@ This repository separates the operational tooling from the markdown content repo
 - `wiki-automation`: build queues, search content, and prepare scrape packets
 - `image-upload`: upload article images to Cloudinary, including browser-captured screenshots
 - `web-scraper`: scrape source URLs into structured packets, with optional FlareSolverr (Cloudflare) and `agent-browser` fallbacks
+- local llama.cpp publisher: guarded ad-hoc URL processing plus a durable SQLite queue, structured draft/critic passes, deterministic gates, isolated worktrees, and optional draft PRs
 
 ## Runtime Model
 
@@ -67,6 +68,8 @@ Important runtime environment variables:
 - `VAULT_ADDR=https://vault.wikip.co`
 - `VAULT_GOOGLE_SECRET_PATH=secret/data/Google/oauth/credentials`
 - `VAULT_CLOUDINARY_SECRET_PATH=secret/data/cloudinary`
+- `LOCAL_LLM_BASE_URL=http://127.0.0.1:8080/v1`
+- `LOCAL_LLM_MODEL=qwen3.6-35b-a3b-q8_0-mtp`
 
 Vault bootstrap variables:
 
@@ -154,6 +157,12 @@ source auth-bootstrap                     # Load Google credentials
 ./agent-workflow archive-source "<url-or-file>"
 ./agent-workflow open-pr --fill
 ./agent-workflow publish-pr --draft
+
+# Production local-model path (dry run is the default)
+./agent-workflow local-publish "<url-or-pdf>"
+./agent-workflow enqueue-local-backlog --status selected --min-score 12 --limit 10
+./agent-workflow local-worker --max-jobs 1
+./agent-workflow local-worker --max-jobs 1 --publish
 ```
 
 ## Web Triage UI
@@ -190,7 +199,7 @@ The Codex job runner uses:
 codex --sandbox danger-full-access --ask-for-approval never exec -C <workspace-root> -
 ```
 
-The generated prompt tells Codex to read `docs/research-publishing-style-guide.md`, process the selected rows through the existing tooling, update the `content` repo, and open a draft PR for review. When Codex exits successfully, the web runner sets `processed_at` on those article rows.
+The generated prompt tells Codex to read `docs/research-publishing-style-guide.md`, process the selected rows through the existing tooling, update the `content` repo, and open a draft PR for review. The web runner sets `processed_at` only after a successful exit that reports a draft PR URL; a zero exit without a PR is not publication success.
 
 Useful overrides:
 
@@ -306,6 +315,16 @@ The web-scraper now automatically detects study types (Review, Meta-Analysis, RC
 - Rows can be marked `selected`, `review`, `rejected`, or `invalid` without deleting data
 - Selected rows can launch background Codex jobs that update `content` and submit draft PRs
 - Web job state is stored in `article_jobs` and `article_job_items`
+
+### Local llama.cpp Publisher
+
+- `agent-workflow local-publish URL` runs an ad-hoc dry-run through packet,
+  retrieval, draft, critic, deterministic validation, and isolated-worktree gates.
+- Add `--publish` to open a draft PR after every gate passes.
+- `enqueue-local`, `enqueue-local-backlog`, and `local-worker` provide the durable
+  SQLite queue used by the passive database workflow.
+- See [docs/local-research-publisher.md](docs/local-research-publisher.md) for
+  packet semantics, rollout commands, and the optional systemd timers.
 
 ### Workspace and CI
 - The repo now has a root `uv` workspace, root `uv.lock`, `Makefile`, and GitHub Actions CI

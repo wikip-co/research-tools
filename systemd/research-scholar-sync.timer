@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically sync Google Scholar alerts
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=30m
+Persistent=true
+RandomizedDelaySec=2m
+
+[Install]
+WantedBy=timers.target

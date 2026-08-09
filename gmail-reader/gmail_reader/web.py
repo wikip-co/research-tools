@@ -364,6 +364,9 @@ Process the selected research article rows below and submit a draft PR to the `c
 
 Required workflow:
 1. Read `research-tools/docs/research-publishing-style-guide.md` before editing content.
+   For `content/Natural Healing/**`, also read
+   `docs/natural-healing-content-style-guide.md`; that category guide is
+   authoritative and requires near-verbatim, one-idea bullets with citations.
 2. Use `research-tools/agent-workflow intake` or the underlying tools to scrape each source, check duplicates, and match existing content.
 3. Prefer appending to an existing `content` markdown article when the source naturally belongs there. Create a new article only when there is no good existing home.
 4. Keep edits inside the `content` repo unless tooling metadata is truly required.
@@ -372,7 +375,8 @@ Required workflow:
 7. Use `research-tools/agent-workflow publish-pr --draft` after applying article changes so I can review the PR.
 8. In your final message, include the PR URL, changed article paths, and any selected articles that you could not process.
 
-Do not mark the SQLite rows processed yourself; this web job runner will set `processed_at` after a successful Codex exit.
+Do not mark the SQLite rows processed yourself; this web job runner will set
+`processed_at` only after a successful exit that reports a draft PR URL.
 
 SQLite DB path: {db_path}
 
@@ -436,10 +440,13 @@ def run_job(job_id: int, db_path: Path, workspace_root: Path, article_keys: list
         log = "".join(log_parts).strip()
         pr_matches = PR_URL_PATTERN.findall(log)
         pr_url = pr_matches[-1] if pr_matches else ""
-        if return_code == 0:
+        if return_code == 0 and pr_url:
             mark_articles_processed(conn, article_keys)
             state = "completed"
             error = ""
+        elif return_code == 0:
+            state = "failed"
+            error = "Codex exited successfully but did not report a pull request URL"
         else:
             state = "failed"
             error = f"Codex exited with {return_code}"

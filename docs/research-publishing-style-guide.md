@@ -8,6 +8,9 @@ Use this guide when an agent turns research sources into `content` markdown.
 - Do not edit generated HTML or the `wikip.co/public` output repo.
 - Prefer updating an existing article when the source naturally belongs there.
 - Create a new article only when there is no strong existing match.
+- Category-specific guides override this general guide. For every path under
+  `Natural Healing/`, `Research/docs/natural-healing-content-style-guide.md` is
+  authoritative, including its near-verbatim, bullet-first content rule.
 
 ## Tone And Evidence
 
@@ -45,7 +48,11 @@ Use this guide when an agent turns research sources into `content` markdown.
 
 - Search and match before writing to avoid duplicate articles.
 - Check whether the URL, DOI, or PMID is already cited.
-- Summarize findings in your own words.
+- Outside `Natural Healing/`, summarize findings in your own words.
+- Inside `Natural Healing/`, preserve the source's scientific wording as closely
+  as possible in concise, one-idea bullets, as required by the Natural Healing
+  guide. Do not invent connective claims, combine distinct findings, or make a
+  claim stronger than the source even when retaining near-verbatim wording.
 - Avoid dumping abstracts into the article.
 - Keep additions proportional. A single paper usually deserves a concise update, not a full rewrite.
 - Leave unrelated sections alone.
