@@ -184,3 +184,6 @@ review patch but suppresses publishing; `off` is ad-hoc dry-run only. A human
 can override a required-mode critic rejection only with `--publish`,
 `--allow-critic-rejection`, and an `--override-reason`; deterministic and
 citation-metadata gates remain mandatory. The passive worker has no override.
+Draft PRs separate validated critic findings from rejected observations. The
+latter are labeled non-blocking and include the validation errors that prevented
+them from influencing the publication decision.

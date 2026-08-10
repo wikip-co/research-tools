@@ -50,6 +50,9 @@ The publisher:
 8. accepts critic issues only from fixed code/severity sets and only when each
    objection contains an exact source or target-page quotation; self-
    contradictory or ungrounded findings are recorded but cannot gate a draft;
+   published PRs show these separately under **Rejected critic observations
+   (non-blocking)** with their validation errors, so reviewers can inspect them
+   without mistaking them for authoritative findings;
 9. applies only a validated plan in an isolated git worktree based on
    `origin/main`; and
 10. opens a draft PR only when `--publish` is supplied and every gate passes.

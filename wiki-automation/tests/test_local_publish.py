@@ -8,6 +8,7 @@ from wiki_automation.local_publish import (
     combine_critic_reviews,
     deterministic_placement_review_issues,
     duplicate_identifiers,
+    format_critic_pr_audit,
     merge_duplicate_checks,
     run_local_publish,
     validate_critic_review,
@@ -275,6 +276,58 @@ Existing text.[^1]
         needs_revision = combine_critic_reviews(placement, evidence)
         self.assertFalse(needs_revision["approved"])
         self.assertEqual(needs_revision["recommendation"], "revise")
+
+    def test_pr_audit_separates_rejected_critic_observations(self) -> None:
+        critic = {
+            "issues": [
+                {
+                    "code": "medical_overclaim",
+                    "severity": "warning",
+                    "bullet_index": 0,
+                    "explanation": "Keep the animal scope explicit.",
+                }
+            ],
+            "placement_review": {
+                "rejected_issues": [
+                    {
+                        "issue": {
+                            "code": "wrong_target_page",
+                            "severity": "review",
+                            "bullet_index": 0,
+                            "explanation": "A cultivar-specific page may be more precise.",
+                        },
+                        "validation_errors": [
+                            "source_quote_not_exact",
+                            "wrong_target_requires_source_and_target_quotes",
+                        ],
+                    }
+                ]
+            },
+            "evidence_review": {"rejected_issues": []},
+        }
+        audit = format_critic_pr_audit(critic)
+        self.assertIn("### Validated critic findings", audit)
+        self.assertIn("`warning` `medical_overclaim` (bullet 0)", audit)
+        self.assertIn("### Rejected critic observations (non-blocking)", audit)
+        self.assertIn("did not affect the publication gate decision", audit)
+        self.assertIn("`placement` `review` `wrong_target_page` (bullet 0)", audit)
+        self.assertIn("`source_quote_not_exact`", audit)
+        self.assertIn("`wrong_target_requires_source_and_target_quotes`", audit)
+
+    def test_pr_audit_retains_override_reason_and_empty_rejected_section(self) -> None:
+        audit = format_critic_pr_audit(
+            {
+                "issues": [{"code": "wrong_heading", "severity": "review", "explanation": "Review placement."}],
+                "placement_review": {"rejected_issues": []},
+                "evidence_review": {"rejected_issues": []},
+            },
+            override_applied=True,
+            override_reason="Human reviewed target and evidence",
+        )
+        self.assertIn("Critic rejection override applied", audit)
+        self.assertIn("Override reason: Human reviewed target and evidence", audit)
+        self.assertIn("### Rejected critic observations (non-blocking)\n\n", audit)
+        self.assertTrue(audit.endswith("- None"))
 
     def test_critic_discards_bad_optional_target_quote_and_promotes_safety_severity(self) -> None:
         plan = {"bullets": [{"text": "A finding."}]}

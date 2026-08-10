@@ -755,6 +755,96 @@ def combine_critic_reviews(placement: dict[str, Any], evidence: dict[str, Any]) 
     }
 
 
+def _critic_markdown_inline(value: Any) -> str:
+    return " ".join(str(value or "").split()).replace("`", "\\`")
+
+
+def _format_validated_critic_findings(critic: dict[str, Any]) -> str:
+    findings = []
+    for item in critic.get("issues") or []:
+        if not isinstance(item, dict):
+            findings.append(f"- Unstructured validated finding: {_critic_markdown_inline(item)}")
+            continue
+        severity = _critic_markdown_inline(item.get("severity") or "unknown_severity")
+        code = _critic_markdown_inline(item.get("code") or "unknown_issue")
+        bullet_index = item.get("bullet_index")
+        bullet = f" (bullet {bullet_index})" if isinstance(bullet_index, int) and not isinstance(bullet_index, bool) else ""
+        explanation = _critic_markdown_inline(item.get("explanation") or "No explanation supplied.")
+        findings.append(f"- `{severity}` `{code}`{bullet}: {explanation}")
+    return "\n".join(findings) or "- None"
+
+
+def _format_rejected_critic_observations(critic: dict[str, Any]) -> str:
+    observations = []
+    for review_kind, review_key in (
+        ("placement", "placement_review"),
+        ("evidence", "evidence_review"),
+    ):
+        review = critic.get(review_key) if isinstance(critic.get(review_key), dict) else {}
+        for rejected in review.get("rejected_issues") or []:
+            if not isinstance(rejected, dict):
+                observations.append(
+                    f"- `{review_kind}` malformed rejected observation: {_critic_markdown_inline(rejected)}"
+                )
+                continue
+            issue = rejected.get("issue")
+            errors = [
+                _critic_markdown_inline(error)
+                for error in rejected.get("validation_errors") or []
+                if _critic_markdown_inline(error)
+            ]
+            error_text = ", ".join(f"`{error}`" for error in errors) or "not specified"
+            if not isinstance(issue, dict):
+                observations.append(
+                    f"- `{review_kind}` malformed critic issue: {_critic_markdown_inline(issue)} "
+                    f"Validation errors: {error_text}."
+                )
+                continue
+            severity = _critic_markdown_inline(issue.get("severity") or "unknown_severity")
+            code = _critic_markdown_inline(issue.get("code") or "unknown_issue")
+            bullet_index = issue.get("bullet_index")
+            bullet = (
+                f" (bullet {bullet_index})"
+                if isinstance(bullet_index, int) and not isinstance(bullet_index, bool)
+                else ""
+            )
+            explanation = _critic_markdown_inline(issue.get("explanation") or "No explanation supplied.")
+            observations.append(
+                f"- `{review_kind}` `{severity}` `{code}`{bullet}: {explanation} "
+                f"Validation errors: {error_text}."
+            )
+    return "\n".join(observations) or "- None"
+
+
+def format_critic_pr_audit(
+    critic: dict[str, Any],
+    *,
+    override_applied: bool = False,
+    override_reason: str = "",
+) -> str:
+    """Render authoritative and rejected critic results separately for a PR."""
+    validated = _format_validated_critic_findings(critic)
+    rejected = _format_rejected_critic_observations(critic)
+    sections = []
+    if override_applied:
+        sections.append(
+            "**Critic rejection override applied after human review.**\n\n"
+            f"Override reason: {_critic_markdown_inline(override_reason)}"
+        )
+    sections.extend(
+        [
+            f"### Validated critic findings\n\n{validated}",
+            (
+                "### Rejected critic observations (non-blocking)\n\n"
+                "These observations failed critic-evidence validation and did not affect "
+                "the publication gate decision.\n\n"
+                f"{rejected}"
+            ),
+        ]
+    )
+    return "\n\n".join(sections)
+
+
 def deterministic_placement_review_issues(
     *,
     packet: dict[str, Any],
@@ -1190,20 +1280,11 @@ def run_local_publish(
         gh = shutil.which("gh")
         if not gh:
             raise FileNotFoundError("gh CLI is required to publish a draft PR")
-        critic_findings = "\n".join(
-            f"- `{item.get('severity')}` `{item.get('code')}`"
-            + (f" (bullet {item.get('bullet_index')})" if item.get("bullet_index") is not None else "")
-            + f": {item.get('explanation')}"
-            for item in critic.get("issues") or []
-        ) or "- None"
-        if critic_override_applied:
-            critic_audit = (
-                "**Critic rejection override applied after human review.**\n\n"
-                f"Override reason: {override_reason.strip()}\n\n"
-                f"Validated critic findings retained for review:\n{critic_findings}"
-            )
-        else:
-            critic_audit = f"Validated critic findings:\n{critic_findings}"
+        critic_audit = format_critic_pr_audit(
+            critic,
+            override_applied=critic_override_applied,
+            override_reason=override_reason.strip(),
+        )
         pr_body = (
             "Local research publisher update.\n\n"
             f"Source: {source}\n\n"
