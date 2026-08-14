@@ -372,6 +372,357 @@ tags:
         self.assertFalse(recommendation["automatic_creation"])
         self.assertFalse(recommendation["automatic_publication"])
 
+    def test_compendium_rat_source_supports_independent_background_targets(self) -> None:
+        references = {
+            "clementine": "[12] Clementine composition review. Journal of Citrus. 2020.",
+            "grapefruit": "[13] Grapefruit composition review. Journal of Citrus. 2021.",
+            "orange": "[14] Orange composition review. Journal of Citrus. 2022.",
+            "citrus": "[15] Citrus composition review. Journal of Citrus. 2023.",
+            "lycopene": "[16] Lycopene food sources review. Nutrition Journal. 2024.",
+        }
+        quotes = {
+            "clementine": "Clementine fruit provides flavonoids and vitamin C that contribute to its nutritional composition [12].",
+            "grapefruit": "Pink grapefruit contains characteristic carotenoids and flavonoids in its edible tissues [13].",
+            "orange": "Orange fruit is a dietary source of vitamin C and several citrus flavonoids [14].",
+            "citrus": "Citrus fruits contain diverse flavonoids whose amounts vary among species and cultivars [15].",
+            "lycopene": "Lycopene is a carotenoid reported in pink grapefruit and other red-colored foods [16].",
+        }
+        body = (
+            "## Introduction\n\n"
+            + "\n\n".join(quotes.values())
+            + "\n\nBergamot was only mentioned in the list of search terms."
+            + "\n\n## Results\n\nThe citrus intervention reduced body-weight gain in rats receiving the experimental diet."
+            + "\n\n## References\n\n"
+            + "\n".join(references.values())
+        )
+        packet = {
+            **self.packet,
+            "title": "Effects of a clementine and pink grapefruit blend on metabolic alterations in rats",
+            "abstract": "A clementine and pink grapefruit blend was administered to rats with diet-induced metabolic alterations for eight weeks.",
+            "body_markdown": body,
+            "study_type": "Animal Study: Rat",
+            "keywords": "clementine; pink grapefruit; citrus blend; metabolic",
+        }
+        paths = {
+            entity: f"Natural Healing/{entity}.md"
+            for entity in ("clementine", "grapefruit", "orange", "citrus", "lycopene")
+        }
+        candidates = {
+            path: {"path": path, "title": entity.title()}
+            for entity, path in paths.items()
+        }
+        plan = {
+            "decision": "append_existing",
+            "study_type": "Animal Study: Rat",
+            "target_proposals": [
+                {
+                    "target_path": paths[entity],
+                    "target_entity": entity,
+                    "parent_heading": "",
+                    "heading": "## Composition",
+                    "rationale": f"The passage directly states a background fact about {entity}.",
+                    "bullets": [
+                        {
+                            "text": quotes[entity],
+                            "source_quote": quotes[entity],
+                            "source_section": "Introduction",
+                            "claim_kind": "background_fact",
+                            "evidence_scope": "review_summary",
+                            "cited_references": [
+                                {
+                                    "citation_marker": f"[{12 + index}]",
+                                    "reference_text": references[entity],
+                                    "reference_url": "",
+                                }
+                            ],
+                        }
+                    ],
+                    "exclusions": [],
+                }
+                for index, entity in enumerate(paths)
+            ],
+            "exclusions": [
+                {
+                    "source_quote": "Bergamot was only mentioned in the list of search terms.",
+                    "reason": "A mere mention does not support a Bergamot claim.",
+                },
+                {
+                    "source_quote": "The citrus intervention reduced body-weight gain in rats receiving the experimental diet.",
+                    "reason": "The supplied paper studied a blend; no exact existing blend target was provided.",
+                },
+            ],
+        }
+        result = validate_draft_plan(
+            plan,
+            packet=packet,
+            candidate_paths=set(candidates),
+            candidate_metadata=candidates,
+            claim_policy="compendium",
+        )
+        self.assertTrue(result.ok, result.issues)
+        self.assertEqual(result.warnings, [])
+        self.assertEqual(
+            {proposal["target_entity"] for proposal in plan["target_proposals"]},
+            {"clementine", "grapefruit", "orange", "citrus", "lycopene"},
+        )
+
+        missing_provenance = {
+            **plan,
+            "target_proposals": [
+                {
+                    **plan["target_proposals"][0],
+                    "bullets": [
+                        {**plan["target_proposals"][0]["bullets"][0], "cited_references": []}
+                    ],
+                }
+            ],
+        }
+        invalid = validate_draft_plan(
+            missing_provenance,
+            packet=packet,
+            candidate_paths=set(candidates),
+            candidate_metadata=candidates,
+            claim_policy="compendium",
+        )
+        self.assertIn(
+            "target_0_bullet_0_missing_cited_reference_provenance",
+            invalid.issues,
+        )
+        reference_only = {
+            **plan,
+            "target_proposals": [
+                {
+                    **plan["target_proposals"][0],
+                    "bullets": [
+                        {
+                            "text": references["clementine"],
+                            "source_quote": references["clementine"],
+                            "source_section": "References",
+                            "claim_kind": "background_fact",
+                            "evidence_scope": "review_summary",
+                            "cited_references": [
+                                {
+                                    "citation_marker": "[12]",
+                                    "reference_text": references["clementine"],
+                                    "reference_url": "",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        invalid = validate_draft_plan(
+            reference_only,
+            packet=packet,
+            candidate_paths=set(candidates),
+            candidate_metadata=candidates,
+            claim_policy="compendium",
+        )
+        self.assertIn(
+            "target_0_bullet_0_source_section_not_claim_bearing",
+            invalid.issues,
+        )
+
+        bergamot_path = "Natural Healing/bergamot.md"
+        bergamot_candidate = {bergamot_path: {"path": bergamot_path, "title": "Bergamot"}}
+        wrong_entity = {
+            "decision": "append_existing",
+            "study_type": "Animal Study: Rat",
+            "target_proposals": [
+                {
+                    **plan["target_proposals"][3],
+                    "target_path": bergamot_path,
+                    "target_entity": "bergamot",
+                    "bullets": [
+                        {
+                            **plan["target_proposals"][3]["bullets"][0],
+                            "text": quotes["citrus"],
+                            "source_quote": quotes["citrus"],
+                        }
+                    ],
+                }
+            ],
+            "exclusions": [],
+        }
+        invalid = validate_draft_plan(
+            wrong_entity,
+            packet=packet,
+            candidate_paths={bergamot_path},
+            candidate_metadata=bergamot_candidate,
+            claim_policy="compendium",
+        )
+        self.assertIn(
+            "target_0_bullet_0_entity_not_supported_by_passage",
+            invalid.issues,
+        )
+        mention = "Bergamot was only mentioned in the list of search terms."
+        mere_mention = {
+            **wrong_entity,
+            "target_proposals": [
+                {
+                    **wrong_entity["target_proposals"][0],
+                    "bullets": [
+                        {
+                            "text": mention,
+                            "source_quote": mention,
+                            "source_section": "Introduction",
+                            "claim_kind": "background_fact",
+                            "evidence_scope": "review_summary",
+                            "cited_references": [],
+                        }
+                    ],
+                }
+            ],
+        }
+        invalid = validate_draft_plan(
+            mere_mention,
+            packet=packet,
+            candidate_paths={bergamot_path},
+            candidate_metadata=bergamot_candidate,
+            claim_policy="compendium",
+        )
+        self.assertIn(
+            "target_0_bullet_0_entity_not_supported_by_passage",
+            invalid.issues,
+        )
+
+        misclassified = {
+            **plan,
+            "target_proposals": [
+                {
+                    **plan["target_proposals"][0],
+                    "bullets": [
+                        {
+                            **plan["target_proposals"][0]["bullets"][0],
+                            "claim_kind": "source_finding",
+                            "evidence_scope": "animal",
+                            "cited_references": [],
+                        }
+                    ],
+                }
+            ],
+        }
+        invalid = validate_draft_plan(
+            misclassified,
+            packet=packet,
+            candidate_paths=set(candidates),
+            candidate_metadata=candidates,
+            claim_policy="compendium",
+        )
+        self.assertIn(
+            "target_0_bullet_0_claim_origin_misclassified",
+            invalid.issues,
+        )
+
+    def test_compendium_preclinical_warning_replaces_heading_rejection(self) -> None:
+        background_quote = "Citrus fruits contain diverse flavonoids whose amounts vary among species and cultivars [15]."
+        direct_quote = "The citrus intervention reduced body-weight gain in rats receiving the experimental diet."
+        reference = "[15] Citrus composition review. Journal of Citrus. 2023."
+        packet = {
+            **self.packet,
+            "title": "Citrus intervention in rats",
+            "abstract": "A citrus intervention was administered to rats to evaluate metabolic outcomes during the experimental feeding period.",
+            "body_markdown": (
+                f"## Introduction\n\n{background_quote}\n\n## Results\n\n{direct_quote}"
+                f"\n\n## References\n\n{reference}"
+            ),
+            "study_type": "Animal Study: Rat",
+        }
+        plan = {
+            "decision": "append_existing",
+            "study_type": "Animal Study: Rat",
+            "target_proposals": [
+                {
+                    "target_path": "Natural Healing/citrus.md",
+                    "target_entity": "citrus",
+                    "parent_heading": "",
+                    "heading": "## Composition",
+                    "rationale": "Both passages make claims about citrus.",
+                    "bullets": [
+                        {
+                            "text": direct_quote,
+                            "source_quote": direct_quote,
+                            "source_section": "Results",
+                            "claim_kind": "source_finding",
+                            "evidence_scope": "animal",
+                            "cited_references": [],
+                        },
+                        {
+                            "text": background_quote,
+                            "source_quote": background_quote,
+                            "source_section": "Introduction",
+                            "claim_kind": "background_fact",
+                            "evidence_scope": "review_summary",
+                            "cited_references": [
+                                {
+                                    "citation_marker": "[15]",
+                                    "reference_text": reference,
+                                    "reference_url": "",
+                                }
+                            ],
+                        },
+                    ],
+                    "exclusions": [],
+                }
+            ],
+            "exclusions": [],
+        }
+        candidate = {
+            "Natural Healing/citrus.md": {
+                "path": "Natural Healing/citrus.md",
+                "title": "Citrus",
+            }
+        }
+        proposal = plan["target_proposals"][0]
+        valid = validate_draft_plan(
+            plan,
+            packet=packet,
+            candidate_paths=set(candidate),
+            candidate_metadata=candidate,
+            claim_policy="compendium",
+        )
+        self.assertTrue(valid.ok, valid.issues)
+        self.assertIn("target_0_preclinical_heading_scope_warning", valid.warnings)
+
+        strict = validate_draft_plan(
+            plan,
+            packet=packet,
+            candidate_paths=set(candidate),
+            candidate_metadata=candidate,
+            claim_policy="strict",
+        )
+        self.assertIn("target_0_preclinical_heading_scope_missing", strict.issues)
+
+        markdown = "---\ntitle: Citrus\n---\n\n## Composition\n"
+        updated = apply_draft_plan(
+            markdown, proposal, packet, claim_policy="compendium"
+        )
+        self.assertIn("**Evidence warning — animal/preclinical evidence:**", updated)
+        self.assertIn(f"{direct_quote}[^1]", updated)
+        self.assertIn(f"{background_quote}[^2]", updated)
+        self.assertIn("**Claim Type:** Background fact summarized by the supplied paper", updated)
+        self.assertIn(reference, updated)
+        rendered = validate_rendered_markdown(
+            markdown,
+            updated,
+            plan=proposal,
+            packet=packet,
+            claim_policy="compendium",
+        )
+        self.assertTrue(rendered.ok, rendered.issues)
+
+        prompt = local_publish.draft_prompt(
+            packet=packet,
+            candidates=list(candidate.values()),
+            candidate_documents={"Natural Healing/citrus.md": markdown},
+            claim_policy="compendium",
+        )
+        self.assertIn("COMPENDIUM CLAIM POLICY", prompt)
+        self.assertIn("Introduction and Discussion", prompt)
+        self.assertIn("cited_references", prompt)
+        self.assertIn("A citrus blend never belongs on a Bergamot page", prompt)
+
     def test_repairs_preserve_history_and_select_best_deterministic_valid_attempt(self) -> None:
         quote = (
             "Poor aqueous solubility and extensive metabolism limit the clinical "
@@ -745,6 +1096,12 @@ Existing text.[^1]
                 publish=False,
                 allow_critic_rejection=True,
                 override_reason="Reviewed",
+            )
+        with self.assertRaisesRegex(ValueError, "claim_policy must be one of"):
+            run_local_publish(
+                **common,
+                publish=False,
+                claim_policy="background-everything",
             )
 
 

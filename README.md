@@ -322,6 +322,10 @@ The web-scraper now automatically detects study types (Review, Meta-Analysis, RC
   retrieval, draft, split placement/evidence critics, deterministic validation,
   and isolated-worktree gates.
 - Add `--publish` to open a draft PR after every gate passes.
+- Keep the default `--claim-policy strict` for supplied-paper findings, or opt
+  into `--claim-policy compendium` to propose full-text background facts with
+  exact passage, claim-origin, entity, evidence-scope, and cited-reference
+  provenance gates.
 - Use `--critic-mode advisory` for patch-only review or `--critic-mode off` for
   a manual ad-hoc dry run. Only default `required` mode can publish normally.
 - A required critic rejection can be published only with the explicit audited

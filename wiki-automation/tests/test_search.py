@@ -119,6 +119,57 @@ class SearchArticlesTests(unittest.TestCase):
         )
         self.assertEqual(matches, [])
 
+    def test_compendium_matching_discovers_full_text_entities_without_bergamot(self) -> None:
+        entities = ["Clementine", "Grapefruit", "Orange", "Citrus", "Lycopene"]
+        articles = [
+            ArticleRecord(
+                path=f"Natural Healing/{entity.lower()}.md",
+                title=entity,
+                stem=entity.lower(),
+                tags=[],
+                permalink=None,
+                body=f"Background information about {entity}.",
+            )
+            for entity in entities
+        ]
+        articles.append(
+            ArticleRecord(
+                path="Natural Healing/bergamot.md",
+                title="Bergamot",
+                stem="bergamot",
+                tags=["Citrus"],
+                permalink=None,
+                body="Bergamot is a citrus fruit.",
+            )
+        )
+        full_text = (
+            "Clementine fruit provides flavonoids. Pink grapefruit contains carotenoids. "
+            "Orange fruit provides vitamin C. Citrus fruits contain diverse flavonoids. "
+            "Lycopene occurs in red-colored foods.\n\n## References\n\n"
+            "Bergamot search term citation."
+        )
+        strict = research_match_candidates(
+            articles,
+            title="Dietary intervention and metabolic alterations in rats",
+            abstract="The intervention was administered during experimental feeding.",
+            full_text=full_text,
+            include_background=False,
+        )
+        self.assertEqual(strict, [])
+
+        compendium = research_match_candidates(
+            articles,
+            title="Dietary intervention and metabolic alterations in rats",
+            abstract="The intervention was administered during experimental feeding.",
+            full_text=full_text,
+            include_background=True,
+        )
+        self.assertEqual(
+            {match["title"] for match in compendium},
+            {"Clementine", "Grapefruit", "Orange", "Citrus", "Lycopene"},
+        )
+        self.assertNotIn("Bergamot", {match["title"] for match in compendium})
+
 
 if __name__ == "__main__":
     unittest.main()

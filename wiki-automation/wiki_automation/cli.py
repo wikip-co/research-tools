@@ -45,6 +45,7 @@ RESEARCH_MATCH_STOPWORDS = {
     "induced", "metabolic", "metabolism", "mouse", "mice", "rat", "rats",
     "pink", "preclinical", "supplement", "supplementation", "versus",
 }
+COMPENDIUM_BACKGROUND_ENTITY_TERMS = {"citrus"}
 
 TOOL_DIR = Path(__file__).resolve().parents[1]
 AGENT_TOOLS_ROOT = Path(
@@ -462,6 +463,8 @@ def research_match_candidates(
     abstract: str = "",
     keywords: str = "",
     alert_name: str = "",
+    full_text: str = "",
+    include_background: bool = False,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
     """Retrieve content homes using source entities, not only paper-title fuzziness.
@@ -470,27 +473,48 @@ def research_match_candidates(
     Eligibility therefore requires a discriminative source-entity term in an
     article identity field (title, stem, path, or tags). Abstract/body overlap
     can rank eligible homes but cannot make an unrelated page eligible by itself.
+    Opt-in compendium matching may discover full-text entities, but those terms
+    must match the article's primary title/path identity rather than a generic
+    tag (for example, Citrus on a Bergamot article).
     """
 
-    def useful_terms(value: str) -> list[str]:
+    def useful_terms(value: str, *, allow_background_entities: bool = False) -> list[str]:
         return [
             term
             for term in normalize(value).split()
-            if len(term) >= 4 and term not in RESEARCH_MATCH_STOPWORDS
+            if len(term) >= 4
+            and (
+                term not in RESEARCH_MATCH_STOPWORDS
+                or allow_background_entities
+                and term in COMPENDIUM_BACKGROUND_ENTITY_TERMS
+            )
         ]
 
     title_terms = useful_terms(title)
     abstract_terms = useful_terms(abstract)
     keyword_terms = useful_terms(keywords)
     alert_terms = useful_terms(alert_name)
+    claim_bearing_full_text = re.split(
+        r"(?im)^#{1,6}\s+(?:references|bibliography|works cited)\s*$",
+        full_text,
+        maxsplit=1,
+    )[0]
+    background_terms = (
+        useful_terms(claim_bearing_full_text, allow_background_entities=True)
+        if include_background
+        else []
+    )
     query_counts: Counter[str] = Counter()
     query_counts.update({term: 5 for term in alert_terms})
     query_counts.update({term: 3 for term in title_terms})
     query_counts.update({term: 3 for term in keyword_terms})
+    for term, count in Counter(background_terms).items():
+        query_counts[term] += min(count, 2)
     for term, count in Counter(abstract_terms).items():
         query_counts[term] += min(count, 3)
 
-    identity_query_terms = set(title_terms) | set(keyword_terms) | set(alert_terms)
+    core_identity_query_terms = set(title_terms) | set(keyword_terms) | set(alert_terms)
+    identity_query_terms = core_identity_query_terms | set(background_terms)
     if not query_counts or not identity_query_terms:
         return []
 
@@ -498,9 +522,15 @@ def research_match_candidates(
     document_frequency: Counter[str] = Counter()
     for article in articles:
         fields = {
-            "title": set(useful_terms(article.title)),
-            "tags": set(useful_terms(" ".join(article.tags))),
-            "path": set(useful_terms(article.path)),
+            "title": set(
+                useful_terms(article.title, allow_background_entities=include_background)
+            ),
+            "tags": set(
+                useful_terms(" ".join(article.tags), allow_background_entities=include_background)
+            ),
+            "path": set(
+                useful_terms(article.path, allow_background_entities=include_background)
+            ),
             "body": set(useful_terms(article.body)),
         }
         article_fields.append((article, fields))
@@ -512,7 +542,10 @@ def research_match_candidates(
     results: list[dict[str, Any]] = []
     for article, fields in article_fields:
         identity_terms = fields["title"] | fields["tags"] | fields["path"]
-        entity_matches = identity_terms & identity_query_terms
+        primary_identity_terms = fields["title"] | fields["path"]
+        entity_matches = (identity_terms & core_identity_query_terms) | (
+            primary_identity_terms & set(background_terms)
+        )
         if not entity_matches:
             continue
         contributions: dict[str, float] = {}
@@ -561,6 +594,7 @@ def match_research_packet(
     scrape: dict[str, Any],
     *,
     alert_name: str = "",
+    include_background: bool = False,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
     """Return topic-oriented homes for a normalized scraper result."""
@@ -570,6 +604,8 @@ def match_research_packet(
         abstract=str(scrape.get("abstract") or ""),
         keywords=str(scrape.get("keywords") or ""),
         alert_name=alert_name,
+        full_text=str(scrape.get("body_markdown") or ""),
+        include_background=include_background,
         limit=limit,
     )
 
@@ -1816,6 +1852,7 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
         max_candidates=args.limit,
         max_draft_attempts=args.max_draft_attempts,
         critic_mode=args.critic_mode,
+        claim_policy=args.claim_policy,
         allow_critic_rejection=args.allow_critic_rejection,
         override_reason=args.override_reason,
     )
@@ -1826,6 +1863,7 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
         "report_path": result.get("report_path"),
         "diff_path": result.get("diff_path"),
         "target_path": result.get("target_path"),
+        "target_paths": result.get("target_paths"),
         "worktree": result.get("worktree"),
         "branch": result.get("branch"),
         "commit": result.get("commit"),
@@ -1835,10 +1873,12 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
         "rendered_validation": result.get("rendered_validation"),
         "critic": result.get("critic"),
         "critic_mode": result.get("critic_mode"),
+        "claim_policy": result.get("claim_policy"),
         "critic_override": result.get("critic_override"),
         "publication_suppressed": result.get("publication_suppressed"),
         "top_candidate": candidates[0] if candidates else None,
         "duplicate": result.get("duplicate"),
+        "new_article_recommendation": result.get("new_article_recommendation"),
     }
 
 
@@ -1940,6 +1980,7 @@ def local_worker_command(args: argparse.Namespace) -> dict[str, Any]:
                 max_candidates=args.limit,
                 max_draft_attempts=args.max_draft_attempts,
                 critic_mode="required",
+                claim_policy=args.claim_policy,
                 allow_critic_rejection=False,
                 override_reason="",
                 passive_worker=True,
@@ -2536,6 +2577,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="required gates publication; advisory writes a patch but suppresses publication; off is manual dry-run only.",
     )
     local_publish_parser.add_argument(
+        "--claim-policy",
+        choices=["strict", "compendium"],
+        default="strict",
+        help="strict uses only supplied-paper findings; compendium may also propose passage-grounded background facts with preserved provenance.",
+    )
+    local_publish_parser.add_argument(
         "--allow-critic-rejection",
         action="store_true",
         help="Record a human critic-rejection override request for audit; it never bypasses the publication gate and requires --publish and --override-reason.",
@@ -2580,6 +2627,12 @@ def build_parser() -> argparse.ArgumentParser:
     local_worker_parser.add_argument("--base-ref", default="origin/main")
     local_worker_parser.add_argument("--limit", type=int, default=5)
     local_worker_parser.add_argument("--max-draft-attempts", type=int, default=3)
+    local_worker_parser.add_argument(
+        "--claim-policy",
+        choices=["strict", "compendium"],
+        default="strict",
+        help="Opt into passage-grounded background facts for queued jobs; strict remains the default.",
+    )
     local_worker_parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR / "local-jobs"))
     local_worker_parser.add_argument(
         "--publish",

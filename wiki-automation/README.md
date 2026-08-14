@@ -191,3 +191,15 @@ mandatory. The passive worker has no override.
 Draft PRs separate validated critic findings from rejected observations. The
 latter are labeled non-blocking and include the validation errors that prevented
 them from influencing the publication decision.
+
+The default `--claim-policy strict` proposes only direct findings of the
+supplied paper. Opt-in `--claim-policy compendium` may additionally extract
+target-specific background facts from full-text Introduction and Discussion
+passages. Each background fact must retain its exact passage, section, claim
+type, evidence scope, and any exact earlier reference cited by the passage.
+Full-text discovery matches primary page identity, not generic tags; unsupported
+claims, missing provenance, mere mentions, and wrong-entity placement remain
+gating failures. An animal-scoped compendium claim may use a normal heading only
+when the rendered proposal includes the mandatory animal/preclinical warning.
+Neither policy creates articles, merges changes, or publishes without
+`--publish` and every applicable gate passing.

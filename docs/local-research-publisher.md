@@ -43,10 +43,12 @@ The publisher:
    tag, and path identity matches; abstract/body overlap ranks an eligible page
    but cannot make an unrelated page eligible by itself;
 5. asks the local model for a structured plan containing one or more separate
-   target proposals, each with its own claims, evidence scopes, rationale, and
-   explicit exclusions;
-6. requires each proposed bullet to carry an exact source quote and checks that
-   the bullet remains near-verbatim;
+   target proposals, each with its own primary target entity, claims, evidence
+   scopes, rationale, and explicit exclusions;
+6. requires each proposed bullet to carry an exact contiguous source passage
+   and checks that the bullet remains near-verbatim; compendium claims also
+   identify the source section and distinguish a supplied-paper finding from a
+   background fact summarized by that paper;
 7. runs separate target-placement and evidence-support reviews for every
    proposed target against that candidate's metadata and Markdown only after
    the complete structured plan passes deterministic validation;
@@ -71,12 +73,52 @@ identity. When no existing page is entity- and scope-compatible, the report is
 `needs_review` and contains a structured, human-only new-article recommendation;
 the publisher does not create or publish that article.
 
+Wrong-entity and mere-mention placements remain gating failures. The exact
+passage for every target must assert that target's primary title/path entity;
+tag overlap is not sufficient for a target discovered only from full text. In
+particular, a clementine/pink-grapefruit or generic citrus blend cannot be filed
+under Bergamot.
+
 `rat`, `rats`, `mouse`, and `mice` are explicit preclinical cues, alongside
-animal/preclinical/in-vivo labels. Preclinical claims require `animal` evidence
-scope and an explicit Animal Evidence, Animal Models, or Preclinical Evidence
-heading context. Near-verbatim validation compares normalized word-token
-sequences with automatic junk suppression disabled, making the threshold stable
-for long or repetitive source text.
+animal/preclinical/in-vivo labels. Under the default strict policy, preclinical
+claims require `animal` evidence scope and an explicit Animal Evidence, Animal
+Models, or Preclinical Evidence heading context. Near-verbatim validation
+compares normalized word-token sequences with automatic junk suppression
+disabled, making the threshold stable for long or repetitive source text.
+
+### Claim policies
+
+`--claim-policy strict` is the default and preserves the core-study workflow.
+It proposes supplied-paper findings only. An animal/preclinical supplied paper
+still requires `animal` scope and an Animal Evidence, Animal Models, or
+Preclinical Evidence heading context.
+
+`--claim-policy compendium` opts into background-fact extraction from the full
+text, including useful Introduction and Discussion passages. Full text may
+discover additional candidate pages only through their primary title/path
+identity. It does not make a mention publishable: every target receives its own
+exact, near-verbatim, entity-supporting passage and independent placement and
+evidence reviews.
+
+Every compendium bullet records:
+
+- `claim_kind`: `source_finding` or `background_fact`;
+- the exact `source_quote` and `source_section`;
+- the target's primary `target_entity` and the claim-specific evidence scope;
+- and, when the passage cites earlier work, `cited_references` entries retaining
+  every exact citation marker, exact reference-list entry, and source-provided
+  URL.
+
+Missing or invented passage/reference provenance is a deterministic rejection.
+Published background bullets receive their own footnote containing the supplied
+paper metadata, exact source passage, section, and earlier cited reference, so
+the secondary provenance is not mistaken for a direct finding. Direct findings
+remain labeled with the supplied paper's actual study type.
+
+In compendium mode, an animal-scoped claim may use an otherwise appropriate
+existing heading. When the heading does not itself say Animal/Preclinical, the
+renderer inserts a mandatory, validated animal/preclinical evidence warning.
+This relaxation does not change the evidence scope or imply human efficacy.
 
 For paths under `Natural Healing/`,
 `Research/docs/natural-healing-content-style-guide.md` is authoritative. Its
@@ -90,6 +132,13 @@ without pushing anything:
 ```bash
 ./agent-workflow local-publish "https://example.org/article" \
   --alert-name "Quercetin"
+```
+
+Opt into personal-compendium background facts explicitly:
+
+```bash
+./agent-workflow local-publish "https://example.org/full-text-article" \
+  --claim-policy compendium
 ```
 
 After reviewing pilot output, allow a validated draft PR:
@@ -151,6 +200,7 @@ Process one job without publishing, or enable draft PR publication:
 ```bash
 ./agent-workflow local-worker --max-jobs 1
 ./agent-workflow local-worker --max-jobs 1 --publish
+./agent-workflow local-worker --max-jobs 1 --claim-policy compendium
 ```
 
 Jobs use atomic leases and retain state/event history. The terminal states
@@ -171,9 +221,10 @@ uv run --directory gmail-reader gmail-reader \
 budget was exhausted. Every transition is appended to
 `publication_job_events`.
 
-The passive worker always uses `critic-mode=required`. It exposes no critic
-override flags, and the publisher also rejects an override when invoked with
-the internal passive-worker context.
+The passive worker always uses `critic-mode=required`. Its claim policy remains
+`strict` unless the operator explicitly supplies `--claim-policy compendium`.
+It exposes no critic override flags, and the publisher also rejects an override
+when invoked with the internal passive-worker context.
 
 Historical article rows can be linked to canonical papers in bounded batches.
 The command is a dry run unless `--apply` is explicit:
