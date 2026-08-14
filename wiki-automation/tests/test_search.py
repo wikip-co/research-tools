@@ -91,6 +91,34 @@ class SearchArticlesTests(unittest.TestCase):
         )
         self.assertEqual(matches[0]["path"], "Natural Healing/Chemicals/quercetin.md")
 
+    def test_rat_citrus_blend_does_not_match_bergamot_from_generic_terms(self) -> None:
+        articles = [
+            ArticleRecord(
+                path="Natural Healing/Herbs/bergamot.md",
+                title="Bergamot",
+                stem="bergamot",
+                tags=["Citrus", "Metabolic Health"],
+                permalink=None,
+                body=(
+                    "Bergamot is a citrus fruit. Animal studies discuss metabolic "
+                    "effects and supplementation in rats."
+                ),
+            )
+        ]
+        matches = research_match_candidates(
+            articles,
+            title=(
+                "Effects of a clementine and pink grapefruit blend on metabolic "
+                "alterations in rats"
+            ),
+            abstract=(
+                "The clementine and pink grapefruit blend was administered to rats "
+                "with diet-induced metabolic alterations."
+            ),
+            keywords="clementine; pink grapefruit; citrus blend; metabolic",
+        )
+        self.assertEqual(matches, [])
+
 
 if __name__ == "__main__":
     unittest.main()
