@@ -100,6 +100,7 @@ PUBLICATION_JOB_STATES = (
     "matching",
     "drafting",
     "validating",
+    "validated",
     "needs_review",
     "publishing",
     "pr_open",
@@ -109,10 +110,20 @@ PUBLICATION_JOB_STATES = (
     "failed",
 )
 PUBLICATION_JOB_TERMINAL_STATES = {"pr_open", "duplicate", "rejected", "failed"}
+PUBLICATION_JOB_STOPPED_STATES = {*PUBLICATION_JOB_TERMINAL_STATES, "needs_review", "validated"}
+DEFAULT_RESEARCH_DOMAIN = "Natural Healing"
+PUBLICATION_CLAIM_POLICIES = {"integrated", "strict", "compendium"}
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def normalize_research_domain(value: str) -> str:
+    domain = re.sub(r"\s+", " ", value).strip()
+    if not domain or domain in {".", ".."} or "/" in domain or "\\" in domain:
+        raise ValueError("domain must be one top-level content directory name")
+    return domain
 
 
 def is_open_access_url(url: str) -> bool:
@@ -414,6 +425,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     enqueue_parser.add_argument("identifier", help="Article key or article URL.")
     enqueue_parser.add_argument("--max-attempts", type=int, default=3)
+    enqueue_parser.add_argument("--domain", required=True)
+    enqueue_parser.add_argument(
+        "--claim-policy", choices=["integrated", "strict"], default="integrated"
+    )
 
     enqueue_backlog_parser = subparsers.add_parser(
         "enqueue-publication-backlog",
@@ -423,6 +438,10 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue_backlog_parser.add_argument("--min-score", type=int, default=12)
     enqueue_backlog_parser.add_argument("--limit", type=int, default=10)
     enqueue_backlog_parser.add_argument("--max-attempts", type=int, default=3)
+    enqueue_backlog_parser.add_argument("--domain", required=True)
+    enqueue_backlog_parser.add_argument(
+        "--claim-policy", choices=["integrated", "strict"], default="integrated"
+    )
 
     claim_parser = subparsers.add_parser(
         "claim-publication",
@@ -453,6 +472,14 @@ def build_parser() -> argparse.ArgumentParser:
     update_job_parser.add_argument("--pr", default="")
     update_job_parser.add_argument("--error", default="")
     update_job_parser.add_argument("--result-json", default="")
+    update_job_parser.add_argument("--run-id", default="")
+
+    requeue_job_parser = subparsers.add_parser(
+        "requeue-publication",
+        help="Explicitly reset a stopped publication job for another run.",
+    )
+    requeue_job_parser.add_argument("job_id", type=int)
+    requeue_job_parser.add_argument("--reason", required=True)
 
     backfill_parser = subparsers.add_parser(
         "backfill-paper-keys",
@@ -603,6 +630,7 @@ def ensure_db(path: Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS articles (
             article_key TEXT PRIMARY KEY,
             paper_key TEXT,
+            domain TEXT NOT NULL DEFAULT 'Natural Healing',
             message_id TEXT NOT NULL,
             alert_name TEXT NOT NULL,
             rank_in_email INTEGER NOT NULL,
@@ -660,12 +688,17 @@ def ensure_db(path: Path) -> sqlite3.Connection:
             article_key TEXT NOT NULL,
             paper_key TEXT,
             source_url TEXT NOT NULL,
+            canonical_source_url TEXT,
             alert_name TEXT,
+            domain TEXT NOT NULL DEFAULT 'Natural Healing',
+            claim_policy TEXT NOT NULL DEFAULT 'integrated',
             state TEXT NOT NULL DEFAULT 'queued',
             attempt_count INTEGER NOT NULL DEFAULT 0,
             max_attempts INTEGER NOT NULL DEFAULT 3,
             lease_owner TEXT,
             lease_expires_at TEXT,
+            next_run_at TEXT,
+            run_id TEXT,
             packet_path TEXT,
             target_path TEXT,
             branch TEXT,
@@ -700,6 +733,7 @@ def ensure_db(path: Path) -> sqlite3.Connection:
         "ALTER TABLE articles ADD COLUMN paper_key TEXT",
         "ALTER TABLE articles ADD COLUMN is_open_access INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE articles ADD COLUMN processed_at TEXT",
+        "ALTER TABLE articles ADD COLUMN domain TEXT NOT NULL DEFAULT 'Natural Healing'",
         "ALTER TABLE papers ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'discovered'",
         "ALTER TABLE papers ADD COLUMN workflow_state_updated_at TEXT",
         "ALTER TABLE papers ADD COLUMN scraped_at TEXT",
@@ -709,6 +743,11 @@ def ensure_db(path: Path) -> sqlite3.Connection:
         "ALTER TABLE papers ADD COLUMN pr_opened_at TEXT",
         "ALTER TABLE papers ADD COLUMN merged_at TEXT",
         "ALTER TABLE papers ADD COLUMN archived_at TEXT",
+        "ALTER TABLE publication_jobs ADD COLUMN canonical_source_url TEXT",
+        "ALTER TABLE publication_jobs ADD COLUMN domain TEXT NOT NULL DEFAULT 'Natural Healing'",
+        "ALTER TABLE publication_jobs ADD COLUMN claim_policy TEXT NOT NULL DEFAULT 'integrated'",
+        "ALTER TABLE publication_jobs ADD COLUMN next_run_at TEXT",
+        "ALTER TABLE publication_jobs ADD COLUMN run_id TEXT",
     ):
         try:
             conn.execute(migration)
@@ -736,7 +775,10 @@ def ensure_db(path: Path) -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_papers_workflow_state ON papers(workflow_state)"
     )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_publication_jobs_state ON publication_jobs(state, lease_expires_at, created_at)"
+        "CREATE INDEX IF NOT EXISTS idx_publication_jobs_state ON publication_jobs(state, next_run_at, lease_expires_at, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_publication_jobs_claimable ON publication_jobs(state, next_run_at, lease_expires_at, created_at)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_publication_job_events_job ON publication_job_events(job_id, event_id)"
@@ -753,6 +795,15 @@ def ensure_db(path: Path) -> sqlite3.Connection:
         CREATE UNIQUE INDEX IF NOT EXISTS idx_publication_jobs_active_source
         ON publication_jobs(source_url)
         WHERE state NOT IN ('pr_open', 'duplicate', 'rejected', 'failed')
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_publication_jobs_active_canonical_source
+        ON publication_jobs(canonical_source_url)
+        WHERE canonical_source_url IS NOT NULL
+          AND canonical_source_url != ''
+          AND state NOT IN ('pr_open', 'duplicate', 'rejected', 'failed')
         """
     )
     conn.commit()
@@ -1909,9 +1960,14 @@ def enqueue_publication_job(
     db_path: Path,
     identifier: str,
     max_attempts: int,
+    domain: str = DEFAULT_RESEARCH_DOMAIN,
+    claim_policy: str = "integrated",
 ) -> dict[str, Any]:
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
+    domain = normalize_research_domain(domain)
+    if claim_policy not in PUBLICATION_CLAIM_POLICIES:
+        raise ValueError("invalid claim_policy")
     conn = ensure_db(db_path)
     row = conn.execute(
         """
@@ -1931,19 +1987,28 @@ def enqueue_publication_job(
         conn.close()
         raise ValueError("Article has no source URL")
     now = utc_now_iso()
+    canonical_source_url = canonicalize_url(source_url)
+    conn.execute(
+        "UPDATE articles SET domain = ?, updated_at = ? WHERE article_key = ?",
+        (domain, now, row["article_key"]),
+    )
     try:
         cursor = conn.execute(
             """
             INSERT INTO publication_jobs (
-                article_key, paper_key, source_url, alert_name, state,
+                article_key, paper_key, source_url, canonical_source_url,
+                alert_name, domain, claim_policy, state,
                 max_attempts, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
             """,
             (
                 row["article_key"],
                 row["paper_key"],
                 source_url,
+                canonical_source_url,
                 row["alert_name"],
+                domain,
+                claim_policy,
                 max_attempts,
                 now,
                 now,
@@ -1953,11 +2018,11 @@ def enqueue_publication_job(
         active = conn.execute(
             """
             SELECT * FROM publication_jobs
-            WHERE (article_key = ? OR source_url = ?)
+            WHERE (article_key = ? OR source_url = ? OR canonical_source_url = ?)
               AND state NOT IN ('pr_open', 'duplicate', 'rejected', 'failed')
             ORDER BY job_id DESC LIMIT 1
             """,
-            (row["article_key"], source_url),
+            (row["article_key"], source_url, canonical_source_url),
         ).fetchone()
         conn.close()
         if active:
@@ -1969,7 +2034,13 @@ def enqueue_publication_job(
         INSERT INTO publication_job_events (job_id, from_state, to_state, detail_json, created_at)
         VALUES (?, NULL, 'queued', ?, ?)
         """,
-        (job_id, json.dumps({"title": row["title"]}), now),
+        (
+            job_id,
+            json.dumps(
+                {"title": row["title"], "domain": domain, "claim_policy": claim_policy}
+            ),
+            now,
+        ),
     )
     conn.commit()
     job = conn.execute("SELECT * FROM publication_jobs WHERE job_id = ?", (job_id,)).fetchone()
@@ -1984,9 +2055,14 @@ def enqueue_publication_backlog(
     min_score: int,
     limit: int,
     max_attempts: int,
+    domain: str = DEFAULT_RESEARCH_DOMAIN,
+    claim_policy: str = "integrated",
 ) -> dict[str, Any]:
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
+    domain = normalize_research_domain(domain)
+    if claim_policy not in PUBLICATION_CLAIM_POLICIES:
+        raise ValueError("invalid claim_policy")
     conn = ensure_db(db_path)
     rows = conn.execute(
         """
@@ -1995,6 +2071,7 @@ def enqueue_publication_backlog(
         FROM articles a
         LEFT JOIN papers p ON p.paper_key = a.paper_key
         WHERE a.status = ?
+          AND a.domain = ?
           AND a.score >= ?
           AND a.processed_at IS NULL
           AND COALESCE(p.workflow_state, 'discovered') NOT IN
@@ -2008,7 +2085,7 @@ def enqueue_publication_backlog(
         ORDER BY a.score DESC, a.created_at, a.article_key
         LIMIT ?
         """,
-        (status, min_score, max(limit, 0) * 5),
+        (status, domain, min_score, max(limit, 0) * 5),
     ).fetchall()
     now = utc_now_iso()
     queued: list[dict[str, Any]] = []
@@ -2025,16 +2102,28 @@ def enqueue_publication_backlog(
         if canonical_source in seen_source_urls:
             continue
         seen_source_urls.add(canonical_source)
+        active = conn.execute(
+            """
+            SELECT job_id FROM publication_jobs
+            WHERE (source_url = ? OR canonical_source_url = ?)
+              AND state NOT IN ('pr_open', 'duplicate', 'rejected', 'failed')
+            LIMIT 1
+            """,
+            (source_url, canonical_source),
+        ).fetchone()
+        if active:
+            continue
         cursor = conn.execute(
             """
             INSERT INTO publication_jobs (
-                article_key, paper_key, source_url, alert_name, state,
+                article_key, paper_key, source_url, canonical_source_url,
+                alert_name, domain, claim_policy, state,
                 max_attempts, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
             """,
             (
-                row["article_key"], row["paper_key"], source_url,
-                row["alert_name"], max_attempts, now, now,
+                row["article_key"], row["paper_key"], source_url, canonical_source,
+                row["alert_name"], domain, claim_policy, max_attempts, now, now,
             ),
         )
         job_id = int(cursor.lastrowid)
@@ -2044,12 +2133,29 @@ def enqueue_publication_backlog(
                 (job_id, from_state, to_state, detail_json, created_at)
             VALUES (?, NULL, 'queued', ?, ?)
             """,
-            (job_id, json.dumps({"source": "backlog", "score": row["score"]}), now),
+            (
+                job_id,
+                json.dumps(
+                    {
+                        "source": "backlog",
+                        "score": row["score"],
+                        "domain": domain,
+                        "claim_policy": claim_policy,
+                    }
+                ),
+                now,
+            ),
         )
         queued.append({"job_id": job_id, "article_key": row["article_key"], "title": row["title"], "score": row["score"]})
     conn.commit()
     conn.close()
-    return {"queued_count": len(queued), "skipped_without_url": skipped, "jobs": queued}
+    return {
+        "domain": domain,
+        "claim_policy": claim_policy,
+        "queued_count": len(queued),
+        "skipped_without_url": skipped,
+        "jobs": queued,
+    }
 
 
 def claim_publication_job(
@@ -2072,9 +2178,13 @@ def claim_publication_job(
         SELECT * FROM publication_jobs
         WHERE attempt_count < max_attempts
           AND (
-            state IN ('queued', 'retry')
+            state = 'queued'
             OR (
-              state NOT IN ('pr_open', 'duplicate', 'rejected', 'failed', 'needs_review')
+              state = 'retry'
+              AND (next_run_at IS NULL OR next_run_at <= ?)
+            )
+            OR (
+              state NOT IN ('pr_open', 'duplicate', 'rejected', 'failed', 'needs_review', 'validated')
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at <= ?
             )
@@ -2082,7 +2192,7 @@ def claim_publication_job(
         ORDER BY created_at, job_id
         LIMIT 1
         """,
-        (now,),
+        (now, now),
     ).fetchone()
     if not row:
         conn.commit()
@@ -2093,7 +2203,8 @@ def claim_publication_job(
         UPDATE publication_jobs
         SET state = 'leased', attempt_count = attempt_count + 1,
             lease_owner = ?, lease_expires_at = ?, updated_at = ?,
-            started_at = COALESCE(started_at, ?), error = NULL
+            started_at = COALESCE(started_at, ?), error = NULL,
+            next_run_at = NULL, finished_at = NULL
         WHERE job_id = ?
         """,
         (worker, expires, now, now, row["job_id"]),
@@ -2140,6 +2251,7 @@ def set_publication_job_state(
         "pr": "pr_url",
         "error": "error",
         "result_json": "result_json",
+        "run_id": "run_id",
     }
     assignments = ["state = ?", "updated_at = ?"]
     params: list[Any] = [state, now]
@@ -2153,11 +2265,28 @@ def set_publication_job_state(
         assignments.append(f"{column} = ?")
         params.append(value)
         detail[key] = value
-    if state in PUBLICATION_JOB_TERMINAL_STATES:
+    if state == "retry":
+        delay_seconds = min(300 * (2 ** max(int(row["attempt_count"]) - 1, 0)), 21600)
+        next_run_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        assignments.extend(
+            [
+                "lease_owner = NULL",
+                "lease_expires_at = NULL",
+                "next_run_at = ?",
+                "finished_at = NULL",
+            ]
+        )
+        params.append(next_run_at)
+        detail["retry_delay_seconds"] = delay_seconds
+        detail["next_run_at"] = next_run_at
+    elif state in PUBLICATION_JOB_STOPPED_STATES:
         assignments.extend(["finished_at = ?", "lease_owner = NULL", "lease_expires_at = NULL"])
         params.append(now)
-    elif state in {"retry", "needs_review"}:
-        assignments.extend(["lease_owner = NULL", "lease_expires_at = NULL"])
+        assignments.append("next_run_at = NULL")
+    else:
+        assignments.append("next_run_at = NULL")
     params.append(job_id)
     conn.execute(
         f"UPDATE publication_jobs SET {', '.join(assignments)} WHERE job_id = ?",
@@ -2182,6 +2311,68 @@ def set_publication_job_state(
     updated = conn.execute("SELECT * FROM publication_jobs WHERE job_id = ?", (job_id,)).fetchone()
     conn.close()
     return {"job": dict(updated)}
+
+
+def requeue_publication_job(
+    *, db_path: Path, job_id: int, reason: str
+) -> dict[str, Any]:
+    reason = reason.strip()
+    if not reason:
+        raise ValueError("requeue reason must not be empty")
+    conn = ensure_db(db_path)
+    conn.execute("BEGIN IMMEDIATE")
+    row = conn.execute(
+        "SELECT * FROM publication_jobs WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise ValueError(f"Publication job not found: {job_id}")
+    allowed_states = {"validated", "needs_review", "failed", "rejected"}
+    if row["state"] not in allowed_states:
+        conn.close()
+        raise ValueError(
+            f"Publication job {job_id} cannot be requeued from state {row['state']}"
+        )
+    now = utc_now_iso()
+    prior_outputs = {
+        key: row[key]
+        for key in ("run_id", "packet_path", "target_path", "branch", "commit_sha", "pr_url")
+        if row[key]
+    }
+    conn.execute(
+        """
+        UPDATE publication_jobs
+        SET state = 'queued', attempt_count = 0,
+            lease_owner = NULL, lease_expires_at = NULL, next_run_at = NULL,
+            run_id = NULL, packet_path = NULL, target_path = NULL,
+            branch = NULL, commit_sha = NULL, pr_url = NULL,
+            result_json = NULL, error = NULL, started_at = NULL,
+            finished_at = NULL, updated_at = ?
+        WHERE job_id = ?
+        """,
+        (now, job_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO publication_job_events
+            (job_id, from_state, to_state, detail_json, created_at)
+        VALUES (?, ?, 'queued', ?, ?)
+        """,
+        (
+            job_id,
+            row["state"],
+            json.dumps(
+                {"action": "explicit_requeue", "reason": reason, "prior_outputs": prior_outputs}
+            ),
+            now,
+        ),
+    )
+    conn.commit()
+    updated = conn.execute(
+        "SELECT * FROM publication_jobs WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    conn.close()
+    return {"job": dict(updated), "prior_outputs": prior_outputs}
 
 
 def list_publication_jobs(*, db_path: Path, state: str, limit: int) -> dict[str, Any]:
@@ -2390,6 +2581,8 @@ def main(argv: list[str] | None = None) -> int:
                 db_path=db_path,
                 identifier=args.identifier,
                 max_attempts=args.max_attempts,
+                domain=args.domain,
+                claim_policy=args.claim_policy,
             )
         elif args.command == "enqueue-publication-backlog":
             result = enqueue_publication_backlog(
@@ -2398,6 +2591,8 @@ def main(argv: list[str] | None = None) -> int:
                 min_score=args.min_score,
                 limit=args.limit,
                 max_attempts=args.max_attempts,
+                domain=args.domain,
+                claim_policy=args.claim_policy,
             )
         elif args.command == "claim-publication":
             result = claim_publication_job(
@@ -2425,6 +2620,13 @@ def main(argv: list[str] | None = None) -> int:
                 pr=args.pr,
                 error=args.error,
                 result_json=args.result_json,
+                run_id=args.run_id,
+            )
+        elif args.command == "requeue-publication":
+            result = requeue_publication_job(
+                db_path=db_path,
+                job_id=args.job_id,
+                reason=args.reason,
             )
         elif args.command == "backfill-paper-keys":
             result = backfill_paper_keys(

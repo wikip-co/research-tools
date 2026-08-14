@@ -39,16 +39,17 @@ The publisher:
 2. validates retrieval plus enriched citation metadata before model use;
 3. checks duplicates using the DOI, DOI URL, resolved URL, requested URL, and
    original intake URL rather than trusting one identifier;
-4. retrieves candidate content homes using entity-aware title, keyword, alert,
-   tag, and path identity matches; abstract/body overlap ranks an eligible page
-   but cannot make an unrelated page eligible by itself;
+4. restricts retrieval to the required top-level domain, then establishes page
+   eligibility from exact title/stem entity phrases; title, keyword, and alert
+   matches carry the most weight, while tags, category folders, and body
+   overlap only rank an already eligible page;
 5. asks the local model for a structured plan containing one or more separate
    target proposals, each with its own primary target entity, claims, evidence
    scopes, rationale, and explicit exclusions;
-6. requires each proposed bullet to carry an exact contiguous source passage
-   and checks that the bullet remains near-verbatim; compendium claims also
-   identify the source section and distinguish a supplied-paper finding from a
-   background fact summarized by that paper;
+6. requires each proposed bullet to carry an exact contiguous source passage,
+   source section, claim kind, and evidence scope, and checks that the bullet
+   remains near-verbatim; background claims also retain every associated
+   reference record;
 7. runs separate target-placement and evidence-support reviews for every
    proposed target against that candidate's metadata and Markdown only after
    the complete structured plan passes deterministic validation;
@@ -61,17 +62,24 @@ The publisher:
 9. retains every repair attempt, complete critic feedback, and the best
    deterministic-valid attempt rather than replacing useful history with a
    later invalid repair;
-10. applies only a validated plan in an isolated git worktree based on
-   `origin/main`; and
-11. opens a draft PR only when `--publish` is supplied and every target's gate
-   passes.
+10. may mix guarded existing-page updates with creation of focused new entity
+    pages below the requested domain when no exact page exists;
+11. applies only a validated plan in an isolated git worktree based on
+    `origin/main`; and
+12. opens a draft PR only when `--publish` is supplied and every target's gate
+    passes.
 
 A single paper may have several target proposals, but each claim belongs to one
 target and every target is validated and criticized independently. Broad study
-vocabulary (for example `citrus` or `metabolic`) is not treated as entity
-identity. When no existing page is entity- and scope-compatible, the report is
-`needs_review` and contains a structured, human-only new-article recommendation;
-the publisher does not create or publish that article.
+vocabulary (for example `metabolic`) is not treated as entity identity. When no
+existing page is compatible, the planner may propose a safe new Markdown path
+below the required domain—for example
+`Natural Healing/Fruits/Citrus/citrus.md`. A new page requires a source-grounded
+lead, focused tags including its exact entity/title, category rationale, at
+least one direct finding, exact quotes, both critics, rendered-Markdown
+validation, and the same draft-PR gate
+as an existing-page update. If those conditions are not met, it stops at
+`needs_review`.
 
 Wrong-entity and mere-mention placements remain gating failures. The exact
 passage for every target must assert that target's primary title/path entity;
@@ -80,27 +88,22 @@ particular, a clementine/pink-grapefruit or generic citrus blend cannot be filed
 under Bergamot.
 
 `rat`, `rats`, `mouse`, and `mice` are explicit preclinical cues, alongside
-animal/preclinical/in-vivo labels. Under the default strict policy, preclinical
-claims require `animal` evidence scope and an explicit Animal Evidence, Animal
-Models, or Preclinical Evidence heading context. Near-verbatim validation
+animal/preclinical/in-vivo labels. Direct preclinical findings require `animal`
+evidence scope. If a suitable heading is not explicitly animal/preclinical, the
+integrated renderer inserts and validates an evidence warning. Near-verbatim validation
 compares normalized word-token sequences with automatic junk suppression
 disabled, making the threshold stable for long or repetitive source text.
 
-### Claim policies
+### Integrated claim policy and prompt context
 
-`--claim-policy strict` is the default and preserves the core-study workflow.
-It proposes supplied-paper findings only. An animal/preclinical supplied paper
-still requires `animal` scope and an Animal Evidence, Animal Models, or
-Preclinical Evidence heading context.
+The default `integrated` policy combines direct findings from the supplied
+paper with useful background facts from claim-bearing full-text sections such
+as the Introduction and Discussion. There is no separate compendium workflow.
+The legacy stored value `compendium` is interpreted as integrated behavior for
+old jobs, while `--claim-policy strict` remains available only for focused
+direct-finding diagnostics.
 
-`--claim-policy compendium` opts into background-fact extraction from the full
-text, including useful Introduction and Discussion passages. Full text may
-discover additional candidate pages only through their primary title/path
-identity. It does not make a mention publishable: every target receives its own
-exact, near-verbatim, entity-supporting passage and independent placement and
-evidence reviews.
-
-Every compendium bullet records:
+Every integrated bullet records:
 
 - `claim_kind`: `source_finding` or `background_fact`;
 - the exact `source_quote` and `source_section`;
@@ -110,15 +113,32 @@ Every compendium bullet records:
   URL.
 
 Missing or invented passage/reference provenance is a deterministic rejection.
+Global exclusions must describe material genuinely omitted from every target;
+reasons saying a passage was already captured, integrated, or not excluded are
+also rejected as contradictory.
 Published background bullets receive their own footnote containing the supplied
 paper metadata, exact source passage, section, and earlier cited reference, so
 the secondary provenance is not mistaken for a direct finding. Direct findings
 remain labeled with the supplied paper's actual study type.
 
-In compendium mode, an animal-scoped claim may use an otherwise appropriate
+Under the integrated policy, an animal-scoped claim may use an otherwise appropriate
 existing heading. When the heading does not itself say Animal/Preclinical, the
 renderer inserts a mandatory, validated animal/preclinical evidence warning.
 This relaxation does not change the evidence scope or imply human efficacy.
+
+Increasing the llama.cpp context window is not the primary provenance fix. The
+current service already has a large context, and sending an unstructured full
+article plus every full candidate page makes associations less reliable. The
+publisher instead normalizes claim-bearing sections and reference-list entries,
+keeps exact citation markers with their records, caps total candidate context,
+and reports the actual source/candidate character budgets used. The active
+262,144-token server remains ample headroom for this bounded prompt.
+
+Draft generation has a separate 10,000-token completion budget. A response that
+reaches that ceiling is recorded as truncated and fails closed; it is not sent
+through a futile syntax repair. If a response stops normally but contains
+malformed JSON, the raw output, SHA-256, usage, and finish reason are retained
+and one syntax-only repair call is allowed before deterministic validation.
 
 For paths under `Natural Healing/`,
 `Research/docs/natural-healing-content-style-guide.md` is authoritative. Its
@@ -126,26 +146,33 @@ near-verbatim, bullet-first style is intentionally preserved.
 
 ## Ad-hoc Usage
 
-Dry-run first. This writes a JSON report, proposed patch, and isolated worktree
-without pushing anything:
+Dry-run first. `--domain` is required so retrieval and any new path stay within
+one top-level content domain:
 
 ```bash
 ./agent-workflow local-publish "https://example.org/article" \
-  --alert-name "Quercetin"
+  --domain "Natural Healing" --alert-name "Quercetin"
 ```
 
-Opt into personal-compendium background facts explicitly:
+Every invocation writes a new immutable
+`out/runs/<timestamp>-<source-slug>-<source-hash>/` directory. It contains
+`source.md`, `packet.json`, `report.json`, and `proposed.patch` when rendering
+succeeds. The report records start/end/duration, repository revisions, options,
+domain, candidate scoring and context budgets, duplicate checks, each model
+call's duration and token usage, every draft/critic attempt, malformed raw
+model output and format-repair history when applicable, artifact paths, and an
+explicit `publication_outcome`. Re-running a source never overwrites a prior
+run.
 
-```bash
-./agent-workflow local-publish "https://example.org/full-text-article" \
-  --claim-policy compendium
-```
+The CLI also emits JSON progress records to stderr for scraping, matching, each
+draft/format-repair/deterministic-validation/critic attempt, and final render
+validation so a long local generation is distinguishable from a stalled job.
 
 After reviewing pilot output, allow a validated draft PR:
 
 ```bash
 ./agent-workflow local-publish "https://example.org/article" \
-  --alert-name "Quercetin" --publish
+  --domain "Natural Healing" --alert-name "Quercetin" --publish
 ```
 
 ### Critic modes
@@ -153,7 +180,7 @@ After reviewing pilot output, allow a validated draft PR:
 `required` is the default and is the only mode that can publish normally:
 
 ```bash
-./agent-workflow local-publish URL --critic-mode required
+./agent-workflow local-publish URL --domain "Natural Healing" --critic-mode required
 ```
 
 `advisory` still runs both reviews and records their findings. It may produce a
@@ -161,14 +188,14 @@ validated patch after deterministic gates pass, but it suppresses commit, push,
 and PR creation even when `--publish` is present:
 
 ```bash
-./agent-workflow local-publish URL --critic-mode advisory --publish
+./agent-workflow local-publish URL --domain "Natural Healing" --critic-mode advisory --publish
 ```
 
 `off` skips both critic calls and is limited to manual ad-hoc dry runs. Combining
 it with `--publish` is an error:
 
 ```bash
-./agent-workflow local-publish URL --critic-mode off
+./agent-workflow local-publish URL --domain "Natural Healing" --critic-mode off
 ```
 
 After a human reviews the packet, selected targets, plan, deterministic results,
@@ -176,7 +203,7 @@ and critic findings, an override request can be recorded only with both an
 explicit flag and audit reason:
 
 ```bash
-./agent-workflow local-publish URL --critic-mode required --publish \
+./agent-workflow local-publish URL --domain "Natural Healing" --critic-mode required --publish \
   --allow-critic-rejection \
   --override-reason "Human reviewed target and evidence"
 ```
@@ -191,8 +218,9 @@ unavailable to `local-worker`, and no path auto-merges.
 Queue one known row or a score-ordered batch:
 
 ```bash
-./agent-workflow enqueue-local ARTICLE_KEY
-./agent-workflow enqueue-local-backlog --min-score 12 --limit 10
+./agent-workflow enqueue-local ARTICLE_KEY --domain "Natural Healing"
+./agent-workflow enqueue-local-backlog --domain "Natural Healing" \
+  --min-score 12 --limit 10
 ```
 
 Process one job without publishing, or enable draft PR publication:
@@ -200,10 +228,13 @@ Process one job without publishing, or enable draft PR publication:
 ```bash
 ./agent-workflow local-worker --max-jobs 1
 ./agent-workflow local-worker --max-jobs 1 --publish
-./agent-workflow local-worker --max-jobs 1 --claim-policy compendium
 ```
 
-Jobs use atomic leases and retain state/event history. The terminal states
+The domain and claim policy are persisted when the job is enqueued; the worker
+does not reinterpret them from whichever flags happen to be present later.
+Canonicalized source URLs prevent query-string, scheme, or `www` variants from
+creating parallel active jobs. Jobs use atomic leases and retain state/event
+history. The terminal states
 `pr_open`, `duplicate`, and `rejected` mark an article processed. A failure does
 not. Exhausted failures remain visible for diagnosis instead of disappearing
 from the backlog.
@@ -216,15 +247,24 @@ uv run --directory gmail-reader gmail-reader \
   publication-jobs --state all --limit 50
 ```
 
-`needs_review` preserves the article as unprocessed for human judgment.
-`retry` carries an attempt count and `next_run_at`; `failed` means the retry
-budget was exhausted. Every transition is appended to
-`publication_job_events`.
+`validated` is a successful dry run and is distinct from `needs_review`.
+Neither is automatically claimed again. `retry` carries an attempt count and a
+real `next_run_at`; delays begin at five minutes and double up to six hours.
+`failed` means the retry budget was exhausted. To publish a reviewed dry run or
+retry a repaired stopped job, explicitly reset it with an audit reason:
 
-The passive worker always uses `critic-mode=required`. Its claim policy remains
-`strict` unless the operator explicitly supplies `--claim-policy compendium`.
-It exposes no critic override flags, and the publisher also rejects an override
-when invoked with the internal passive-worker context.
+```bash
+./agent-workflow requeue-local JOB_ID \
+  --reason "Reviewed dry-run; ready for one publication attempt"
+./agent-workflow local-worker --max-jobs 1 --publish
+```
+
+Every transition, including explicit requeue and prior artifact pointers, is
+appended to `publication_job_events`.
+
+The passive worker always uses `critic-mode=required` and the job's persisted
+integrated policy. It exposes no critic override flags, and the publisher also
+rejects an override when invoked with the internal passive-worker context.
 
 Historical article rows can be linked to canonical papers in bounded batches.
 The command is a dry run unless `--apply` is explicit:

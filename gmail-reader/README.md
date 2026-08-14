@@ -171,9 +171,10 @@ Supported command patterns:
 - Advance a paper: `gmail-reader set-paper-state <identifier> --state discovered|scraped|matched|drafted|committed|pr_open|merged [--matched-content-path PATH] [--commit SHA] [--pr URL] [--archive-path PATH] [--db PATH]`
 - Mark a paper as published/matched: `gmail-reader mark-published <identifier> --matched-content-path PATH [--commit SHA] [--pr URL] [--db PATH]`
 - Attach an archive path: `gmail-reader attach-archive <identifier> --archive-path PATH [--db PATH]`
-- Enqueue a local publication: `gmail-reader enqueue-publication <article-key-or-url> [--max-attempts N] [--db PATH]`
-- Enqueue a bounded backlog: `gmail-reader enqueue-publication-backlog [--status selected|review] [--min-score N] [--limit N] [--db PATH]`
+- Enqueue a local publication: `gmail-reader enqueue-publication <article-key-or-url> --domain "Natural Healing" [--max-attempts N] [--db PATH]`
+- Enqueue a bounded backlog: `gmail-reader enqueue-publication-backlog --domain "Natural Healing" [--status selected|review] [--min-score N] [--limit N] [--db PATH]`
 - List local publication jobs: `gmail-reader publication-jobs [--state STATE] [--limit N] [--db PATH]`
+- Requeue a reviewed stopped job: `gmail-reader requeue-publication JOB_ID --reason "..." [--db PATH]`
 - Backfill canonical paper keys: `gmail-reader backfill-paper-keys [--status STATUS] [--limit N] [--apply] [--db PATH]`
 
 Response contract:
@@ -202,9 +203,8 @@ Operational notes for agents:
 The database contains the following primary groups:
 
 - `messages`: one row per ingested Gmail message
-- `articles`: one row per parsed Scholar result with triage fields and source links
+- `articles`: one row per parsed Scholar result with domain, triage fields, source links, and optional `paper_key`
 - `papers`: one row per canonical paper identity with publish/archive state
-- `article_papers`: links alert occurrences to canonical papers
 
 The web UI adds two operational tables when first started:
 
@@ -213,7 +213,7 @@ The web UI adds two operational tables when first started:
 
 The local llama.cpp publisher adds two durable queue tables:
 
-- `publication_jobs`: source identity, state, lease owner/expiry, attempts, next run, report, patch, and PR outcome
+- `publication_jobs`: domain, canonical source identity, persisted claim policy, state, lease owner/expiry, attempts, `next_run_at`, immutable run ID/report, patch, and PR outcome
 - `publication_job_events`: append-only transition and error history
 
 Useful article columns:

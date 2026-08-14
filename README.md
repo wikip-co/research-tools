@@ -159,8 +159,8 @@ source auth-bootstrap                     # Load Google credentials
 ./agent-workflow publish-pr --draft
 
 # Production local-model path (dry run is the default)
-./agent-workflow local-publish "<url-or-pdf>"
-./agent-workflow enqueue-local-backlog --status selected --min-score 12 --limit 10
+./agent-workflow local-publish "<url-or-pdf>" --domain "Natural Healing"
+./agent-workflow enqueue-local-backlog --domain "Natural Healing" --status selected --min-score 12 --limit 10
 ./agent-workflow local-worker --max-jobs 1
 ./agent-workflow local-worker --max-jobs 1 --publish
 ```
@@ -318,21 +318,30 @@ The web-scraper now automatically detects study types (Review, Meta-Analysis, RC
 
 ### Local llama.cpp Publisher
 
-- `agent-workflow local-publish URL` runs an ad-hoc dry-run through packet,
+- `agent-workflow local-publish URL --domain "Natural Healing"` runs an ad-hoc dry-run through packet,
   retrieval, draft, split placement/evidence critics, deterministic validation,
   and isolated-worktree gates.
 - Add `--publish` to open a draft PR after every gate passes.
-- Keep the default `--claim-policy strict` for supplied-paper findings, or opt
-  into `--claim-policy compendium` to propose full-text background facts with
-  exact passage, claim-origin, entity, evidence-scope, and cited-reference
-  provenance gates.
+- A plan may update several compatible pages and create a focused new entity
+  page below the required domain when no exact page exists.
+- Every invocation has an immutable `out/runs/<run-id>/` source, packet, report,
+  and optional patch with repository, model-call, timing, and publication
+  outcome telemetry.
+- Drafts use a 10,000-token completion budget. Truncated output fails closed;
+  normally completed malformed JSON is preserved and receives at most one
+  syntax-only repair before validation.
+- The default integrated policy proposes supplied-paper findings and useful
+  full-text background facts with exact passage, claim-origin, entity,
+  evidence-scope, and cited-reference provenance gates.
 - Use `--critic-mode advisory` for patch-only review or `--critic-mode off` for
   a manual ad-hoc dry run. Only default `required` mode can publish normally.
 - A required critic rejection can be published only with the explicit audited
   `--allow-critic-rejection --override-reason "..."` pair; passive workers can
   never use it, and deterministic/citation gates still apply.
 - `enqueue-local`, `enqueue-local-backlog`, and `local-worker` provide the durable
-  SQLite queue used by the passive database workflow.
+  SQLite queue used by the passive database workflow. Jobs persist their domain
+  and policy, delay retries with `next_run_at`, and require `requeue-local` plus
+  an audit reason before a stopped dry-run job is processed again.
 - See [docs/local-research-publisher.md](docs/local-research-publisher.md) for
   packet semantics, rollout commands, and the optional systemd timers.
 

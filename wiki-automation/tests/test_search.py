@@ -170,6 +170,44 @@ class SearchArticlesTests(unittest.TestCase):
         )
         self.assertNotIn("Bergamot", {match["title"] for match in compendium})
 
+    def test_research_candidates_are_domain_scoped_and_title_weighted(self) -> None:
+        articles = [
+            ArticleRecord(
+                path="Natural Healing/Fruits/Citrus/citrus.md",
+                title="Citrus",
+                stem="citrus",
+                tags=["Fruit"],
+                permalink=None,
+                body="Citrus fruit background.",
+            ),
+            ArticleRecord(
+                path="Natural Healing/Herbs/general.md",
+                title="General Herbs",
+                stem="general",
+                tags=["Citrus", "Fruit", "Flavonoids"],
+                permalink=None,
+                body="Citrus appears repeatedly in this broad page.",
+            ),
+            ArticleRecord(
+                path="Biology/Plants/citrus.md",
+                title="Citrus",
+                stem="citrus",
+                tags=["Botany"],
+                permalink=None,
+                body="Taxonomy of the Citrus genus.",
+            ),
+        ]
+        matches = research_match_candidates(
+            articles,
+            title="Citrus fruit flavonoids and metabolic outcomes",
+            abstract="Citrus fruits contain flavonoids.",
+            keywords="citrus; fruit; flavonoids",
+            domain="Natural Healing",
+        )
+        self.assertEqual(matches[0]["path"], "Natural Healing/Fruits/Citrus/citrus.md")
+        self.assertNotIn("Biology/Plants/citrus.md", {item["path"] for item in matches})
+        self.assertNotIn("Natural Healing/Herbs/general.md", {item["path"] for item in matches})
+
 
 if __name__ == "__main__":
     unittest.main()

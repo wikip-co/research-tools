@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from wiki_automation import cli, local_publish
 from wiki_automation.local_publish import (
+    ModelOutputJSONError,
     apply_draft_plan,
+    canonical_citation_marker,
+    citation_marker_matches_reference,
     combine_critic_reviews,
     deterministic_placement_review_issues,
     duplicate_identifiers,
     format_critic_pr_audit,
     merge_duplicate_checks,
+    missing_entity_page_seed,
     run_local_publish,
     source_is_preclinical,
+    study_type_matches_packet,
     validate_critic_review,
     validate_draft_plan,
     validate_rendered_markdown,
@@ -52,6 +58,29 @@ class LocalPublishTests(unittest.TestCase):
         result = validate_source_packet(packet)
         self.assertFalse(result.ok)
         self.assertIn("captcha_page", result.issues)
+
+    def test_model_client_preserves_malformed_json_for_bounded_repair(self) -> None:
+        malformed = '{"decision": "publish_changes",}'
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {"content": malformed},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            }
+        ).encode("utf-8")
+        client = local_publish.LocalLLMClient("http://127.0.0.1:1/v1", "test")
+        with patch.object(local_publish, "urlopen", return_value=response):
+            with self.assertRaises(ModelOutputJSONError):
+                client.json_completion(system="system", user="user")
+        self.assertEqual(client.calls[0]["response_text"], malformed)
+        self.assertEqual(client.calls[0]["response_chars"], len(malformed))
+        self.assertEqual(client.calls[0]["status"], "error")
 
     def test_packet_rejects_placeholder_citation_metadata(self) -> None:
         packet = dict(self.packet)
@@ -104,6 +133,52 @@ class LocalPublishTests(unittest.TestCase):
         )
         self.assertEqual(merged["content_hit_count"], 1)
         self.assertEqual(merged["paper_result"]["paper"]["workflow_state"], "pr_open")
+
+    def test_sciencedirect_visible_marker_remains_linked_to_reference(self) -> None:
+        source_marker = "[Liu et al., 2016](#bb0115)"
+        model_marker = "[Liu et al., 2016]"
+        reference = (
+            "23. [Liu, Dong, Yang and Pan, 2016](#bbb0115)\n\n"
+            "Anti-diabetic effect of citrus pectin in diabetic rats"
+        )
+        self.assertEqual(
+            canonical_citation_marker(source_marker),
+            canonical_citation_marker(model_marker),
+        )
+        self.assertTrue(citation_marker_matches_reference(model_marker, reference))
+        self.assertFalse(
+            citation_marker_matches_reference(
+                "[Fidelix et al., 2020]", reference
+            )
+        )
+
+    def test_generic_article_type_can_be_refined_by_explicit_rat_evidence(self) -> None:
+        packet = {
+            **self.packet,
+            "study_type": "Research Article",
+            "abstract": "The citrus intervention was administered to rats for eight weeks.",
+        }
+        self.assertTrue(study_type_matches_packet("Animal Study", packet))
+        self.assertFalse(study_type_matches_packet("Human Trial", packet))
+
+    def test_existing_citrus_category_seeds_missing_catch_all_page(self) -> None:
+        seed = missing_entity_page_seed(
+            packet={
+                **self.packet,
+                "title": "A functional citrus-based food in rats",
+                "abstract": "Citrus concentrates were compared with metformin.",
+            },
+            alert_name="Citrus",
+            domain="Natural Healing",
+            category_catalog=[
+                "Natural Healing/Fruits/Citrus",
+                "Natural Healing/Fiber/Pectin",
+            ],
+            existing_paths={"Natural Healing/Fruits/Citrus/orange.md"},
+        )
+        self.assertEqual(
+            seed["suggested_path"], "Natural Healing/Fruits/Citrus/citrus.md"
+        )
 
     def test_plan_requires_exact_source_quote_and_candidate(self) -> None:
         plan = {
@@ -240,6 +315,7 @@ tags:
             "target_proposals": [
                 {
                     "target_path": "Natural Healing/quercetin.md",
+                    "target_entity": "quercetin",
                     "parent_heading": "",
                     "heading": "## Bioavailability",
                     "rationale": "The claim directly concerns quercetin.",
@@ -254,6 +330,7 @@ tags:
                 },
                 {
                     "target_path": "Health/clinical-evidence.md",
+                    "target_entity": "clinical",
                     "parent_heading": "",
                     "heading": "## Evidence Limitations",
                     "rationale": "This target covers heterogeneity in clinical evidence.",
@@ -302,15 +379,18 @@ tags:
             0.1,
         )
 
-    def test_rat_citrus_blend_yields_review_only_new_article_recommendation(self) -> None:
+    def test_missing_citrus_page_is_created_in_existing_category(self) -> None:
+        lead_quote = (
+            "Citrus fruits include clementines and grapefruits with diverse bioactive compounds."
+        )
+        finding_quote = (
+            "The citrus fruit blend reduced body-weight gain in rats receiving the experimental diet."
+        )
         packet = {
             "title": "Effects of a clementine and pink grapefruit blend on metabolic alterations in rats",
             "doi": "10.1000/citrus-rat",
-            "abstract": (
-                "A clementine and pink grapefruit blend was administered to rats "
-                "with diet-induced metabolic alterations for eight weeks."
-            ),
-            "body_markdown": "Clementine and pink grapefruit blend evidence in rats. " * 30,
+            "abstract": f"{lead_quote} {finding_quote}",
+            "body_markdown": f"## Abstract\n\n{lead_quote} {finding_quote}",
             "retrieval_issues": [],
             "reference_url": "https://doi.org/10.1000/citrus-rat",
             "url": "https://example.org/citrus-rat",
@@ -320,11 +400,66 @@ tags:
             "authors": "A. Author",
             "keywords": "clementine; pink grapefruit; citrus blend; metabolic",
         }
+        plan = {
+            "decision": "publish_changes",
+            "study_type": "Animal Study: Rat",
+            "target_proposals": [
+                {
+                    "operation": "create_new",
+                    "target_path": "Natural Healing/Fruits/Citrus/citrus.md",
+                    "target_entity": "citrus",
+                    "new_article": {
+                        "title": "Citrus",
+                        "tags": ["Citrus", "Fruit"],
+                        "lead_text": lead_quote,
+                        "lead_source_quote": lead_quote,
+                        "category_rationale": "Citrus is a fruit family and the category already exists.",
+                    },
+                    "parent_heading": "",
+                    "heading": "## Research",
+                    "rationale": "The source directly studies a citrus fruit blend.",
+                    "bullets": [
+                        {
+                            "text": finding_quote,
+                            "source_quote": finding_quote,
+                            "source_section": "Abstract",
+                            "claim_kind": "source_finding",
+                            "evidence_scope": "animal",
+                            "cited_references": [],
+                        }
+                    ],
+                    "exclusions": [],
+                }
+            ],
+            "exclusions": [],
+        }
+        approved_critic = {
+            "approved": True,
+            "recommendation": "approve",
+            "issues": [],
+            "mode": "required",
+            "target_reviews": [],
+        }
+        missing_entity_tag = json.loads(json.dumps(plan))
+        missing_entity_tag["target_proposals"][0]["new_article"]["tags"] = [
+            "Metabolic Health"
+        ]
+        invalid_tags = validate_draft_plan(
+            missing_entity_tag,
+            packet=packet,
+            candidate_paths=set(),
+            existing_paths={"Natural Healing/Fruits/Citrus/bergamot.md"},
+            domain="Natural Healing",
+            claim_policy="integrated",
+        )
+        self.assertIn(
+            "target_0_missing_new_article_entity_tag", invalid_tags.issues
+        )
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             content = root / "content"
             content.mkdir()
-            article = content / "Natural Healing" / "bergamot.md"
+            article = content / "Natural Healing" / "Fruits" / "Citrus" / "bergamot.md"
             article.parent.mkdir(parents=True)
             article.write_text(
                 "---\ntitle: Bergamot\ntags:\n- Citrus\n- Metabolic Health\n---\n\n"
@@ -347,12 +482,27 @@ tags:
                 cwd=content,
                 check=True,
             )
+            client = Mock()
+            client.calls = []
+            client.json_completion.side_effect = [
+                ModelOutputJSONError(
+                    "Expecting property name enclosed in double quotes",
+                    '{"decision": "publish_changes",}',
+                ),
+                plan,
+            ]
             with patch.object(cli, "CONTENT_INDEX_DIR", root / "cache"), patch.object(
                 cli, "scrape_source_packet", return_value=packet
             ), patch.object(
                 cli,
                 "check_duplicate_paper",
                 return_value={"content_hits": [], "paper_result": None},
+            ), patch.object(
+                local_publish, "LocalLLMClient", return_value=client
+            ), patch.object(
+                local_publish, "style_context", return_value="guides"
+            ), patch.object(
+                local_publish, "review_plan_targets", return_value=approved_critic
             ):
                 report = run_local_publish(
                     source=packet["url"],
@@ -364,13 +514,24 @@ tags:
                     model="unused",
                     publish=False,
                     base_ref="HEAD",
+                    domain="Natural Healing",
                 )
-        self.assertEqual(report["status"], "needs_review")
-        self.assertEqual(report["reason"], "no_content_candidates")
-        recommendation = report["new_article_recommendation"]
-        self.assertEqual(recommendation["recommendation"], "consider_new_article")
-        self.assertFalse(recommendation["automatic_creation"])
-        self.assertFalse(recommendation["automatic_publication"])
+                created = (
+                    Path(report["worktree"])
+                    / "Natural Healing/Fruits/Citrus/citrus.md"
+                ).read_text(encoding="utf-8")
+                report_path = Path(report["report_path"])
+                packet_path = Path(report["artifacts"]["packet_json"])
+                self.assertTrue(report_path.is_file())
+                self.assertTrue(packet_path.is_file())
+        self.assertEqual(report["status"], "validated_draft")
+        self.assertEqual(report["target_path"], "Natural Healing/Fruits/Citrus/citrus.md")
+        self.assertEqual(report["publication_outcome"], "dry_run")
+        self.assertEqual(report["format_repairs"][0]["status"], "repaired")
+        self.assertEqual(client.json_completion.call_count, 2)
+        self.assertIn("title: Citrus", created)
+        self.assertIn(f"- {finding_quote}[^1]", created)
+        self.assertIn("**Evidence warning — animal/preclinical evidence:**", created)
 
     def test_compendium_rat_source_supports_independent_background_targets(self) -> None:
         references = {
@@ -465,6 +626,19 @@ tags:
             {proposal["target_entity"] for proposal in plan["target_proposals"]},
             {"clementine", "grapefruit", "orange", "citrus", "lycopene"},
         )
+
+        contradictory_exclusion = json.loads(json.dumps(plan))
+        contradictory_exclusion["exclusions"][0]["reason"] = (
+            "This was already captured and is not excluded."
+        )
+        invalid = validate_draft_plan(
+            contradictory_exclusion,
+            packet=packet,
+            candidate_paths=set(candidates),
+            candidate_metadata=candidates,
+            claim_policy="compendium",
+        )
+        self.assertIn("exclusion_0_contradictory_reason", invalid.issues)
 
         missing_provenance = {
             **plan,
@@ -718,10 +892,21 @@ tags:
             candidate_documents={"Natural Healing/citrus.md": markdown},
             claim_policy="compendium",
         )
-        self.assertIn("COMPENDIUM CLAIM POLICY", prompt)
-        self.assertIn("Introduction and Discussion", prompt)
+        self.assertIn("INTEGRATED / LEGACY COMPENDIUM CLAIM POLICY", prompt)
+        self.assertIn("both direct source_finding claims", prompt)
+        self.assertIn("normalized source sections", prompt)
         self.assertIn("cited_references", prompt)
         self.assertIn("A citrus blend never belongs on a Bergamot page", prompt)
+        self.assertIn("lead_text must normally equal lead_source_quote", prompt)
+
+        repair_prompt = local_publish.draft_prompt(
+            packet=packet,
+            candidates=list(candidate.values()),
+            candidate_documents={"Natural Healing/citrus.md": markdown},
+            claim_policy="compendium",
+            prior_issues=["target_0_lead_not_near_verbatim"],
+        )
+        self.assertIn("Do not turn an intervention-specific passage", repair_prompt)
 
     def test_repairs_preserve_history_and_select_best_deterministic_valid_attempt(self) -> None:
         quote = (
@@ -734,6 +919,8 @@ tags:
             "target_proposals": [
                 {
                     "target_path": "Natural Healing/quercetin.md",
+                    "operation": "append_existing",
+                    "target_entity": "quercetin",
                     "parent_heading": "",
                     "heading": "## Safety",
                     "rationale": "The target is the studied entity.",
@@ -741,7 +928,10 @@ tags:
                         {
                             "text": quote,
                             "source_quote": quote,
+                            "source_section": "Abstract",
+                            "claim_kind": "source_finding",
                             "evidence_scope": "review_summary",
+                            "cited_references": [],
                         }
                     ],
                     "exclusions": [],

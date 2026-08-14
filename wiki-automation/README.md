@@ -167,8 +167,8 @@ Dry-run an ad-hoc source, enqueue selected backlog rows, or process one leased
 job:
 
 ```bash
-./agent-workflow local-publish "https://example.org/article"
-./agent-workflow enqueue-local-backlog --status selected --min-score 12 --limit 10
+./agent-workflow local-publish "https://example.org/article" --domain "Natural Healing"
+./agent-workflow enqueue-local-backlog --domain "Natural Healing" --status selected --min-score 12 --limit 10
 ./agent-workflow local-worker --max-jobs 1
 ```
 
@@ -177,8 +177,9 @@ uses an isolated worktree based on `origin/main` and opens a draft PR only when
 packet, duplicate, entity match, every target-specific evidence/placement
 critic, render, and Git-scope gate all pass. A single paper may propose multiple
 existing targets, with separate claims, rationale, and exclusions for each. It
-does not auto-merge or autonomously create a new article; an unmatched source
-instead receives a structured human-review recommendation. See
+may also create a focused, source-grounded entity page below the required
+domain when no suitable page exists; new pages pass the same deterministic and
+critic gates. It never auto-merges. See
 [`../docs/local-research-publisher.md`](../docs/local-research-publisher.md).
 
 The default `--critic-mode required` runs independent placement and evidence
@@ -192,14 +193,15 @@ Draft PRs separate validated critic findings from rejected observations. The
 latter are labeled non-blocking and include the validation errors that prevented
 them from influencing the publication decision.
 
-The default `--claim-policy strict` proposes only direct findings of the
-supplied paper. Opt-in `--claim-policy compendium` may additionally extract
-target-specific background facts from full-text Introduction and Discussion
-passages. Each background fact must retain its exact passage, section, claim
+The default integrated policy proposes direct findings of the supplied paper
+and target-specific background facts from normalized claim-bearing full-text
+sections. Each background fact must retain its exact passage, section, claim
 type, evidence scope, and any exact earlier reference cited by the passage.
 Full-text discovery matches primary page identity, not generic tags; unsupported
 claims, missing provenance, mere mentions, and wrong-entity placement remain
-gating failures. An animal-scoped compendium claim may use a normal heading only
+gating failures. An animal-scoped background claim may use a normal heading only
 when the rendered proposal includes the mandatory animal/preclinical warning.
-Neither policy creates articles, merges changes, or publishes without
-`--publish` and every applicable gate passing.
+No change is committed or pushed without `--publish` and every applicable gate
+passing. Each run is preserved under `out/runs/<run-id>/`; queued jobs persist
+their domain/policy and require an explicit audited requeue after a successful
+dry run.

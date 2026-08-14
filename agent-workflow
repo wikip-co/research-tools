@@ -158,10 +158,11 @@ Usage:
   agent-workflow search "<query>" [wiki-automation search args...]
   agent-workflow prepare "<url>" [wiki-automation prepare args...]
   agent-workflow intake "<url-or-pdf>" [wiki-automation intake args...]
-  agent-workflow local-publish "<url-or-pdf>" [--claim-policy strict|compendium] [--critic-mode required|advisory|off] [--publish]
-  agent-workflow enqueue-local "<article-key-or-url>"
-  agent-workflow enqueue-local-backlog [--min-score N] [--limit N]
-  agent-workflow local-worker [--max-jobs N] [--claim-policy strict|compendium] [--publish]
+  agent-workflow local-publish "<url-or-pdf>" --domain "Natural Healing" [--critic-mode required|advisory|off] [--publish]
+  agent-workflow enqueue-local "<article-key-or-url>" --domain "Natural Healing"
+  agent-workflow enqueue-local-backlog --domain "Natural Healing" [--min-score N] [--limit N]
+  agent-workflow local-worker [--max-jobs N] [--publish]
+  agent-workflow requeue-local <job-id> --reason "why this job should run again"
   agent-workflow ingest-paper "<source>" [wiki-automation ingest-paper args...]
   agent-workflow append "<url>" --target "<path>" [wiki-automation append args...]
   agent-workflow tags [--suggest "<query>"] [--limit N]
@@ -293,6 +294,15 @@ run_enqueue_local_backlog() {
 
 run_local_worker() {
   run_wiki_command local-worker "$@"
+}
+
+run_requeue_local() {
+  if (($# < 1)); then
+    printf 'requeue-local requires a job id\n' >&2
+    exit 1
+  fi
+
+  run_wiki_command requeue-local "$@"
 }
 
 run_ingest_paper() {
@@ -617,6 +627,9 @@ main() {
       ;;
     local-worker)
       run_local_worker "$@"
+      ;;
+    requeue-local)
+      run_requeue_local "$@"
       ;;
     ingest-paper)
       run_ingest_paper "$@"

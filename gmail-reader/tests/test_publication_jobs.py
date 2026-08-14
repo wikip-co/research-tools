@@ -10,6 +10,7 @@ from gmail_reader.app import (
     enqueue_publication_backlog,
     enqueue_publication_job,
     ensure_db,
+    requeue_publication_job,
     set_publication_job_state,
     utc_now_iso,
 )
@@ -55,6 +56,11 @@ class PublicationJobTests(unittest.TestCase):
             max_attempts=3,
         )
         self.assertTrue(queued["created"])
+        self.assertEqual(queued["job"]["domain"], "Natural Healing")
+        self.assertEqual(queued["job"]["claim_policy"], "integrated")
+        self.assertEqual(
+            queued["job"]["canonical_source_url"], "https://example.org/study"
+        )
 
         duplicate_enqueue = enqueue_publication_job(
             db_path=self.db_path,
@@ -180,6 +186,80 @@ class PublicationJobTests(unittest.TestCase):
         self.assertTrue(first["created"])
         self.assertFalse(second["created"])
         self.assertEqual(first["job"]["job_id"], second["job"]["job_id"])
+
+    def test_canonical_source_variants_have_one_active_job(self) -> None:
+        conn = ensure_db(self.db_path)
+        now = utc_now_iso()
+        conn.execute(
+            """
+            INSERT INTO articles (
+                article_key, message_id, alert_name, rank_in_email, title,
+                article_url, score, status, reasons_json, created_at, updated_at
+            ) VALUES ('article-2', 'message-1', 'Polyphenols', 2,
+                      'Example Study mirror', 'http://www.example.org/study/?utm_source=alert', 19,
+                      'selected', '[]', ?, ?)
+            """,
+            (now, now),
+        )
+        conn.commit()
+        conn.close()
+        first = enqueue_publication_job(
+            db_path=self.db_path, identifier="article-1", max_attempts=3
+        )
+        second = enqueue_publication_job(
+            db_path=self.db_path, identifier="article-2", max_attempts=3
+        )
+        self.assertTrue(first["created"])
+        self.assertFalse(second["created"])
+        self.assertEqual(first["job"]["job_id"], second["job"]["job_id"])
+
+    def test_retry_is_deferred_until_next_run(self) -> None:
+        queued = enqueue_publication_job(
+            db_path=self.db_path, identifier="article-1", max_attempts=3
+        )
+        claimed = claim_publication_job(
+            db_path=self.db_path, worker="test-worker", lease_seconds=300
+        )
+        retried = set_publication_job_state(
+            db_path=self.db_path,
+            job_id=queued["job"]["job_id"],
+            state="retry",
+            worker="test-worker",
+            error="temporary model timeout",
+        )
+        self.assertTrue(retried["job"]["next_run_at"])
+        immediately_claimed = claim_publication_job(
+            db_path=self.db_path, worker="other-worker", lease_seconds=300
+        )
+        self.assertFalse(immediately_claimed["claimed"])
+        self.assertEqual(claimed["job"]["attempt_count"], 1)
+
+    def test_validated_job_requires_explicit_audited_requeue(self) -> None:
+        queued = enqueue_publication_job(
+            db_path=self.db_path,
+            identifier="article-1",
+            max_attempts=3,
+            domain="Natural Healing",
+        )
+        set_publication_job_state(
+            db_path=self.db_path,
+            job_id=queued["job"]["job_id"],
+            state="validated",
+            run_id="run-123",
+            packet_path="/tmp/run-123/report.json",
+        )
+        waiting = claim_publication_job(
+            db_path=self.db_path, worker="test-worker", lease_seconds=300
+        )
+        self.assertFalse(waiting["claimed"])
+        requeued = requeue_publication_job(
+            db_path=self.db_path,
+            job_id=queued["job"]["job_id"],
+            reason="reviewed dry-run and now ready to publish",
+        )
+        self.assertEqual(requeued["job"]["state"], "queued")
+        self.assertEqual(requeued["job"]["attempt_count"], 0)
+        self.assertEqual(requeued["prior_outputs"]["run_id"], "run-123")
 
 
 if __name__ == "__main__":

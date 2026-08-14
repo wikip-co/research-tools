@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from math import log
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -46,6 +47,15 @@ RESEARCH_MATCH_STOPWORDS = {
     "pink", "preclinical", "supplement", "supplementation", "versus",
 }
 COMPENDIUM_BACKGROUND_ENTITY_TERMS = {"citrus"}
+DEFAULT_RESEARCH_DOMAIN = "Natural Healing"
+GENERIC_ENTITY_ALIASES = {
+    "activity", "analysis", "article", "benefit", "benefits", "biology",
+    "care", "chemical", "chemicals", "compound", "compounds", "content",
+    "current events", "development", "disease", "diseases", "evidence",
+    "food", "foods", "health", "healing", "medicine", "ministry", "model",
+    "models", "natural healing", "prevention", "product", "products",
+    "research", "study", "studies", "therapy", "treatment", "vitamin",
+}
 
 TOOL_DIR = Path(__file__).resolve().parents[1]
 AGENT_TOOLS_ROOT = Path(
@@ -97,6 +107,15 @@ def normalize(text: str) -> str:
 
 def slugify(text: str) -> str:
     return re.sub(r"-{2,}", "-", normalize(text).replace(" ", "-")).strip("-")
+
+
+def normalize_domain(value: str) -> str:
+    """Return one safe top-level content domain name."""
+    domain = str(value or "").strip().strip("/")
+    parts = PurePosixPath(domain).parts
+    if not domain or len(parts) != 1 or parts[0] in {".", ".."}:
+        raise ValueError("domain must be one top-level content directory")
+    return domain
 
 
 def split_markdown_document(text: str) -> tuple[str | None, str]:
@@ -464,111 +483,115 @@ def research_match_candidates(
     keywords: str = "",
     alert_name: str = "",
     full_text: str = "",
-    include_background: bool = False,
+    include_background: bool = True,
+    domain: str = DEFAULT_RESEARCH_DOMAIN,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
-    """Retrieve content homes using source entities, not only paper-title fuzziness.
+    """Rank domain-scoped pages whose primary entity is asserted by the source.
 
-    Research paper titles are often descriptions rather than encyclopedia topics.
-    Eligibility therefore requires a discriminative source-entity term in an
-    article identity field (title, stem, path, or tags). Abstract/body overlap
-    can rank eligible homes but cannot make an unrelated page eligible by itself.
-    Opt-in compendium matching may discover full-text entities, but those terms
-    must match the article's primary title/path identity rather than a generic
-    tag (for example, Citrus on a Bergamot article).
+    Eligibility is based on an article's title/stem identity as a complete
+    phrase. Tags, category folders, and body overlap rank an already eligible
+    page but cannot make a generic disease/tag match look like an entity match.
+    Full-text background entities are part of the default integrated policy.
     """
 
-    def useful_terms(value: str, *, allow_background_entities: bool = False) -> list[str]:
-        return [
-            term
-            for term in normalize(value).split()
-            if len(term) >= 4
-            and (
-                term not in RESEARCH_MATCH_STOPWORDS
-                or allow_background_entities
-                and term in COMPENDIUM_BACKGROUND_ENTITY_TERMS
-            )
-        ]
+    selected_domain = normalize_domain(domain)
 
-    title_terms = useful_terms(title)
-    abstract_terms = useful_terms(abstract)
-    keyword_terms = useful_terms(keywords)
-    alert_terms = useful_terms(alert_name)
+    def aliases(article: ArticleRecord) -> list[str]:
+        values = [normalize(article.title), normalize(article.stem)]
+        cleaned: list[str] = []
+        for value in values:
+            value = re.sub(r"^(?:the|what is|what are|an introduction to)\s+", "", value)
+            if (
+                value
+                and value not in GENERIC_ENTITY_ALIASES
+                and len(value) >= 4
+                and value not in cleaned
+            ):
+                cleaned.append(value)
+        return cleaned
+
+    def phrase_count(phrase: str, value: str) -> int:
+        normalized_value = normalize(value)
+        if not phrase or not normalized_value:
+            return 0
+        return len(re.findall(rf"(?:^|\s){re.escape(phrase)}(?:$|\s)", normalized_value))
+
     claim_bearing_full_text = re.split(
         r"(?im)^#{1,6}\s+(?:references|bibliography|works cited)\s*$",
         full_text,
         maxsplit=1,
     )[0]
-    background_terms = (
-        useful_terms(claim_bearing_full_text, allow_background_entities=True)
-        if include_background
-        else []
-    )
-    query_counts: Counter[str] = Counter()
-    query_counts.update({term: 5 for term in alert_terms})
-    query_counts.update({term: 3 for term in title_terms})
-    query_counts.update({term: 3 for term in keyword_terms})
-    for term, count in Counter(background_terms).items():
-        query_counts[term] += min(count, 2)
-    for term, count in Counter(abstract_terms).items():
-        query_counts[term] += min(count, 3)
-
-    core_identity_query_terms = set(title_terms) | set(keyword_terms) | set(alert_terms)
-    identity_query_terms = core_identity_query_terms | set(background_terms)
-    if not query_counts or not identity_query_terms:
-        return []
-
-    article_fields: list[tuple[ArticleRecord, dict[str, set[str]]]] = []
-    document_frequency: Counter[str] = Counter()
-    for article in articles:
-        fields = {
-            "title": set(
-                useful_terms(article.title, allow_background_entities=include_background)
-            ),
-            "tags": set(
-                useful_terms(" ".join(article.tags), allow_background_entities=include_background)
-            ),
-            "path": set(
-                useful_terms(article.path, allow_background_entities=include_background)
-            ),
-            "body": set(useful_terms(article.body)),
-        }
-        article_fields.append((article, fields))
-        document_frequency.update(set().union(*fields.values()) & query_counts.keys())
-
-    corpus_size = max(len(articles), 1)
-    field_weights = {"title": 9.0, "tags": 7.0, "path": 5.0, "body": 1.0}
-    alert_phrase = normalize(alert_name)
+    source_fields = {
+        "source_title": title,
+        "keywords": keywords,
+        "abstract": abstract,
+        "full_text": claim_bearing_full_text if include_background else "",
+        "alert": alert_name,
+    }
+    weights = {
+        "source_title": 240.0,
+        "keywords": 180.0,
+        "abstract": 120.0,
+        "full_text": 25.0,
+        "alert": 220.0,
+    }
+    source_terms = set(normalize(" ".join(source_fields.values())).split())
     results: list[dict[str, Any]] = []
-    for article, fields in article_fields:
-        identity_terms = fields["title"] | fields["tags"] | fields["path"]
-        primary_identity_terms = fields["title"] | fields["path"]
-        entity_matches = (identity_terms & core_identity_query_terms) | (
-            primary_identity_terms & set(background_terms)
-        )
+    for article in articles:
+        path_parts = PurePosixPath(article.path).parts
+        if not path_parts or path_parts[0] != selected_domain:
+            continue
+        article_aliases = aliases(article)
+        entity_matches = [
+            alias
+            for alias in article_aliases
+            if any(phrase_count(alias, value) for value in source_fields.values())
+        ]
         if not entity_matches:
             continue
         contributions: dict[str, float] = {}
-        matched_terms: set[str] = set()
         score = 0.0
-        for field, field_terms in fields.items():
-            field_score = 0.0
-            for term in field_terms & query_counts.keys():
-                idf = log((corpus_size + 1) / (document_frequency[term] + 1)) + 1.0
-                field_score += query_counts[term] * idf * field_weights[field]
-                matched_terms.add(term)
-            if field_score:
+        for field, value in source_fields.items():
+            count = sum(min(phrase_count(alias, value), 3) for alias in entity_matches)
+            if count:
+                field_score = count * weights[field]
                 contributions[field] = round(field_score, 2)
                 score += field_score
 
-        normalized_identity = " ".join(
-            [normalize(article.title), normalize(" ".join(article.tags)), normalize(article.path)]
+        tag_phrases = [normalize(tag) for tag in article.tags if normalize(tag)]
+        matched_tags = sorted(
+            tag for tag in tag_phrases
+            if tag not in GENERIC_ENTITY_ALIASES and phrase_count(tag, " ".join(source_fields.values()))
         )
-        if alert_phrase and alert_phrase in normalized_identity:
-            score += 100.0
-            contributions["alert_phrase"] = 100.0
-        if not matched_terms:
-            continue
+        if matched_tags:
+            tag_score = min(len(matched_tags), 8) * 18.0
+            contributions["tags"] = tag_score
+            score += tag_score
+
+        category_matches = sorted(
+            {
+                normalize(part)
+                for part in path_parts[1:-1]
+                if normalize(part)
+                and normalize(part) not in GENERIC_ENTITY_ALIASES
+                and phrase_count(normalize(part), " ".join(source_fields.values()))
+            }
+        )
+        if category_matches:
+            category_score = len(category_matches) * 30.0
+            contributions["category"] = category_score
+            score += category_score
+
+        body_terms = set(normalize(article.body).split())
+        overlap_terms = sorted(
+            term for term in source_terms & body_terms
+            if len(term) >= 5 and term not in RESEARCH_MATCH_STOPWORDS
+        )
+        if overlap_terms:
+            body_score = min(len(overlap_terms), 20) * 1.5
+            contributions["body"] = body_score
+            score += body_score
         results.append(
             {
                 "path": article.path,
@@ -577,8 +600,11 @@ def research_match_candidates(
                 "permalink": article.permalink,
                 "route_key": article.route_key,
                 "score": round(score, 2),
-                "match_method": "research_hybrid",
-                "matched_terms": sorted(matched_terms),
+                "match_method": "domain_entity_phrase",
+                "domain": selected_domain,
+                "matched_terms": overlap_terms[:30],
+                "matched_tags": matched_tags,
+                "category_matches": category_matches,
                 "entity_matches": sorted(entity_matches),
                 "entity_compatible": True,
                 "score_components": contributions,
@@ -594,7 +620,8 @@ def match_research_packet(
     scrape: dict[str, Any],
     *,
     alert_name: str = "",
-    include_background: bool = False,
+    include_background: bool = True,
+    domain: str = DEFAULT_RESEARCH_DOMAIN,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
     """Return topic-oriented homes for a normalized scraper result."""
@@ -606,6 +633,7 @@ def match_research_packet(
         alert_name=alert_name,
         full_text=str(scrape.get("body_markdown") or ""),
         include_background=include_background,
+        domain=domain,
         limit=limit,
     )
 
@@ -1839,6 +1867,11 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
     from .local_publish import configured_client_values, run_local_publish
 
     default_base_url, default_model = configured_client_values()
+    print(json.dumps({"local_publish_progress": "scraping"}), file=sys.stderr, flush=True)
+
+    def progress(state: str) -> None:
+        print(json.dumps({"local_publish_progress": state}), file=sys.stderr, flush=True)
+
     result = run_local_publish(
         source=args.source,
         alert_name=args.alert_name,
@@ -1855,6 +1888,8 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
         claim_policy=args.claim_policy,
         allow_critic_rejection=args.allow_critic_rejection,
         override_reason=args.override_reason,
+        domain=args.domain,
+        progress=progress,
     )
     candidates = result.get("candidates") or []
     return {
@@ -1874,6 +1909,10 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
         "critic": result.get("critic"),
         "critic_mode": result.get("critic_mode"),
         "claim_policy": result.get("claim_policy"),
+        "domain": result.get("domain"),
+        "run_id": result.get("run_id"),
+        "publication_outcome": result.get("publication_outcome"),
+        "artifacts": result.get("artifacts"),
         "critic_override": result.get("critic_override"),
         "publication_suppressed": result.get("publication_suppressed"),
         "top_candidate": candidates[0] if candidates else None,
@@ -1900,6 +1939,7 @@ def update_local_job(job_id: int, state: str, worker: str, **values: str) -> dic
         "pr": "--pr",
         "error": "--error",
         "result_json": "--result-json",
+        "run_id": "--run-id",
     }
     for key, option in option_names.items():
         if values.get(key):
@@ -1916,6 +1956,10 @@ def enqueue_local_command(args: argparse.Namespace) -> dict[str, Any]:
             args.identifier,
             "--max-attempts",
             str(args.max_attempts),
+            "--domain",
+            args.domain,
+            "--claim-policy",
+            args.claim_policy,
         ),
     )
 
@@ -1934,6 +1978,10 @@ def enqueue_local_backlog_command(args: argparse.Namespace) -> dict[str, Any]:
             str(args.limit),
             "--max-attempts",
             str(args.max_attempts),
+            "--domain",
+            args.domain,
+            "--claim-policy",
+            args.claim_policy,
         ),
     )
 
@@ -1980,10 +2028,11 @@ def local_worker_command(args: argparse.Namespace) -> dict[str, Any]:
                 max_candidates=args.limit,
                 max_draft_attempts=args.max_draft_attempts,
                 critic_mode="required",
-                claim_policy=args.claim_policy,
+                claim_policy=str(job.get("claim_policy") or args.claim_policy),
                 allow_critic_rejection=False,
                 override_reason="",
                 passive_worker=True,
+                domain=str(job.get("domain") or "Natural Healing"),
                 progress=progress,
             )
             status = str(report.get("status") or "needs_review")
@@ -1991,13 +2040,15 @@ def local_worker_command(args: argparse.Namespace) -> dict[str, Any]:
                 "duplicate": "duplicate",
                 "needs_review": "needs_review",
                 "pr_open": "pr_open",
-                "validated_draft": "needs_review",
+                "validated_draft": "validated",
             }.get(status, "needs_review")
             summary = {
                 "status": status,
                 "reason": report.get("reason"),
                 "report_path": report.get("report_path"),
                 "diff_path": report.get("diff_path"),
+                "run_id": report.get("run_id"),
+                "publication_outcome": report.get("publication_outcome"),
             }
             update_local_job(
                 job_id,
@@ -2009,6 +2060,7 @@ def local_worker_command(args: argparse.Namespace) -> dict[str, Any]:
                 commit=str(report.get("commit") or ""),
                 pr=str(report.get("pr_url") or ""),
                 result_json=json.dumps(summary),
+                run_id=str(report.get("run_id") or ""),
             )
             processed.append({"job_id": job_id, **summary})
         except Exception as exc:
@@ -2020,6 +2072,19 @@ def local_worker_command(args: argparse.Namespace) -> dict[str, Any]:
             update_local_job(job_id, next_state, worker, error=str(exc)[:4000])
             processed.append({"job_id": job_id, "status": next_state, "error": str(exc)})
     return {"worker": worker, "processed": processed, "idle": not processed}
+
+
+def requeue_local_command(args: argparse.Namespace) -> dict[str, Any]:
+    ensure_tool_dir(GMAIL_READER_DIR, "gmail-reader")
+    return run_json_tool(
+        GMAIL_READER_DIR,
+        gmail_reader_command(
+            "requeue-publication",
+            str(args.job_id),
+            "--reason",
+            args.reason,
+        ),
+    )
 
 
 def create_pull_request(
@@ -2568,7 +2633,12 @@ def build_parser() -> argparse.ArgumentParser:
     local_publish_parser.add_argument("--base-url", default="", help="OpenAI-compatible llama.cpp /v1 base URL.")
     local_publish_parser.add_argument("--model", default="", help="Local llama.cpp model identifier.")
     local_publish_parser.add_argument("--base-ref", default="origin/main", help="Git ref for the isolated content worktree.")
-    local_publish_parser.add_argument("--limit", type=int, default=5, help="Maximum target candidates.")
+    local_publish_parser.add_argument("--limit", type=int, default=12, help="Maximum domain-filtered target candidates.")
+    local_publish_parser.add_argument(
+        "--domain",
+        required=True,
+        help="Required top-level content domain, for example 'Natural Healing'.",
+    )
     local_publish_parser.add_argument("--max-draft-attempts", type=int, default=3, help="Maximum draft/critic repair passes.")
     local_publish_parser.add_argument(
         "--critic-mode",
@@ -2578,9 +2648,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     local_publish_parser.add_argument(
         "--claim-policy",
-        choices=["strict", "compendium"],
-        default="strict",
-        help="strict uses only supplied-paper findings; compendium may also propose passage-grounded background facts with preserved provenance.",
+        choices=["integrated", "strict"],
+        default="integrated",
+        help="integrated (default) combines supplied-paper findings and passage-grounded background facts; strict is retained for focused diagnostics.",
     )
     local_publish_parser.add_argument(
         "--allow-critic-rejection",
@@ -2605,6 +2675,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     enqueue_local_parser.add_argument("identifier", help="Article key or source URL.")
     enqueue_local_parser.add_argument("--max-attempts", type=int, default=3)
+    enqueue_local_parser.add_argument("--domain", required=True)
+    enqueue_local_parser.add_argument(
+        "--claim-policy",
+        choices=["integrated", "strict"],
+        default="integrated",
+    )
 
     enqueue_local_backlog_parser = subparsers.add_parser(
         "enqueue-local-backlog",
@@ -2614,6 +2690,12 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue_local_backlog_parser.add_argument("--min-score", type=int, default=12)
     enqueue_local_backlog_parser.add_argument("--limit", type=int, default=10)
     enqueue_local_backlog_parser.add_argument("--max-attempts", type=int, default=3)
+    enqueue_local_backlog_parser.add_argument("--domain", required=True)
+    enqueue_local_backlog_parser.add_argument(
+        "--claim-policy",
+        choices=["integrated", "strict"],
+        default="integrated",
+    )
 
     local_worker_parser = subparsers.add_parser(
         "local-worker",
@@ -2625,13 +2707,13 @@ def build_parser() -> argparse.ArgumentParser:
     local_worker_parser.add_argument("--base-url", default="")
     local_worker_parser.add_argument("--model", default="")
     local_worker_parser.add_argument("--base-ref", default="origin/main")
-    local_worker_parser.add_argument("--limit", type=int, default=5)
+    local_worker_parser.add_argument("--limit", type=int, default=12)
     local_worker_parser.add_argument("--max-draft-attempts", type=int, default=3)
     local_worker_parser.add_argument(
         "--claim-policy",
-        choices=["strict", "compendium"],
-        default="strict",
-        help="Opt into passage-grounded background facts for queued jobs; strict remains the default.",
+        choices=["integrated", "strict"],
+        default="integrated",
+        help="Integrated direct/background claim processing is the default; strict is retained for focused diagnostics. A job's persisted policy takes precedence.",
     )
     local_worker_parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR / "local-jobs"))
     local_worker_parser.add_argument(
@@ -2639,6 +2721,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Open draft PRs for jobs that pass every quality gate.",
     )
+
+    requeue_local_parser = subparsers.add_parser(
+        "requeue-local",
+        help="Explicitly reset a stopped local publication job.",
+    )
+    requeue_local_parser.add_argument("job_id", type=int)
+    requeue_local_parser.add_argument("--reason", required=True)
 
     open_pr_parser = subparsers.add_parser(
         "open-pr",
@@ -2743,6 +2832,8 @@ def main(argv: list[str] | None = None) -> int:
             result = enqueue_local_backlog_command(args)
         elif args.command == "local-worker":
             result = local_worker_command(args)
+        elif args.command == "requeue-local":
+            result = requeue_local_command(args)
         elif args.command == "open-pr":
             result = open_pull_request(args)
         elif args.command == "publish-pr":

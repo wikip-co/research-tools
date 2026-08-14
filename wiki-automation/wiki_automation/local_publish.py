@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import io
 import os
 import re
@@ -8,13 +9,17 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, Callable
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+import yaml
 
 
 INVALID_PACKET_ISSUES = {
@@ -29,7 +34,15 @@ INVALID_TITLE_PATTERN = re.compile(
     r"^(?:are you a robot\??|access denied|just a moment\.?|new tab|unknown title)$",
     re.IGNORECASE,
 )
-ALLOWED_DECISIONS = {"append_existing", "duplicate", "needs_review"}
+ALLOWED_DECISIONS = {
+    "publish_changes",
+    "append_existing",
+    "create_new",
+    "duplicate",
+    "needs_review",
+}
+CHANGE_DECISIONS = {"publish_changes", "append_existing", "create_new"}
+PROPOSAL_OPERATIONS = {"append_existing", "create_new"}
 ALLOWED_EVIDENCE_SCOPES = {
     "review_summary",
     "human",
@@ -39,8 +52,13 @@ ALLOWED_EVIDENCE_SCOPES = {
 }
 DOI_PATTERN = re.compile(r"^10\.\d{4,9}/[-._;()/:a-z0-9]+$", re.IGNORECASE)
 CRITIC_MODES = {"required", "advisory", "off"}
-CLAIM_POLICIES = {"strict", "compendium"}
+CLAIM_POLICIES = {"integrated", "strict", "compendium"}
 CLAIM_KINDS = {"source_finding", "background_fact"}
+MAX_SOURCE_CLAIM_CONTEXT_CHARS = 90000
+MAX_SOURCE_REFERENCE_CONTEXT_CHARS = 60000
+MAX_CANDIDATE_CONTEXT_CHARS = 20000
+MAX_ALL_CANDIDATE_CONTEXT_CHARS = 80000
+MAX_DRAFT_OUTPUT_TOKENS = 10000
 CRITIC_SEVERITIES = {"warning", "review", "blocking"}
 CRITIC_SEVERITY_RANK = {"warning": 0, "review": 1, "blocking": 2}
 PLACEMENT_ISSUE_CODES = {
@@ -50,6 +68,8 @@ PLACEMENT_ISSUE_CODES = {
     "existing_content_conflict",
     "duplicate_content",
     "unsafe_context_inference",
+    "new_article_not_warranted",
+    "wrong_category",
 }
 EVIDENCE_ISSUE_CODES = {
     "unsupported_claim",
@@ -68,6 +88,8 @@ MINIMUM_CRITIC_SEVERITY = {
     "existing_content_conflict": "review",
     "duplicate_content": "review",
     "unsafe_context_inference": "review",
+    "new_article_not_warranted": "review",
+    "wrong_category": "review",
     "unsupported_claim": "review",
     "missing_source_provenance": "review",
     "claim_origin_misclassified": "review",
@@ -92,6 +114,11 @@ class ValidationResult:
 
 def normalize_evidence(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def includes_background_claims(claim_policy: str) -> bool:
+    """Integrated is the production policy; compendium is a legacy alias."""
+    return claim_policy in {"integrated", "compendium"}
 
 
 def valid_http_url(value: str) -> bool:
@@ -126,6 +153,18 @@ def source_is_preclinical(packet: dict[str, Any]) -> bool:
     )
 
 
+def study_type_matches_packet(plan_study_type: str, packet: dict[str, Any]) -> bool:
+    planned = normalize_evidence(plan_study_type)
+    recorded = normalize_evidence(str(packet.get("study_type") or ""))
+    if planned == recorded:
+        return True
+    generic_recorded = recorded in {"article", "research article", "original article"}
+    preclinical_planned = bool(
+        re.search(r"\b(?:animal|preclinical|in vivo|rat|rats|mouse|mice)\b", planned)
+    )
+    return generic_recorded and source_is_preclinical(packet) and preclinical_planned
+
+
 def exact_source_passage(packet: dict[str, Any], passage: str) -> bool:
     """Return whether a claim passage is an exact contiguous source span."""
     return bool(passage and passage in source_evidence(packet))
@@ -156,12 +195,215 @@ def source_section_present(packet: dict[str, Any], section: str) -> bool:
 
 def cited_markers(passage: str) -> list[str]:
     """Extract common numeric and author-year citations from one source passage."""
+    markdown_markers = re.findall(
+        r"\[[^\]\n]*(?:19|20)\d{2}[a-z]?\]\(#[^)]+\)",
+        passage,
+    )
     markers = re.findall(
         r"\[(?:\d+(?:\s*[-,]\s*\d+)*)\]"
         r"|\((?:[A-Z][A-Za-z'’-]+(?:\s+et\s+al\.)?\s*,?\s*)?(?:19|20)\d{2}[a-z]?\)",
         passage,
     )
-    return list(dict.fromkeys(markers))
+    return list(dict.fromkeys([*markdown_markers, *markers]))
+
+
+def canonical_citation_marker(value: str) -> str:
+    """Compare visible citation labels while tolerating publisher anchor IDs."""
+    return re.sub(r"\]\(#[^)]+\)", "]", value.strip())
+
+
+def citation_marker_matches_reference(marker: str, reference_text: str) -> bool:
+    visible = canonical_citation_marker(marker)
+    numeric = re.fullmatch(r"\[(\d+)\]", visible)
+    if numeric:
+        return bool(
+            re.match(rf"\s*(?:{numeric.group(1)}\.|\[{numeric.group(1)}\])", reference_text)
+        )
+    year = re.search(r"\b(?:19|20)\d{2}[a-z]?\b", visible, re.IGNORECASE)
+    surname = re.search(r"[A-Za-z'’-]{3,}", visible)
+    normalized_reference = normalize_evidence(reference_text[:1000])
+    return bool(
+        year
+        and surname
+        and normalize_evidence(year.group(0)) in normalized_reference
+        and normalize_evidence(surname.group(0)) in normalized_reference
+    )
+
+
+def source_prompt_sections(markdown: str) -> tuple[list[dict[str, str]], str]:
+    """Split claim-bearing Markdown sections from the terminal references block."""
+    references_match = re.search(
+        r"(?im)^#{1,6}\s+(?:references|bibliography|works cited)\s*$",
+        markdown,
+    )
+    claim_markdown = markdown[: references_match.start()] if references_match else markdown
+    references = markdown[references_match.start() :] if references_match else ""
+    heading_matches = list(re.finditer(r"(?m)^#{1,6}\s+.+$", claim_markdown))
+    if not heading_matches:
+        return ([{"heading": "Document", "text": claim_markdown.strip()}], references)
+    sections: list[dict[str, str]] = []
+    preamble = claim_markdown[: heading_matches[0].start()].strip()
+    if preamble:
+        sections.append({"heading": "Document metadata", "text": preamble})
+    for index, match in enumerate(heading_matches):
+        end = heading_matches[index + 1].start() if index + 1 < len(heading_matches) else len(claim_markdown)
+        sections.append(
+            {
+                "heading": re.sub(r"^#{1,6}\s+", "", match.group(0)).strip(),
+                "text": claim_markdown[match.start() : end].strip(),
+            }
+        )
+    return sections, references
+
+
+def prompt_relevant_section(heading: str) -> bool:
+    """Exclude navigation, boilerplate, and low-value assay detail from drafting context."""
+    normalized = normalize_evidence(heading)
+    if normalized in {"document metadata", "outline", "published by"}:
+        return False
+    return not bool(
+        re.search(
+            r"(?:^|\s)(?:figures?|tables?|extras?|graphical abstract|"
+            r"western blot|extraction of|hplc analysis|gene expression|"
+            r"statistical analysis|credit authorship|authorship contribution|"
+            r"ethical statements?|uncited references?|declaration of competing|"
+            r"supplementary data|data availability|acknowledg|funding)(?:\s|$)",
+            normalized,
+        )
+    )
+
+
+def source_reference_entries(references: str) -> list[dict[str, Any]]:
+    """Normalize numbered reference blocks while preserving exact source text."""
+    if not references:
+        return []
+    starts = list(re.finditer(r"(?m)^\s*(?:\d+\.\s+|\[\d+\]:?\s+)", references))
+    entries: list[dict[str, Any]] = []
+    for index, match in enumerate(starts):
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(references)
+        text = references[match.start() : end].strip()
+        if not text:
+            continue
+        first_line = text.splitlines()[0].strip()
+        label_match = re.search(r"\[([^\]]+)\]\(#[^)]+\)", first_line)
+        anchors = re.findall(r"#(b+\d+)", text, re.IGNORECASE)
+        entries.append(
+            {
+                "reference_id": anchors[0].lower() if anchors else f"reference-{index + 1}",
+                "marker": label_match.group(0) if label_match else first_line,
+                "label": label_match.group(1) if label_match else first_line,
+                "text": text,
+                "urls": list(dict.fromkeys(re.findall(r"https?://[^)\s]+", text))),
+                "anchors": [anchor.lower() for anchor in anchors],
+            }
+        )
+    return entries
+
+
+def prompt_source_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    """Build a complete but bounded source context with references retained."""
+    source = {key: value for key, value in packet.items() if key != "body_markdown"}
+    sections, references = source_prompt_sections(str(packet.get("body_markdown") or ""))
+    relevant_sections = [
+        section for section in sections if prompt_relevant_section(section["heading"])
+    ]
+    selected_sections: list[dict[str, str]] = []
+    used = 0
+    for section in relevant_sections:
+        remaining = MAX_SOURCE_CLAIM_CONTEXT_CHARS - used
+        if remaining <= 0:
+            break
+        text = section["text"][:remaining]
+        if text:
+            selected_sections.append({"heading": section["heading"], "text": text})
+            used += len(text)
+    entries = source_reference_entries(references)
+    associated_ids: set[str] = set()
+    for section in selected_sections:
+        markers = cited_markers(section["text"])
+        section_ids = [
+            str(entry["reference_id"])
+            for entry in entries
+            if any(
+                citation_marker_matches_reference(marker, str(entry["text"]))
+                for marker in markers
+            )
+        ]
+        section["associated_reference_ids"] = section_ids
+        associated_ids.update(section_ids)
+    selected_entries: list[dict[str, Any]] = []
+    reference_used = 0
+    for entry in entries:
+        if entry["reference_id"] not in associated_ids:
+            continue
+        remaining = MAX_SOURCE_REFERENCE_CONTEXT_CHARS - reference_used
+        if remaining <= 0:
+            break
+        if len(entry["text"]) > remaining:
+            continue
+        selected_entries.append(entry)
+        reference_used += len(entry["text"])
+    source["claim_sections"] = selected_sections
+    source["reference_entries"] = selected_entries
+    retained_ids = {str(entry["reference_id"]) for entry in selected_entries}
+    for section in selected_sections:
+        section["associated_reference_ids"] = [
+            reference_id
+            for reference_id in section["associated_reference_ids"]
+            if reference_id in retained_ids
+        ]
+    source["prompt_context"] = {
+        "claim_chars": used,
+        "claim_section_count": len(selected_sections),
+        "excluded_section_count": len(sections) - len(relevant_sections),
+        "excluded_section_chars": sum(
+            len(section["text"])
+            for section in sections
+            if section not in relevant_sections
+        ),
+        "reference_chars": reference_used,
+        "reference_entry_count": len(selected_entries),
+        "full_body_chars": len(str(packet.get("body_markdown") or "")),
+    }
+    return source
+
+
+def candidate_document_excerpt(
+    markdown: str,
+    entity_terms: list[str],
+    max_chars: int = MAX_CANDIDATE_CONTEXT_CHARS,
+) -> str:
+    """Retain complete small pages and relevant windows from unusually large pages."""
+    max_chars = max(2000, min(max_chars, MAX_CANDIDATE_CONTEXT_CHARS))
+    if len(markdown) <= max_chars:
+        return markdown
+    windows: list[tuple[int, int]] = [(0, 6000), (max(len(markdown) - 5000, 0), len(markdown))]
+    normalized_terms = [term for term in entity_terms if term]
+    lowered = markdown.lower()
+    for term in normalized_terms:
+        cursor = 0
+        while len(windows) < 8:
+            position = lowered.find(term.lower(), cursor)
+            if position < 0:
+                break
+            windows.append((max(position - 1800, 0), min(position + 3200, len(markdown))))
+            cursor = position + len(term)
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(windows):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    chunks: list[str] = []
+    used = 0
+    for start, end in merged:
+        chunk = markdown[start:end]
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        chunks.append(chunk[:remaining])
+        used += min(len(chunk), remaining)
+    return "\n\n[...context window...]\n\n".join(chunks)
 
 
 def bullet_cited_references(item: dict[str, Any]) -> list[dict[str, Any]]:
@@ -176,9 +418,17 @@ def bullet_cited_references(item: dict[str, Any]) -> list[dict[str, Any]]:
 def phrase_in_text(phrase: str, text: str) -> bool:
     normalized_phrase = normalize_evidence(phrase)
     normalized_text = normalize_evidence(text)
-    return bool(
-        normalized_phrase
-        and re.search(rf"(?:^|\s){re.escape(normalized_phrase)}(?:$|\s)", normalized_text)
+    if not normalized_phrase:
+        return False
+    variants = {normalized_phrase}
+    words = normalized_phrase.split()
+    last = words[-1]
+    if not last.endswith("s"):
+        plural = f"{last[:-1]}ies" if last.endswith("y") and len(last) > 2 else f"{last}s"
+        variants.add(" ".join([*words[:-1], plural]))
+    return any(
+        re.search(rf"(?:^|\s){re.escape(variant)}(?:$|\s)", normalized_text)
+        for variant in variants
     )
 
 
@@ -220,7 +470,7 @@ def target_entity_matches_candidate(
 
 def proposal_has_animal_claim(proposal: dict[str, Any], packet: dict[str, Any], claim_policy: str) -> bool:
     bullets = proposal.get("bullets") if isinstance(proposal.get("bullets"), list) else []
-    if claim_policy == "compendium":
+    if includes_background_claims(claim_policy):
         return any(
             isinstance(item, dict) and item.get("evidence_scope") == "animal"
             for item in bullets
@@ -255,9 +505,76 @@ def plan_target_proposals(plan: dict[str, Any]) -> list[dict[str, Any]]:
     proposals = plan.get("target_proposals")
     if isinstance(proposals, list):
         return [item for item in proposals if isinstance(item, dict)]
-    if plan.get("decision") == "append_existing" and plan.get("target_path"):
+    if plan.get("decision") in CHANGE_DECISIONS and plan.get("target_path"):
         return [plan]
     return []
+
+
+def proposal_operation(plan: dict[str, Any], proposal: dict[str, Any]) -> str:
+    operation = str(proposal.get("operation") or "")
+    if operation:
+        return operation
+    decision = str(plan.get("decision") or "")
+    if decision in {"append_existing", "create_new"}:
+        return decision
+    return "append_existing"
+
+
+def safe_new_article_path(target_path: str, domain: str) -> bool:
+    path = PurePosixPath(target_path)
+    return bool(
+        target_path
+        and not path.is_absolute()
+        and ".." not in path.parts
+        and len(path.parts) >= 2
+        and path.parts[0] == domain
+        and path.suffix.lower() == ".md"
+    )
+
+
+def missing_entity_page_seed(
+    *,
+    packet: dict[str, Any],
+    alert_name: str,
+    domain: str,
+    category_catalog: list[str],
+    existing_paths: set[str],
+) -> dict[str, str] | None:
+    """Suggest a grounded catch-all path without deciding that it must be created."""
+    primary_text = " ".join(
+        str(packet.get(key) or "") for key in ("title", "abstract", "keywords")
+    )
+    options: list[tuple[int, int, str, str]] = []
+    alert_entity = normalize_evidence(alert_name)
+    for category in category_catalog:
+        category_entity = normalize_evidence(PurePosixPath(category).name)
+        if not category_entity or category_entity in {"natural healing", "chemicals"}:
+            continue
+        score = 0
+        if alert_entity and (
+            phrase_in_text(alert_entity, category_entity)
+            or phrase_in_text(category_entity, alert_entity)
+        ):
+            score += 300
+        if phrase_in_text(category_entity, str(packet.get("title") or "")):
+            score += 200
+        if phrase_in_text(category_entity, primary_text):
+            score += 80
+        if score:
+            options.append((score, len(PurePosixPath(category).parts), category_entity, category))
+    if not options:
+        return None
+    _score, _depth, entity, category = max(options)
+    filename = re.sub(r"[^a-z0-9]+", "-", entity).strip("-") + ".md"
+    target_path = str(PurePosixPath(category) / filename)
+    if target_path in existing_paths or not safe_new_article_path(target_path, domain):
+        return None
+    return {
+        "target_entity": entity,
+        "suggested_path": target_path,
+        "category_directory": category,
+        "basis": "The category entity is asserted in the source title/abstract/keywords; critics still decide whether creation is warranted.",
+    }
 
 
 def validate_source_packet(packet: dict[str, Any]) -> ValidationResult:
@@ -360,11 +677,20 @@ def extract_json_object(value: str) -> dict[str, Any]:
     return payload
 
 
+class ModelOutputJSONError(ValueError):
+    """A model response arrived, but its requested JSON object was malformed."""
+
+    def __init__(self, message: str, raw_output: str):
+        super().__init__(message)
+        self.raw_output = raw_output
+
+
 class LocalLLMClient:
     def __init__(self, base_url: str, model: str, timeout_seconds: int = 600):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.calls: list[dict[str, Any]] = []
 
     def json_completion(
         self,
@@ -373,6 +699,16 @@ class LocalLLMClient:
         user: str,
         max_tokens: int = 5000,
     ) -> dict[str, Any]:
+        started_at = datetime.now(timezone.utc)
+        started_monotonic = time.monotonic()
+        call: dict[str, Any] = {
+            "call": len(self.calls) + 1,
+            "started_at": started_at.isoformat(),
+            "model": self.model,
+            "system_chars": len(system),
+            "user_chars": len(user),
+            "max_tokens": max_tokens,
+        }
         request = Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(
@@ -392,20 +728,56 @@ class LocalLLMClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urlopen(request, timeout=self.timeout_seconds) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        choices = payload.get("choices") or []
-        if not choices:
-            raise RuntimeError("Local model returned no choices")
-        message = choices[0].get("message") or {}
-        content = message.get("content") or ""
-        if not content:
-            # Some llama.cpp reasoning templates place even a requested final
-            # JSON object in reasoning_content. Use it only when content is empty.
-            content = message.get("reasoning_content") or ""
-        if not content:
-            raise RuntimeError("Local model returned no final JSON content")
-        return extract_json_object(content)
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            choices = payload.get("choices") or []
+            if not choices:
+                raise RuntimeError("Local model returned no choices")
+            message = choices[0].get("message") or {}
+            content = message.get("content") or ""
+            if not content:
+                # Some llama.cpp reasoning templates place even a requested final
+                # JSON object in reasoning_content. Use it only when content is empty.
+                content = message.get("reasoning_content") or ""
+            if not content:
+                raise RuntimeError("Local model returned no final JSON content")
+            try:
+                result = extract_json_object(content)
+            except ValueError as exc:
+                call.update(
+                    {
+                        "response_chars": len(content),
+                        "response_sha256": hashlib.sha256(
+                            content.encode("utf-8")
+                        ).hexdigest(),
+                        "response_text": content,
+                        "usage": payload.get("usage") or {},
+                        "finish_reason": choices[0].get("finish_reason"),
+                    }
+                )
+                raise ModelOutputJSONError(str(exc), content) from exc
+            call.update(
+                {
+                    "status": "ok",
+                    "response_chars": len(content),
+                    "usage": payload.get("usage") or {},
+                    "finish_reason": choices[0].get("finish_reason"),
+                }
+            )
+            return result
+        except Exception as exc:
+            call.update({"status": "error", "error": str(exc)[:1000]})
+            raise
+        finally:
+            completed_at = datetime.now(timezone.utc)
+            call.update(
+                {
+                    "completed_at": completed_at.isoformat(),
+                    "duration_seconds": round(time.monotonic() - started_monotonic, 3),
+                }
+            )
+            self.calls.append(call)
 
 
 def validate_draft_plan(
@@ -414,15 +786,18 @@ def validate_draft_plan(
     packet: dict[str, Any],
     candidate_paths: set[str],
     candidate_metadata: dict[str, dict[str, Any]] | None = None,
+    existing_paths: set[str] | None = None,
+    domain: str = "Natural Healing",
     claim_policy: str = "strict",
 ) -> ValidationResult:
     issues: list[str] = []
     warnings: list[str] = []
     candidate_metadata = candidate_metadata or {}
+    existing_paths = existing_paths or set(candidate_paths)
     decision = str(plan.get("decision") or "")
     if decision not in ALLOWED_DECISIONS:
         issues.append("invalid_decision")
-    if decision != "append_existing":
+    if decision not in CHANGE_DECISIONS:
         return ValidationResult(not issues, issues, warnings)
     raw_proposals = plan.get("target_proposals")
     if isinstance(raw_proposals, list):
@@ -436,9 +811,9 @@ def validate_draft_plan(
     new_contract = isinstance(plan.get("target_proposals"), list)
     if new_contract and not isinstance(plan.get("exclusions"), list):
         issues.append("invalid_exclusions")
-    if claim_policy == "compendium" and normalize_evidence(
-        str(plan.get("study_type") or "")
-    ) != normalize_evidence(str(packet.get("study_type") or "")):
+    if includes_background_claims(claim_policy) and not study_type_matches_packet(
+        str(plan.get("study_type") or ""), packet
+    ):
         issues.append("study_type_mismatch")
 
     evidence = source_evidence(packet)
@@ -453,23 +828,71 @@ def validate_draft_plan(
             quote = str(exclusion.get("source_quote") or "")
             if quote and not exact_source_passage(packet, quote):
                 issues.append(f"{prefix}_quote_not_in_source")
-            if not str(exclusion.get("reason") or "").strip():
+            reason = str(exclusion.get("reason") or "").strip()
+            if not reason:
                 issues.append(f"{prefix}_missing_reason")
+            elif re.search(
+                r"\b(?:not excluded|already (?:captured|included|integrated)|rather integrated)\b",
+                reason,
+                re.IGNORECASE,
+            ):
+                issues.append(f"{prefix}_contradictory_reason")
     for target_index, proposal in enumerate(proposals):
         target_prefix = f"target_{target_index}"
         target = str(proposal.get("target_path") or "")
-        if target not in candidate_paths:
+        operation = proposal_operation(plan, proposal)
+        if operation not in PROPOSAL_OPERATIONS:
+            issues.append(f"{target_prefix}_invalid_operation")
+        elif operation == "append_existing" and target not in candidate_paths:
             issues.append(f"{target_prefix}_not_in_candidates")
+        elif operation == "create_new":
+            if not safe_new_article_path(target, domain):
+                issues.append(f"{target_prefix}_invalid_new_article_path")
+            if target in existing_paths:
+                issues.append(f"{target_prefix}_new_article_already_exists")
         if target in seen_targets:
             issues.append(f"{target_prefix}_duplicate_target")
         seen_targets.add(target)
         target_entity = str(proposal.get("target_entity") or "").strip()
-        if claim_policy == "compendium" and not target_entity:
+        if new_contract and not target_entity:
             issues.append(f"{target_prefix}_missing_target_entity")
         if target_entity and not target_entity_matches_candidate(
-            target_entity, target, candidate_metadata
+            target_entity,
+            target,
+            candidate_metadata
+            if operation == "append_existing"
+            else {target: {"title": str(((proposal.get("new_article") or {}).get("title") or ""))}},
         ):
             issues.append(f"{target_prefix}_entity_mismatch")
+        if operation == "create_new":
+            new_article = proposal.get("new_article")
+            if not isinstance(new_article, dict):
+                issues.append(f"{target_prefix}_missing_new_article_metadata")
+            else:
+                title = str(new_article.get("title") or "").strip()
+                tags = new_article.get("tags")
+                lead_text = str(new_article.get("lead_text") or "").strip()
+                lead_quote = str(new_article.get("lead_source_quote") or "").strip()
+                if not title:
+                    issues.append(f"{target_prefix}_missing_new_article_title")
+                if not isinstance(tags, list) or not tags or any(
+                    not isinstance(tag, str) or not tag.strip() for tag in tags
+                ):
+                    issues.append(f"{target_prefix}_invalid_new_article_tags")
+                elif target_entity and not any(
+                    phrase_in_text(target_entity, str(tag)) for tag in tags
+                ):
+                    issues.append(f"{target_prefix}_missing_new_article_entity_tag")
+                if not str(new_article.get("category_rationale") or "").strip():
+                    issues.append(f"{target_prefix}_missing_category_rationale")
+                if not lead_text:
+                    issues.append(f"{target_prefix}_missing_lead_text")
+                elif target_entity and not phrase_in_text(target_entity, lead_text):
+                    issues.append(f"{target_prefix}_lead_missing_target_entity")
+                if len(normalize_evidence(lead_quote)) < 35 or not exact_source_passage(packet, lead_quote):
+                    issues.append(f"{target_prefix}_lead_quote_not_in_source")
+                elif word_token_similarity(lead_text, lead_quote) < 0.68:
+                    issues.append(f"{target_prefix}_lead_not_near_verbatim")
         heading = str(proposal.get("heading") or "")
         parent_heading = str(proposal.get("parent_heading") or "")
         if not re.match(r"^#{2,6}\s+\S", heading):
@@ -498,7 +921,7 @@ def validate_draft_plan(
             issues.append(f"{target_prefix}_invalid_bullet_count")
             continue
         if proposal_has_animal_claim(proposal, packet, claim_policy) and not has_preclinical_heading_scope(proposal):
-            if claim_policy == "compendium":
+            if includes_background_claims(claim_policy):
                 warnings.append(f"{target_prefix}_preclinical_heading_scope_warning")
             else:
                 issues.append(f"{target_prefix}_preclinical_heading_scope_missing")
@@ -538,7 +961,7 @@ def validate_draft_plan(
                 and "introduction" in normalize_evidence(source_section)
             ):
                 issues.append(f"{prefix}_claim_origin_misclassified")
-            if claim_policy == "compendium":
+            if includes_background_claims(claim_policy):
                 if claim_kind not in CLAIM_KINDS:
                     issues.append(f"{prefix}_invalid_claim_kind")
                 if not source_section_present(packet, source_section):
@@ -573,27 +996,40 @@ def validate_draft_plan(
                 if claim_kind == "background_fact" and markers and not cited_references:
                     issues.append(f"{prefix}_missing_cited_reference_provenance")
                 represented_markers: set[str] = set()
+                canonical_markers = {canonical_citation_marker(marker) for marker in markers}
                 for cited_reference in cited_references:
                     marker = str(cited_reference.get("citation_marker") or "").strip()
                     reference_text = str(cited_reference.get("reference_text") or "").strip()
                     reference_url = str(cited_reference.get("reference_url") or "").strip()
                     if marker:
-                        represented_markers.add(marker)
-                    if markers and (not marker or marker not in markers or marker not in quote):
+                        represented_markers.add(canonical_citation_marker(marker))
+                    if markers and (
+                        not marker
+                        or canonical_citation_marker(marker) not in canonical_markers
+                        or canonical_citation_marker(marker)
+                        not in canonical_citation_marker(quote)
+                    ):
                         issues.append(f"{prefix}_citation_marker_not_in_passage")
                     if not reference_text or not exact_source_passage(packet, reference_text):
                         issues.append(f"{prefix}_cited_reference_not_in_source")
+                    elif marker and not citation_marker_matches_reference(marker, reference_text):
+                        issues.append(f"{prefix}_cited_reference_marker_mismatch")
                     if reference_url and (
                         not valid_http_url(reference_url) or reference_url not in evidence
                     ):
                         issues.append(f"{prefix}_cited_reference_url_not_in_source")
-                if markers and not set(markers).issubset(represented_markers):
+                if markers and not canonical_markers.issubset(represented_markers):
                     issues.append(f"{prefix}_missing_cited_reference_provenance")
             normalized_quote = normalize_evidence(quote)
             if normalized_quote:
                 previous_target = assigned_quotes.setdefault(normalized_quote, target_index)
                 if previous_target != target_index:
                     issues.append(f"{prefix}_claim_assigned_to_multiple_targets")
+        if operation == "create_new" and not any(
+            isinstance(item, dict) and item.get("claim_kind") == "source_finding"
+            for item in bullets
+        ):
+            issues.append(f"{target_prefix}_new_article_requires_source_finding")
 
     # Retain the legacy issue spellings for callers that still submit the old
     # single-target contract while reports use indexed multi-target issues.
@@ -706,7 +1142,7 @@ def bullet_reference_numbers(
     background_indexes = {
         index
         for index, item in enumerate(bullets)
-        if claim_policy == "compendium"
+        if includes_background_claims(claim_policy)
         and isinstance(item, dict)
         and item.get("claim_kind") == "background_fact"
     }
@@ -753,7 +1189,7 @@ def render_background_reference(packet: dict[str, Any], ref_num: int, item: dict
 
 def compendium_evidence_warning(plan: dict[str, Any], packet: dict[str, Any], claim_policy: str) -> str:
     if (
-        claim_policy == "compendium"
+        includes_background_claims(claim_policy)
         and proposal_has_animal_claim(plan, packet, claim_policy)
         and not has_preclinical_heading_scope(plan)
     ):
@@ -791,11 +1227,35 @@ def apply_draft_plan(
         if ref_num in rendered_numbers:
             continue
         rendered_numbers.add(ref_num)
-        if claim_policy == "compendium" and item.get("claim_kind") == "background_fact":
+        if includes_background_claims(claim_policy) and item.get("claim_kind") == "background_fact":
             references.append(render_background_reference(packet, ref_num, item))
         else:
             references.append(render_reference(packet, ref_num))
     return updated.rstrip() + "\n\n" + "\n\n".join(references) + "\n"
+
+
+def initial_new_article_markdown(proposal: dict[str, Any]) -> str:
+    """Render a minimal source-grounded article before applying its first section."""
+    metadata = proposal.get("new_article") if isinstance(proposal.get("new_article"), dict) else {}
+    title = str(metadata.get("title") or proposal.get("target_entity") or "Untitled").strip()
+    tags = [str(tag).strip() for tag in metadata.get("tags") or [] if str(tag).strip()]
+    entity = str(proposal.get("target_entity") or title).strip()
+    lead = str(metadata.get("lead_text") or "").strip()
+    emphasized = re.sub(
+        re.escape(entity),
+        lambda match: f"**{match.group(0)}**",
+        lead,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    frontmatter = yaml.safe_dump(
+        {"title": title, "tags": tags},
+        sort_keys=False,
+        allow_unicode=False,
+        default_flow_style=False,
+    ).strip()
+    heading = str(proposal.get("heading") or "## Research").strip()
+    return f"---\n{frontmatter}\n---\n\n{emphasized}[^1]\n\n{heading}\n"
 
 
 def frontmatter_block(markdown: str) -> str:
@@ -830,7 +1290,7 @@ def validate_rendered_markdown(
         rendered = f"- {str(item.get('text') or '').strip()}[^{ref_numbers[index]}]"
         if rendered not in updated:
             issues.append(f"bullet_{index}_citation_missing")
-        if claim_policy == "compendium" and item.get("claim_kind") == "background_fact":
+        if includes_background_claims(claim_policy) and item.get("claim_kind") == "background_fact":
             passage = provenance_inline(item.get("source_quote"))
             if passage not in updated:
                 issues.append(f"bullet_{index}_background_passage_missing")
@@ -854,6 +1314,33 @@ def run_command(args: list[str], *, cwd: Path) -> str:
     return result.stdout.strip()
 
 
+def git_revision(repo: Path, ref: str = "HEAD") -> str:
+    """Return a revision for run provenance without making reporting brittle."""
+    try:
+        return run_command(["git", "rev-parse", ref], cwd=repo)
+    except (OSError, RuntimeError):
+        return "unknown"
+
+
+def git_worktree_provenance(repo: Path) -> dict[str, Any]:
+    """Describe uncommitted tool code without embedding a potentially huge diff."""
+    try:
+        status = run_command(["git", "status", "--porcelain"], cwd=repo)
+        diff = subprocess.run(
+            ["git", "diff", "--binary", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        ).stdout
+    except (OSError, RuntimeError, subprocess.CalledProcessError):
+        return {"dirty": None, "status": [], "diff_sha256": "unknown"}
+    return {
+        "dirty": bool(status),
+        "status": status.splitlines(),
+        "diff_sha256": hashlib.sha256(diff).hexdigest(),
+    }
+
+
 def materialize_git_ref(*, content_repo: Path, git_ref: str) -> tempfile.TemporaryDirectory[str]:
     result = subprocess.run(
         ["git", "archive", "--format=tar", git_ref],
@@ -871,7 +1358,7 @@ def materialize_git_ref(*, content_repo: Path, git_ref: str) -> tempfile.Tempora
                 raise ValueError(f"Unsafe path in git archive: {member.name}")
             if member.issym() or member.islnk():
                 raise ValueError(f"Symlinks are not allowed in the content snapshot: {member.name}")
-        archive.extractall(temporary.name)
+        archive.extractall(temporary.name, filter="data")
     return temporary
 
 
@@ -913,15 +1400,26 @@ def draft_prompt(
     prior_issues: list[str] | None = None,
     previous_plan: dict[str, Any] | None = None,
     previous_critic: dict[str, Any] | None = None,
-    claim_policy: str = "strict",
+    claim_policy: str = "integrated",
+    domain: str = "Natural Healing",
+    category_catalog: list[str] | None = None,
+    new_article_seed: dict[str, str] | None = None,
 ) -> str:
     contract = {
-        "decision": "append_existing | duplicate | needs_review",
-        "study_type": "source study type",
+        "decision": "publish_changes | duplicate | needs_review",
+        "study_type": "most specific evidence design supported by the source; a generic publisher label may be refined from explicit rat/mouse/human text",
         "target_proposals": [
             {
-                "target_path": "must exactly equal one entity-compatible candidate path",
+                "operation": "append_existing | create_new",
+                "target_path": "candidate path for append_existing; safe new .md path under DOMAIN for create_new",
                 "target_entity": "exact entity supported by every claim and matching the candidate title/path",
+                "new_article": {
+                    "title": "required only for create_new",
+                    "tags": ["focused domain tags"],
+                    "lead_text": "one near-verbatim source-grounded definition or description",
+                    "lead_source_quote": "exact contiguous source passage supporting lead_text",
+                    "category_rationale": "why this existing or new sub-category is appropriate",
+                },
                 "parent_heading": "exact existing ##-##### heading when heading is new, else empty",
                 "heading": "exact existing heading, or a new child heading",
                 "rationale": "why this entity and scope belong on this target",
@@ -955,14 +1453,12 @@ def draft_prompt(
                 "reason": "why it is not proposed anywhere",
             }
         ],
-        "new_article_recommendation": "null for append_existing; structured object only with needs_review",
         "review_notes": [],
     }
-    source = dict(packet)
-    source["body_markdown"] = str(source.get("body_markdown") or "")[:50000]
+    source = prompt_source_packet(packet)
     repair_hints: list[str] = []
     issues = prior_issues or []
-    if any(re.match(r"bullet_\d+_invalid_text$", issue) for issue in issues):
+    if any("invalid_text" in issue for issue in issues):
         repair_hints.append("For bullet text, remove every leading dash and every [^n] citation marker; the renderer adds both.")
     if any("preclinical_heading_scope_missing" in issue for issue in issues):
         repair_hints.append("Put 'Animal Evidence', 'Animal Models', or 'Preclinical Evidence' literally in the proposed heading.")
@@ -970,9 +1466,38 @@ def draft_prompt(
         repair_hints.append("Copy source_quote as one exact contiguous span from SOURCE_PACKET without ellipses or repairs.")
     if any("not_near_verbatim" in issue for issue in issues):
         repair_hints.append("Make bullet text equal source_quote except for removing a section/list label.")
+    if any("lead_not_near_verbatim" in issue for issue in issues):
+        repair_hints.append(
+            "Set new_article.lead_text equal to new_article.lead_source_quote except for harmless Markdown removal. "
+            "Do not turn an intervention-specific passage into a general entity definition or add health claims."
+        )
+    if any("missing_new_article_entity_tag" in issue for issue in issues):
+        repair_hints.append(
+            "Include the exact target entity or new-article title as one focused tag."
+        )
+    if any("contradictory_reason" in issue for issue in issues):
+        repair_hints.append(
+            "A global exclusion must be genuinely omitted everywhere. Remove entries described as already captured, included, integrated, or not excluded."
+        )
     if any("provenance" in issue or "cited_reference" in issue for issue in issues):
         repair_hints.append(
             "For a background passage with a citation marker, copy that marker and its full reference entry exactly from SOURCE_PACKET."
+        )
+    if any("citation_marker_not_in_passage" in issue for issue in issues):
+        repair_hints.append(
+            "Copy the visible author-year or numeric citation marker from source_quote; publisher Markdown anchor IDs may be omitted."
+        )
+    if any("cited_reference_url_not_in_source" in issue for issue in issues):
+        repair_hints.append(
+            "Set reference_url to an empty string unless that exact URL is visibly present in the supplied reference_text; never infer a DOI URL."
+        )
+    if any("cited_reference_not_in_source" in issue for issue in issues):
+        repair_hints.append(
+            "Remove a background claim when its exact cited reference entry is absent; do not write placeholders such as 'Not provided'."
+        )
+    if any("study_type_mismatch" in issue for issue in issues):
+        repair_hints.append(
+            "Use the most specific source-supported design: explicit rats/mice may be labeled Animal Study even when publisher metadata only says Research Article."
         )
     if any("entity" in issue for issue in issues):
         repair_hints.append(
@@ -987,8 +1512,7 @@ def draft_prompt(
         )
     else:
         policy_rules = (
-            "COMPENDIUM CLAIM POLICY: In addition to direct source_finding claims, you may propose useful "
-            "background_fact claims summarized by the supplied paper, including from Introduction and Discussion. "
+            "INTEGRATED / LEGACY COMPENDIUM CLAIM POLICY: Propose both direct source_finding claims and useful "
             "Distinguish the two claim kinds explicitly. Every claim needs an exact source_quote and source_section. "
             "When a background passage cites earlier work, preserve its exact citation marker, exact reference-list "
             "entry, and source-provided URL in cited_references; missing provenance requires needs_review. Background "
@@ -996,20 +1520,30 @@ def draft_prompt(
             "design. Animal-scoped claims should use an explicit preclinical heading when natural; otherwise the "
             "renderer adds a mandatory animal/preclinical evidence warning."
         )
-    return "\n\n".join(
-        [
+    sections = [
+            (
+                "REPAIR DIRECTIVE — THE PREVIOUS PLAN FAILED DETERMINISTIC VALIDATION. Return a materially corrected plan, not the same JSON. Fix or remove every target/bullet named below before doing anything else.\n"
+                + "ISSUES:\n"
+                + json.dumps(issues, indent=2)
+                + "\nREPAIR_HINTS:\n"
+                + json.dumps(repair_hints, indent=2)
+            )
+            if issues
+            else "FIRST PASS: build the smallest safe plan that covers the primary direct findings and useful provenance-complete background facts.",
             "Return only one JSON object matching this contract:\n" + json.dumps(contract, indent=2),
+            f"DOMAIN: {domain}",
+            "AVAILABLE_CATEGORY_DIRECTORIES:\n" + json.dumps(category_catalog or [], indent=2),
+            "MISSING_ENTITY_PAGE_SEED (suggestion, not an automatic decision):\n"
+            + json.dumps(new_article_seed or {}, indent=2),
             f"CLAIM_POLICY: {claim_policy}\n{policy_rules}",
-            "Rules: For Natural Healing use concise one-idea bullets as close to the source wording as possible. The bullet text should normally equal source_quote exactly, except that a list number or section label may be removed. Do not add citation markers; the renderer adds them. Every source_quote must be copied exactly from SOURCE_PACKET. Preserve study limitations and never turn a review, animal, rat, mouse, in-vitro, or mechanistic statement into a human treatment claim. Omit any source sentence that appears internally contradictory, corrupted, dangerously mistyped, or statistically misleading; do not silently repair it. A source may support several existing entity pages. Create a separate target_proposal for each entity-compatible page, with its own rationale, claims, evidence scopes, and exclusions. Every target_entity must match the candidate's primary title/path identity and must be asserted by each source_quote assigned to that target; a mere mention is not a claim. Never reuse the same claim across targets. Do not place cultivar, blend, or isolated-compound claims on a broader botanical page unless the exact claim supports that broader entity and the target is that entity. A citrus blend never belongs on a Bergamot page. Explicitly list material unused claims in exclusions. If no existing page is entity- and scope-compatible, return needs_review with a structured new_article_recommendation; do not create an article.",
-            "SOURCE_PACKET:\n" + json.dumps(source, indent=2),
+            "Rules: For Natural Healing use concise one-idea bullets as close to the source wording as possible. The bullet text should normally equal source_quote exactly, except that a list number, section label, or citation marker may be removed. Do not add footnote markers; the renderer adds them. Every source_quote must be copied exactly from the normalized source sections. Preserve study limitations and never turn a review, animal, rat, mouse, in-vitro, or mechanistic statement into a human treatment claim. Omit internally contradictory, corrupted, dangerously mistyped, or statistically misleading source sentences. One plan may append to several compatible pages and create one or more missing entity pages. Use operation append_existing only for a supplied candidate. Use create_new when the source's primary entity has no suitable page, including a useful category-level catch-all such as DOMAIN/Fruits/Citrus/citrus.md; choose an existing category directory when appropriate and create a new sub-category only when its semantic scope is clear. When MISSING_ENTITY_PAGE_SEED is nonempty and direct source findings explicitly concern that entity, do not discard those primary findings in favor of component-only background updates: create the seeded catch-all page and keep formulation/cultivar scope explicit in each bullet. Every target_entity must match the target title/stem and be asserted by every quote assigned to that target; a mere mention is insufficient. Never reuse the same claim across targets. Do not place cultivar, blend, or isolated-compound findings on a broader page unless the exact passage supports the broader entity. A citrus blend never belongs on a Bergamot page. A new page must include at least one direct source_finding, a source-grounded lead, focused tags including the exact target entity/title, a category rationale, and a safe path under DOMAIN. Its lead_text must normally equal lead_source_quote except for harmless Markdown removal; never generalize an intervention-specific quote into a broad definition or health claim. For cited_references, never invent a DOI or URL and never use placeholder reference text; remove the background claim if its exact reference record is unavailable. Explicitly list material unused claims in exclusions. Return needs_review only when neither guarded existing-page updates nor a well-scoped new page can be proposed safely.",
+            "SOURCE_PACKET_WITH_NORMALIZED_SECTIONS_AND_REFERENCES:\n" + json.dumps(source, indent=2),
             "MATCH_CANDIDATES:\n" + json.dumps(candidates, indent=2),
             "CANDIDATE_DOCUMENTS:\n" + json.dumps(candidate_documents, indent=2),
-            "PREVIOUS_VALIDATION_ISSUES:\n" + json.dumps(prior_issues or []),
-            "DETERMINISTIC_REPAIR_HINTS:\n" + json.dumps(repair_hints),
             "PREVIOUS_PLAN_TO_REVISE:\n" + json.dumps(previous_plan or {}, indent=2),
             "PREVIOUS_CRITIC_FEEDBACK:\n" + json.dumps(previous_critic or {}, indent=2),
         ]
-    )
+    return "\n\n".join(sections)
 
 
 def critic_issue_contract(codes: set[str]) -> dict[str, Any]:
@@ -1034,20 +1568,19 @@ def placement_critic_prompt(
     selected_candidate: dict[str, Any],
     selected_target_markdown: str,
     deterministic_issues: list[str],
-    claim_policy: str = "strict",
+    claim_policy: str = "integrated",
 ) -> str:
-    source = dict(packet)
-    source["body_markdown"] = str(source.get("body_markdown") or "")[:12000]
+    source = prompt_source_packet(packet)
     return "\n\n".join(
         [
             "Review only target-page and heading placement. Return one JSON object matching this contract:\n"
             + json.dumps(critic_issue_contract(PLACEMENT_ISSUE_CODES), indent=2),
             f"CLAIM_POLICY: {claim_policy}",
-            "Use only the supplied source, selected candidate metadata, and selected target Markdown. Do not use outside botanical or medical knowledge. Each bullet's exact source_quote must assert the target_entity; an entity merely mentioned without support for the claim is entity_not_supported. A target_entity must match the candidate's primary title/path identity. A citrus blend must never be placed on a Bergamot page. Check whether a multi-entity plan puts named-cultivar or isolated-compound claims onto a broader page that does not materially cover that entity; require the planner to restrict bullets to the selected target or return needs_review. Every issue must cite exact contiguous text from the source packet or selected target page; wrong_target_page must cite both. Use warning for useful non-gating notes, review for a human placement decision, and blocking for a clearly unsafe placement. Return an empty issues list when there is no grounded objection. Deterministic checks are authoritative for candidate membership, exact source containment, near-verbatim similarity, and provenance. In strict policy, required preclinical heading labels are authoritative. In compendium policy, an ordinary heading is acceptable only because the renderer adds a mandatory animal/preclinical evidence warning.",
-            "SOURCE_PACKET:\n" + json.dumps(source, indent=2),
+            "Use only the supplied source, selected candidate metadata, proposed new-article metadata, and selected target Markdown. Do not use outside botanical or medical knowledge. Each bullet's exact source_quote must assert the target_entity; an entity merely mentioned without support for the claim is entity_not_supported. A target_entity must match the target title/path identity. A citrus blend must never be placed on a Bergamot page. For append_existing, check the page and heading; wrong_target_page must quote both source and target. For create_new, check whether a distinct page is warranted and whether its domain/category/path scope is appropriate; new_article_not_warranted or wrong_category requires an exact source quote but no target quote because the page does not exist. Check whether named-cultivar or isolated-compound claims are being put onto a broader target without direct passage support. Use warning for useful non-gating notes, review for human placement judgment, and blocking for clearly unsafe placement. Return an empty issues list when there is no grounded objection. Deterministic checks are authoritative for path safety, candidate membership, exact source containment, near-verbatim similarity, and provenance. In integrated policy, an ordinary heading is acceptable for animal evidence only because the renderer adds a mandatory warning.",
+            "SOURCE_PACKET_WITH_NORMALIZED_SECTIONS_AND_REFERENCES:\n" + json.dumps(source, indent=2),
             "DRAFT_PLAN:\n" + json.dumps(plan, indent=2),
             "SELECTED_CANDIDATE_METADATA:\n" + json.dumps(selected_candidate, indent=2),
-            "SELECTED_TARGET_MARKDOWN:\n" + selected_target_markdown[:30000],
+            "SELECTED_TARGET_MARKDOWN:\n" + selected_target_markdown,
             "DETERMINISTIC_ISSUES:\n" + json.dumps(deterministic_issues),
         ]
     )
@@ -1060,20 +1593,19 @@ def evidence_critic_prompt(
     selected_candidate: dict[str, Any],
     selected_target_markdown: str,
     deterministic_issues: list[str],
-    claim_policy: str = "strict",
+    claim_policy: str = "integrated",
 ) -> str:
-    source = dict(packet)
-    source["body_markdown"] = str(source.get("body_markdown") or "")[:50000]
+    source = prompt_source_packet(packet)
     return "\n\n".join(
         [
             "Review only evidence support, claim strength, study scope, one-idea bullets, source integrity, and material limitations. Return one JSON object matching this contract:\n"
             + json.dumps(critic_issue_contract(EVIDENCE_ISSUE_CODES), indent=2),
             f"CLAIM_POLICY: {claim_policy}",
             "Every issue must cite an exact contiguous source_quote from SOURCE_PACKET; target_quote may additionally quote the selected page when surrounding context creates an overclaim. Verify that source_finding means a direct finding of the supplied paper and background_fact means a statement the paper summarizes. For background_fact, require its source section and preserve every earlier citation marker plus the exact supplied reference entry; missing or invented provenance is missing_source_provenance. Check the evidence_scope against the evidence described by that individual passage. Do not object merely because a near-verbatim bullet does not repeat context already made explicit by its preclinical heading, evidence warning, or evidence scope. Do not state that a claim is unsupported and then admit that the source supports it. Use no outside facts. Use warning for useful non-gating notes, review for ambiguity requiring human judgment, and blocking for a materially unsupported, misattributed, or unsafe claim. Return an empty issues list when there is no grounded objection. Deterministic checks are authoritative for exact source containment, provenance, and near-verbatim similarity.",
-            "SOURCE_PACKET:\n" + json.dumps(source, indent=2),
+            "SOURCE_PACKET_WITH_NORMALIZED_SECTIONS_AND_REFERENCES:\n" + json.dumps(source, indent=2),
             "DRAFT_PLAN:\n" + json.dumps(plan, indent=2),
             "SELECTED_CANDIDATE_METADATA:\n" + json.dumps(selected_candidate, indent=2),
-            "SELECTED_TARGET_MARKDOWN:\n" + selected_target_markdown[:30000],
+            "SELECTED_TARGET_MARKDOWN:\n" + selected_target_markdown,
             "DETERMINISTIC_ISSUES:\n" + json.dumps(deterministic_issues),
         ]
     )
@@ -1109,6 +1641,7 @@ def validate_critic_review(
     allowed_codes = PLACEMENT_ISSUE_CODES if review_kind == "placement" else EVIDENCE_ISSUE_CODES
     source = source_evidence(packet)
     bullets = plan.get("bullets") if isinstance(plan.get("bullets"), list) else []
+    operation = str(plan.get("operation") or "append_existing")
     accepted: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     raw_issues = review.get("issues")
@@ -1155,7 +1688,7 @@ def validate_critic_review(
             errors.append("missing_evidence_quote")
         if review_kind == "evidence" and not source_quote:
             errors.append("evidence_review_requires_source_quote")
-        if code == "wrong_target_page" and (not source_quote or not target_quote):
+        if code == "wrong_target_page" and operation != "create_new" and (not source_quote or not target_quote):
             errors.append("wrong_target_requires_source_and_target_quotes")
         if critic_issue_is_self_contradictory(code, explanation):
             errors.append("self_contradictory_issue")
@@ -1450,7 +1983,7 @@ def review_plan_targets(
     candidate_documents: dict[str, str],
     deterministic_issues: list[str],
     critic_mode: str,
-    claim_policy: str = "strict",
+    claim_policy: str = "integrated",
 ) -> dict[str, Any]:
     """Run independent placement and evidence criticism for every target."""
     if critic_mode == "off":
@@ -1475,6 +2008,14 @@ def review_plan_targets(
             ),
             {},
         )
+        if proposal_operation(plan, proposal) == "create_new":
+            selected_candidate = {
+                "operation": "create_new",
+                "path": selected_path,
+                "title": str(((proposal.get("new_article") or {}).get("title") or "")),
+                "domain": PurePosixPath(selected_path).parts[0] if selected_path else "",
+                "new_article": proposal.get("new_article") or {},
+            }
         raw_placement = client.json_completion(
             system="You are an independent target-placement reviewer. Use only supplied evidence and return only the requested JSON.",
             user=placement_critic_prompt(
@@ -1571,7 +2112,12 @@ def critic_rejects_all_target_entities(critic: dict[str, Any]) -> bool:
     target_reviews = critic.get("target_reviews")
     if not isinstance(target_reviews, list) or not target_reviews:
         return False
-    entity_codes = {"wrong_target_page", "unsafe_context_inference"}
+    entity_codes = {
+        "wrong_target_page",
+        "unsafe_context_inference",
+        "new_article_not_warranted",
+        "wrong_category",
+    }
     for target_review in target_reviews:
         if not isinstance(target_review, dict):
             return False
@@ -1596,13 +2142,14 @@ def run_local_publish(
     model: str,
     publish: bool,
     base_ref: str = "origin/main",
-    max_candidates: int = 5,
+    max_candidates: int = 12,
     max_draft_attempts: int = 3,
     critic_mode: str = "required",
-    claim_policy: str = "strict",
+    claim_policy: str = "integrated",
     allow_critic_rejection: bool = False,
     override_reason: str = "",
     passive_worker: bool = False,
+    domain: str = "Natural Healing",
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     # Imported lazily to keep the pure validators independently testable.
@@ -1610,6 +2157,7 @@ def run_local_publish(
         check_duplicate_paper,
         load_articles,
         match_research_packet,
+        normalize_domain,
         scrape_source_packet,
         slugify,
     )
@@ -1619,6 +2167,7 @@ def run_local_publish(
         raise ValueError(f"critic_mode must be one of: {', '.join(sorted(CRITIC_MODES))}")
     if claim_policy not in CLAIM_POLICIES:
         raise ValueError(f"claim_policy must be one of: {', '.join(sorted(CLAIM_POLICIES))}")
+    domain = normalize_domain(domain)
     if passive_worker and allow_critic_rejection:
         raise ValueError("Critic rejection overrides are prohibited in the passive database worker")
     if passive_worker and critic_mode != "required":
@@ -1633,11 +2182,101 @@ def run_local_publish(
         raise ValueError("--critic-mode off is manual dry-run only and cannot be used with --publish")
 
     publication_suppressed = "critic_mode_advisory" if publish and critic_mode == "advisory" else ""
+    run_started = datetime.now(timezone.utc)
+    run_started_monotonic = time.monotonic()
     output_dir.mkdir(parents=True, exist_ok=True)
     slug = slugify(Path(source).stem or "research") or "research"
-    scrape_markdown = output_dir / f"{slug}-source.md"
-    report_path = output_dir / f"{slug}-local-publish-report.json"
-    packet = scrape_source_packet(source, scrape_markdown)
+    run_id = (
+        run_started.strftime("%Y%m%dT%H%M%S.%fZ")
+        + f"-{slug[:40]}-"
+        + hashlib.sha256(source.encode("utf-8")).hexdigest()[:10]
+    )
+    run_dir = output_dir / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    scrape_markdown = run_dir / "source.md"
+    packet_path = run_dir / "packet.json"
+    report_path = run_dir / "report.json"
+    diff_path = run_dir / "proposed.patch"
+    base_snapshot_temp: tempfile.TemporaryDirectory[str] | None = None
+    client: LocalLLMClient | None = None
+    duplicate: dict[str, Any] | None = None
+
+    def finish(report: dict[str, Any]) -> dict[str, Any]:
+        completed_at = datetime.now(timezone.utc)
+        status = str(report.get("status") or "needs_review")
+        if status == "pr_open":
+            publication_outcome = "draft_pr_opened"
+        elif status == "validated_draft":
+            publication_outcome = "suppressed" if publication_suppressed else "dry_run"
+        else:
+            publication_outcome = "not_published"
+        report.setdefault("source", source)
+        report.setdefault("domain", domain)
+        report.setdefault("critic_mode", critic_mode)
+        report.setdefault("claim_policy", claim_policy)
+        report.setdefault("publication_requested", publish)
+        report.setdefault("publication_suppressed", publication_suppressed)
+        report.setdefault("duplicate", duplicate)
+        report.update(
+            {
+                "run_id": run_id,
+                "started_at": run_started.isoformat(),
+                "completed_at": completed_at.isoformat(),
+                "duration_seconds": round(time.monotonic() - run_started_monotonic, 3),
+                "publication_outcome": publication_outcome,
+                "model_calls": (
+                    list(client.calls)
+                    if client is not None and isinstance(client.calls, list)
+                    else []
+                ),
+                "report_path": str(report_path),
+                "artifacts": {
+                    "run_directory": str(run_dir),
+                    "source_markdown": str(scrape_markdown) if scrape_markdown.exists() else "",
+                    "packet_json": (
+                        str(packet_path) if isinstance(report.get("packet"), dict) else ""
+                    ),
+                    "report_json": str(report_path),
+                    "proposed_patch": str(diff_path) if diff_path.exists() else "",
+                },
+                "runtime": {
+                    "base_url": base_url,
+                    "model": model,
+                    "tools_revision": git_revision(tools_root),
+                    "tools_worktree": git_worktree_provenance(tools_root),
+                    "content_base_ref": base_ref,
+                    "content_base_revision": git_revision(content_repo, base_ref),
+                    "options": {
+                        "alert_name": alert_name,
+                        "max_candidates": max_candidates,
+                        "max_draft_attempts": max_draft_attempts,
+                        "critic_mode": critic_mode,
+                        "claim_policy": claim_policy,
+                        "domain": domain,
+                        "publish": publish,
+                        "passive_worker": passive_worker,
+                    },
+                },
+            }
+        )
+        packet_value = report.get("packet")
+        if isinstance(packet_value, dict):
+            packet_path.write_text(json.dumps(packet_value, indent=2), encoding="utf-8")
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        if base_snapshot_temp is not None:
+            base_snapshot_temp.cleanup()
+        return report
+
+    try:
+        packet = scrape_source_packet(source, scrape_markdown)
+    except Exception as exc:
+        return finish(
+            {
+                "status": "needs_review",
+                "reason": "source_retrieval_failed",
+                "retrieval_error": str(exc)[:4000],
+            }
+        )
     packet_validation = validate_source_packet(packet)
     if not packet_validation.ok:
         report = {
@@ -1646,14 +2285,8 @@ def run_local_publish(
             "reason": "invalid_source_packet",
             "packet": packet,
             "packet_validation": asdict(packet_validation),
-            "critic_mode": critic_mode,
-            "claim_policy": claim_policy,
-            "publication_requested": publish,
-            "publication_suppressed": publication_suppressed,
-            "report_path": str(report_path),
         }
-        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        return report
+        return finish(report)
     if progress:
         progress("matching")
 
@@ -1662,11 +2295,6 @@ def run_local_publish(
         run_command(["git", "fetch", "origin", "main"], cwd=content_repo)
     base_snapshot_temp = materialize_git_ref(content_repo=content_repo, git_ref=base_ref)
     base_snapshot = Path(base_snapshot_temp.name)
-
-    def finish(report: dict[str, Any]) -> dict[str, Any]:
-        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        base_snapshot_temp.cleanup()
-        return report
 
     duplicate_checks = [
         check_duplicate_paper(
@@ -1691,50 +2319,63 @@ def run_local_publish(
             "duplicate": duplicate,
             "packet": packet,
             "packet_validation": asdict(packet_validation),
-            "critic_mode": critic_mode,
-            "claim_policy": claim_policy,
-            "publication_requested": publish,
-            "publication_suppressed": publication_suppressed,
-            "report_path": str(report_path),
         }
         return finish(report)
 
     articles = load_articles(base_snapshot)
-    candidates = match_research_packet(
+    existing_paths = {article.path for article in articles}
+    ranked_candidates = match_research_packet(
         articles,
         packet,
         alert_name=alert_name,
-        include_background=claim_policy == "compendium",
-        limit=max_candidates,
+        include_background=includes_background_claims(claim_policy),
+        domain=domain,
+        limit=max(max_candidates * 10, 100),
     )
-    if not candidates:
-        report = {
-            "status": "needs_review",
-            "reason": "no_content_candidates",
-            "packet": packet,
-            "packet_validation": asdict(packet_validation),
-            "critic_mode": critic_mode,
-            "claim_policy": claim_policy,
-            "publication_requested": publish,
-            "publication_suppressed": publication_suppressed,
-            "new_article_recommendation": new_article_recommendation(
-                packet,
-                reason=(
-                    "No existing page has a discriminative entity match for this source; "
-                    "a human should decide whether a new scoped article is warranted."
-                ),
-            ),
-            "report_path": str(report_path),
-        }
-        return finish(report)
+    candidates = ranked_candidates[:max_candidates]
+    candidate_retrieval = {
+        "domain": domain,
+        "eligible_count": len(ranked_candidates),
+        "selected_count": len(candidates),
+        "candidate_limit": max_candidates,
+        "rejected_candidates": ranked_candidates[max_candidates : max_candidates + 20],
+    }
     candidate_documents: dict[str, str] = {}
+    per_candidate_context = max(
+        2000,
+        MAX_ALL_CANDIDATE_CONTEXT_CHARS // max(len(candidates), 1),
+    )
     for candidate in candidates:
         path = base_snapshot / candidate["path"]
-        candidate_documents[candidate["path"]] = path.read_text(encoding="utf-8")[:30000]
+        candidate_documents[candidate["path"]] = candidate_document_excerpt(
+            path.read_text(encoding="utf-8"),
+            [str(value) for value in candidate.get("entity_matches") or []],
+            max_chars=per_candidate_context,
+        )
+    candidate_retrieval.update(
+        {
+            "per_candidate_context_limit_chars": per_candidate_context,
+            "selected_context_chars": sum(len(value) for value in candidate_documents.values()),
+        }
+    )
+    category_catalog = sorted(
+        {
+            str(PurePosixPath(article.path).parent)
+            for article in articles
+            if PurePosixPath(article.path).parts
+            and PurePosixPath(article.path).parts[0] == domain
+        }
+    )
+    new_article_seed = missing_entity_page_seed(
+        packet=packet,
+        alert_name=alert_name,
+        domain=domain,
+        category_catalog=category_catalog,
+        existing_paths=existing_paths,
+    )
+    candidate_retrieval["new_article_seed"] = new_article_seed
 
     client = LocalLLMClient(base_url, model)
-    if progress:
-        progress("drafting")
     system = (
         "You are a conservative research publishing planner. Follow the supplied style guides and JSON contract exactly.\n\n"
         + style_context(tools_root)
@@ -1751,31 +2392,124 @@ def run_local_publish(
     previous_plan: dict[str, Any] = {}
     previous_critic: dict[str, Any] = {}
     attempt_history: list[dict[str, Any]] = []
+    format_repairs: list[dict[str, Any]] = []
     best_valid_attempt: dict[str, Any] | None = None
     candidate_paths = {str(item["path"]) for item in candidates}
     if max_draft_attempts < 1:
         raise ValueError("max_draft_attempts must be at least 1")
-    for attempt_number in range(1, max_draft_attempts + 1):
-        plan = client.json_completion(
-            system=system,
-            user=draft_prompt(
-                packet=packet,
-                candidates=candidates,
-                candidate_documents=candidate_documents,
-                prior_issues=prior_issues,
-                previous_plan=previous_plan,
-                previous_critic=previous_critic,
-                claim_policy=claim_policy,
-            ),
+
+    def model_failure(phase: str, exc: Exception) -> dict[str, Any]:
+        return finish(
+            {
+                "status": "needs_review",
+                "reason": "model_call_failed",
+                "failure_phase": phase,
+                "model_error": str(exc)[:4000],
+                "source": source,
+                "packet": packet,
+                "packet_validation": asdict(packet_validation),
+                "candidates": candidates,
+                "candidate_retrieval": candidate_retrieval,
+                "source_prompt_context": prompt_source_packet(packet).get(
+                    "prompt_context", {}
+                ),
+                "attempt_history": attempt_history,
+                "format_repairs": format_repairs,
+            }
         )
+
+    for attempt_number in range(1, max_draft_attempts + 1):
+        if progress:
+            progress(f"drafting_attempt_{attempt_number}")
+        try:
+            plan = client.json_completion(
+                system=system,
+                user=draft_prompt(
+                    packet=packet,
+                    candidates=candidates,
+                    candidate_documents=candidate_documents,
+                    prior_issues=prior_issues,
+                    previous_plan=previous_plan,
+                    previous_critic=previous_critic,
+                    claim_policy=claim_policy,
+                    domain=domain,
+                    category_catalog=category_catalog,
+                    new_article_seed=new_article_seed,
+                ),
+                max_tokens=MAX_DRAFT_OUTPUT_TOKENS,
+            )
+        except ModelOutputJSONError as exc:
+            source_call = client.calls[-1] if client.calls else {}
+            repair_record: dict[str, Any] = {
+                "attempt": attempt_number,
+                "source_call": len(client.calls),
+                "status": "attempting",
+                "finish_reason": source_call.get("finish_reason"),
+                "raw_output_sha256": hashlib.sha256(
+                    exc.raw_output.encode("utf-8")
+                ).hexdigest(),
+                "raw_output_chars": len(exc.raw_output),
+            }
+            format_repairs.append(repair_record)
+            if source_call.get("finish_reason") == "length":
+                repair_record.update(
+                    {
+                        "status": "not_attempted",
+                        "reason": "draft_output_truncated_at_completion_limit",
+                    }
+                )
+                return model_failure("draft_output_truncated", exc)
+            try:
+                if progress:
+                    progress(f"format_repair_attempt_{attempt_number}")
+                plan = client.json_completion(
+                    system=(
+                        "You repair JSON syntax only. Preserve every field, string, array, "
+                        "claim, quote, citation, and decision exactly as supplied. Return only "
+                        "one syntactically valid JSON object. Do not add, remove, reinterpret, "
+                        "or fact-check content."
+                    ),
+                    user="MALFORMED_JSON_TO_REPAIR:\n" + exc.raw_output,
+                    max_tokens=MAX_DRAFT_OUTPUT_TOKENS,
+                )
+                repair_record.update(
+                    {
+                        "status": "repaired",
+                        "repair_call": len(client.calls),
+                    }
+                )
+            except Exception as repair_exc:
+                repair_record.update(
+                    {
+                        "status": "failed",
+                        "repair_call": len(client.calls),
+                        "error": str(repair_exc)[:1000],
+                    }
+                )
+                return model_failure("draft_format_repair", repair_exc)
+        except Exception as exc:
+            return model_failure("drafting", exc)
         deterministic = validate_draft_plan(
             plan,
             packet=packet,
             candidate_paths=candidate_paths,
             candidate_metadata={str(item["path"]): item for item in candidates},
+            existing_paths=existing_paths,
+            domain=domain,
             claim_policy=claim_policy,
         )
-        if deterministic.ok and plan.get("decision") != "append_existing":
+        if progress:
+            progress(f"deterministic_validation_attempt_{attempt_number}")
+        repeated_invalid_plan = bool(
+            previous_plan and plan == previous_plan and not deterministic.ok
+        )
+        if repeated_invalid_plan:
+            deterministic = ValidationResult(
+                False,
+                sorted({*deterministic.issues, "repeated_invalid_plan"}),
+                deterministic.warnings,
+            )
+        if deterministic.ok and plan.get("decision") not in CHANGE_DECISIONS:
             critic = {
                 "approved": False,
                 "recommendation": "not_run",
@@ -1792,16 +2526,21 @@ def run_local_publish(
                 "skipped_reason": "deterministic_plan_invalid",
             }
         else:
-            critic = review_plan_targets(
-                client=client,
-                packet=packet,
-                plan=plan,
-                candidates=candidates,
-                candidate_documents=candidate_documents,
-                deterministic_issues=deterministic.issues + deterministic.warnings,
-                critic_mode=critic_mode,
-                claim_policy=claim_policy,
-            )
+            try:
+                if progress:
+                    progress(f"critic_attempt_{attempt_number}")
+                critic = review_plan_targets(
+                    client=client,
+                    packet=packet,
+                    plan=plan,
+                    candidates=candidates,
+                    candidate_documents=candidate_documents,
+                    deterministic_issues=deterministic.issues + deterministic.warnings,
+                    critic_mode=critic_mode,
+                    claim_policy=claim_policy,
+                )
+            except Exception as exc:
+                return model_failure("critic", exc)
 
         attempt_record = {
             "attempt": attempt_number,
@@ -1810,12 +2549,14 @@ def run_local_publish(
             "critic": critic,
         }
         attempt_history.append(attempt_record)
-        if deterministic.ok and plan.get("decision") == "append_existing":
+        if deterministic.ok and plan.get("decision") in CHANGE_DECISIONS:
             if best_valid_attempt is None or attempt_quality(attempt_record) < attempt_quality(best_valid_attempt):
                 best_valid_attempt = attempt_record
-        if deterministic.ok and plan.get("decision") != "append_existing":
+        if deterministic.ok and plan.get("decision") not in CHANGE_DECISIONS:
             break
         if deterministic.ok and critic.get("approved") is True:
+            break
+        if repeated_invalid_plan:
             break
         prior_issues = deterministic.issues + [
             str(item.get("code") or item)
@@ -1835,6 +2576,9 @@ def run_local_publish(
         "packet": packet,
         "packet_validation": asdict(packet_validation),
         "candidates": candidates,
+        "candidate_retrieval": candidate_retrieval,
+        "source_prompt_context": prompt_source_packet(packet).get("prompt_context", {}),
+        "domain": domain,
         "plan": plan,
         "plan_validation": asdict(deterministic),
         "critic": critic,
@@ -1843,15 +2587,16 @@ def run_local_publish(
         "publication_requested": publish,
         "publication_suppressed": publication_suppressed,
         "attempt_history": attempt_history,
+        "format_repairs": format_repairs,
         "selected_attempt": selected_attempt.get("attempt") if selected_attempt else None,
         "best_deterministic_valid_attempt": best_valid_attempt,
     }
     if progress:
         progress("validating")
-    report["report_path"] = str(report_path)
-    if plan.get("decision") != "append_existing":
+    if plan.get("decision") not in CHANGE_DECISIONS:
         report["status"] = str(plan.get("decision") or "needs_review")
         if report["status"] == "needs_review":
+            report["reason"] = str(plan.get("reason") or "model_needs_review")
             report["new_article_recommendation"] = (
                 plan.get("new_article_recommendation")
                 if isinstance(plan.get("new_article_recommendation"), dict)
@@ -1908,9 +2653,19 @@ def run_local_publish(
     for target_index, proposal in enumerate(plan_target_proposals(plan)):
         target_relative = Path(str(proposal["target_path"]))
         target = (worktree / target_relative).resolve()
-        if worktree.resolve() not in target.parents or not target.is_file():
+        operation = proposal_operation(plan, proposal)
+        if worktree.resolve() not in target.parents:
             raise ValueError("Validated target escaped the isolated content worktree")
-        original = rendered_documents.get(target, target.read_text(encoding="utf-8"))
+        if operation == "append_existing" and not target.is_file():
+            raise ValueError("Validated existing target is missing from the isolated worktree")
+        if operation == "create_new" and target.exists():
+            raise ValueError("Validated new target already exists in the isolated worktree")
+        original = rendered_documents.get(
+            target,
+            target.read_text(encoding="utf-8")
+            if operation == "append_existing"
+            else initial_new_article_markdown(proposal),
+        )
         updated = apply_draft_plan(
             original, proposal, packet, claim_policy=claim_policy
         )
@@ -1937,15 +2692,19 @@ def run_local_publish(
         if target_relative not in target_relatives:
             target_relatives.append(target_relative)
     for target, updated in rendered_documents.items():
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(updated, encoding="utf-8")
     report["rendered_validation"] = rendered_results
+    run_command(
+        ["git", "add", "-N", "--", *[str(path) for path in target_relatives]],
+        cwd=worktree,
+    )
     diff = run_command(
         ["git", "diff", "--", *[str(path) for path in target_relatives]],
         cwd=worktree,
     )
     if not diff:
         raise RuntimeError("Draft produced no markdown change")
-    diff_path = output_dir / f"{slug}-proposed.patch"
     diff_path.write_text(diff + "\n", encoding="utf-8")
     report.update(
         {
