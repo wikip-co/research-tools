@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
+from wiki_automation import cli, local_publish
 from wiki_automation.local_publish import (
     apply_draft_plan,
     combine_critic_reviews,
@@ -11,10 +15,12 @@ from wiki_automation.local_publish import (
     format_critic_pr_audit,
     merge_duplicate_checks,
     run_local_publish,
+    source_is_preclinical,
     validate_critic_review,
     validate_draft_plan,
     validate_rendered_markdown,
     validate_source_packet,
+    word_token_similarity,
 )
 
 
@@ -189,6 +195,280 @@ tags:
             candidate_paths={"Natural Healing/resveratrol.md"},
         )
         self.assertTrue(valid.ok, valid.issues)
+
+    def test_rat_mouse_terms_are_preclinical_and_require_animal_scope(self) -> None:
+        for cue in ("rat", "rats", "mouse", "mice"):
+            with self.subTest(cue=cue):
+                packet = dict(self.packet)
+                packet["abstract"] = (
+                    f"This experiment administered the botanical blend to {cue} "
+                    "and measured a metabolic outcome over eight weeks."
+                )
+                self.assertTrue(source_is_preclinical(packet))
+                plan = {
+                    "decision": "append_existing",
+                    "target_path": "Natural Healing/example.md",
+                    "parent_heading": "## Disease / Symptom Treatment",
+                    "heading": "### Metabolic Syndrome",
+                    "bullets": [
+                        {
+                            "text": packet["abstract"],
+                            "source_quote": packet["abstract"],
+                            "evidence_scope": "human",
+                        }
+                    ],
+                }
+                result = validate_draft_plan(
+                    plan,
+                    packet=packet,
+                    candidate_paths={"Natural Healing/example.md"},
+                )
+                self.assertIn("preclinical_heading_scope_missing", result.issues)
+                self.assertIn("bullet_0_preclinical_scope_must_be_animal", result.issues)
+
+    def test_multi_target_plan_validates_each_target_and_explicit_exclusions(self) -> None:
+        quote_one = (
+            "Poor aqueous solubility and extensive metabolism limit the clinical "
+            "translation of quercetin."
+        )
+        quote_two = "Clinical study results remain heterogeneous across the reviewed populations."
+        packet = dict(self.packet)
+        packet["abstract"] = f"{quote_one} {quote_two}"
+        plan = {
+            "decision": "append_existing",
+            "study_type": "Review",
+            "target_proposals": [
+                {
+                    "target_path": "Natural Healing/quercetin.md",
+                    "parent_heading": "",
+                    "heading": "## Bioavailability",
+                    "rationale": "The claim directly concerns quercetin.",
+                    "bullets": [
+                        {
+                            "text": quote_one,
+                            "source_quote": quote_one,
+                            "evidence_scope": "review_summary",
+                        }
+                    ],
+                    "exclusions": [],
+                },
+                {
+                    "target_path": "Health/clinical-evidence.md",
+                    "parent_heading": "",
+                    "heading": "## Evidence Limitations",
+                    "rationale": "This target covers heterogeneity in clinical evidence.",
+                    "bullets": [
+                        {
+                            "text": quote_two,
+                            "source_quote": quote_two,
+                            "evidence_scope": "review_summary",
+                        }
+                    ],
+                    "exclusions": [{"source_quote": quote_one, "reason": "Different target entity."}],
+                },
+            ],
+            "exclusions": [],
+        }
+        valid = validate_draft_plan(
+            plan,
+            packet=packet,
+            candidate_paths={
+                "Natural Healing/quercetin.md",
+                "Health/clinical-evidence.md",
+            },
+        )
+        self.assertTrue(valid.ok, valid.issues)
+        plan["target_proposals"][1]["bullets"][0].update(
+            {"text": quote_one, "source_quote": quote_one}
+        )
+        invalid = validate_draft_plan(
+            plan,
+            packet=packet,
+            candidate_paths={
+                "Natural Healing/quercetin.md",
+                "Health/clinical-evidence.md",
+            },
+        )
+        self.assertIn(
+            "target_1_bullet_0_claim_assigned_to_multiple_targets",
+            invalid.issues,
+        )
+
+    def test_near_verbatim_uses_word_tokens_without_autojunk(self) -> None:
+        repeated = " ".join(["clementine"] * 220 + ["reduced", "weight", "gain"])
+        self.assertEqual(word_token_similarity(repeated, repeated), 1.0)
+        self.assertLess(
+            word_token_similarity(repeated, "weight gain reduced " + " ".join(["grapefruit"] * 220)),
+            0.1,
+        )
+
+    def test_rat_citrus_blend_yields_review_only_new_article_recommendation(self) -> None:
+        packet = {
+            "title": "Effects of a clementine and pink grapefruit blend on metabolic alterations in rats",
+            "doi": "10.1000/citrus-rat",
+            "abstract": (
+                "A clementine and pink grapefruit blend was administered to rats "
+                "with diet-induced metabolic alterations for eight weeks."
+            ),
+            "body_markdown": "Clementine and pink grapefruit blend evidence in rats. " * 30,
+            "retrieval_issues": [],
+            "reference_url": "https://doi.org/10.1000/citrus-rat",
+            "url": "https://example.org/citrus-rat",
+            "journal": "Example Journal",
+            "pub_date": "2026",
+            "study_type": "Animal Study: Rat",
+            "authors": "A. Author",
+            "keywords": "clementine; pink grapefruit; citrus blend; metabolic",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            content = root / "content"
+            content.mkdir()
+            article = content / "Natural Healing" / "bergamot.md"
+            article.parent.mkdir(parents=True)
+            article.write_text(
+                "---\ntitle: Bergamot\ntags:\n- Citrus\n- Metabolic Health\n---\n\n"
+                "# Bergamot\n\nBergamot is a citrus fruit discussed in metabolic research.\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-q"], cwd=content, check=True)
+            subprocess.run(["git", "add", "."], cwd=content, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.org",
+                    "commit",
+                    "-qm",
+                    "base",
+                ],
+                cwd=content,
+                check=True,
+            )
+            with patch.object(cli, "CONTENT_INDEX_DIR", root / "cache"), patch.object(
+                cli, "scrape_source_packet", return_value=packet
+            ), patch.object(
+                cli,
+                "check_duplicate_paper",
+                return_value={"content_hits": [], "paper_result": None},
+            ):
+                report = run_local_publish(
+                    source=packet["url"],
+                    alert_name="",
+                    content_repo=content,
+                    tools_root=root,
+                    output_dir=root / "out",
+                    base_url="http://127.0.0.1:1/v1",
+                    model="unused",
+                    publish=False,
+                    base_ref="HEAD",
+                )
+        self.assertEqual(report["status"], "needs_review")
+        self.assertEqual(report["reason"], "no_content_candidates")
+        recommendation = report["new_article_recommendation"]
+        self.assertEqual(recommendation["recommendation"], "consider_new_article")
+        self.assertFalse(recommendation["automatic_creation"])
+        self.assertFalse(recommendation["automatic_publication"])
+
+    def test_repairs_preserve_history_and_select_best_deterministic_valid_attempt(self) -> None:
+        quote = (
+            "Poor aqueous solubility and extensive metabolism limit the clinical "
+            "translation of quercetin."
+        )
+        valid_plan = {
+            "decision": "append_existing",
+            "study_type": "Review",
+            "target_proposals": [
+                {
+                    "target_path": "Natural Healing/quercetin.md",
+                    "parent_heading": "",
+                    "heading": "## Safety",
+                    "rationale": "The target is the studied entity.",
+                    "bullets": [
+                        {
+                            "text": quote,
+                            "source_quote": quote,
+                            "evidence_scope": "review_summary",
+                        }
+                    ],
+                    "exclusions": [],
+                }
+            ],
+            "exclusions": [],
+        }
+        invalid_repair = {
+            **valid_plan,
+            "target_proposals": [
+                {**valid_plan["target_proposals"][0], "target_path": "Natural Healing/missing.md"}
+            ],
+        }
+        rejected_critic = {
+            "approved": False,
+            "recommendation": "needs_review",
+            "issues": [{"code": "wrong_heading", "severity": "review"}],
+            "mode": "required",
+            "target_reviews": [],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            content = root / "content"
+            content.mkdir()
+            article = content / "Natural Healing" / "quercetin.md"
+            article.parent.mkdir(parents=True)
+            article.write_text(
+                "---\ntitle: Quercetin\ntags:\n- Antioxidant\n---\n\n## Safety\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-q"], cwd=content, check=True)
+            subprocess.run(["git", "add", "."], cwd=content, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.org",
+                    "commit",
+                    "-qm",
+                    "base",
+                ],
+                cwd=content,
+                check=True,
+            )
+            client = Mock()
+            client.json_completion.side_effect = [valid_plan, invalid_repair]
+            with patch.object(cli, "CONTENT_INDEX_DIR", root / "cache"), patch.object(
+                cli, "scrape_source_packet", return_value=self.packet
+            ), patch.object(
+                cli,
+                "check_duplicate_paper",
+                return_value={"content_hits": [], "paper_result": None},
+            ), patch.object(
+                local_publish, "LocalLLMClient", return_value=client
+            ), patch.object(
+                local_publish, "style_context", return_value="guides"
+            ), patch.object(
+                local_publish, "review_plan_targets", return_value=rejected_critic
+            ):
+                report = run_local_publish(
+                    source=self.packet["url"],
+                    alert_name="Quercetin",
+                    content_repo=content,
+                    tools_root=root,
+                    output_dir=root / "out",
+                    base_url="http://127.0.0.1:1/v1",
+                    model="unused",
+                    publish=False,
+                    base_ref="HEAD",
+                    max_draft_attempts=2,
+                )
+        self.assertEqual(report["status"], "needs_review")
+        self.assertEqual(report["reason"], "critic_quality_gate_failed")
+        self.assertEqual(len(report["attempt_history"]), 2)
+        self.assertEqual(report["selected_attempt"], 1)
+        self.assertEqual(report["best_deterministic_valid_attempt"]["plan"], valid_plan)
 
     def test_new_subsection_is_inserted_before_footnote_definitions(self) -> None:
         markdown = """---

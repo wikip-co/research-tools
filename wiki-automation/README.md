@@ -174,16 +174,20 @@ job:
 
 Add `--publish` only after reviewing dry-run reports and patches. Publication
 uses an isolated worktree based on `origin/main` and opens a draft PR only when
-packet, duplicate, match, evidence, critic, render, and Git-scope gates all
-pass. It does not auto-merge or autonomously create a new article. See
+packet, duplicate, entity match, every target-specific evidence/placement
+critic, render, and Git-scope gate all pass. A single paper may propose multiple
+existing targets, with separate claims, rationale, and exclusions for each. It
+does not auto-merge or autonomously create a new article; an unmatched source
+instead receives a structured human-review recommendation. See
 [`../docs/local-research-publisher.md`](../docs/local-research-publisher.md).
 
 The default `--critic-mode required` runs independent placement and evidence
 reviews grounded in exact source/target quotations. `advisory` can produce a
 review patch but suppresses publishing; `off` is ad-hoc dry-run only. A human
-can override a required-mode critic rejection only with `--publish`,
-`--allow-critic-rejection`, and an `--override-reason`; deterministic and
-citation-metadata gates remain mandatory. The passive worker has no override.
+can record an audited override request only with `--publish`,
+`--allow-critic-rejection`, and an `--override-reason`; it does not bypass the
+critic publication gate, and deterministic/citation-metadata gates remain
+mandatory. The passive worker has no override.
 Draft PRs separate validated critic findings from rejected observations. The
 latter are labeled non-blocking and include the validation errors that prevented
 them from influencing the publication decision.

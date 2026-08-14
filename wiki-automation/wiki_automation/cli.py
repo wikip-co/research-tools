@@ -38,6 +38,12 @@ RESEARCH_MATCH_STOPWORDS = {
     "signal", "study", "studies", "systematic", "therapy", "treatment",
     "using", "with", "without", "from", "into", "this", "that", "their",
     "these", "those", "were", "been", "have", "has", "and", "the", "for",
+    # Study design, outcomes, and broad category vocabulary are useful for
+    # describing a paper but unsafe as evidence that an article covers the
+    # paper's studied entity.
+    "activity", "administration", "associated", "blend", "citrus", "dose",
+    "induced", "metabolic", "metabolism", "mouse", "mice", "rat", "rats",
+    "pink", "preclinical", "supplement", "supplementation", "versus",
 }
 
 TOOL_DIR = Path(__file__).resolve().parents[1]
@@ -402,11 +408,18 @@ def score_match(title: str, article: ArticleRecord) -> float:
     elif title_norm == stem_norm:
         exact_bonus = 30
 
-    title_ratio = SequenceMatcher(None, title_norm, article_title_norm).ratio()
-    stem_ratio = SequenceMatcher(None, title_norm, stem_norm).ratio()
-    path_ratio = SequenceMatcher(None, title_norm, path_norm).ratio()
+    title_tokens = title_norm.split()
+    title_ratio = SequenceMatcher(
+        None, title_tokens, article_title_norm.split(), autojunk=False
+    ).ratio()
+    stem_ratio = SequenceMatcher(
+        None, title_tokens, stem_norm.split(), autojunk=False
+    ).ratio()
+    path_ratio = SequenceMatcher(
+        None, title_tokens, path_norm.split(), autojunk=False
+    ).ratio()
 
-    title_tokens = set(title_norm.split())
+    title_tokens = set(title_tokens)
     article_tokens = set(article_title_norm.split()) | set(stem_norm.split())
     overlap = 0.0
     if title_tokens and article_tokens:
@@ -454,9 +467,9 @@ def research_match_candidates(
     """Retrieve content homes using source entities, not only paper-title fuzziness.
 
     Research paper titles are often descriptions rather than encyclopedia topics.
-    This scorer emphasizes rare compounds/conditions repeated in the title,
-    abstract, keywords, or Scholar alert name and searches titles, tags, paths,
-    and existing article bodies.
+    Eligibility therefore requires a discriminative source-entity term in an
+    article identity field (title, stem, path, or tags). Abstract/body overlap
+    can rank eligible homes but cannot make an unrelated page eligible by itself.
     """
 
     def useful_terms(value: str) -> list[str]:
@@ -477,8 +490,9 @@ def research_match_candidates(
     for term, count in Counter(abstract_terms).items():
         query_counts[term] += min(count, 3)
 
-    if not query_counts:
-        return top_matches(articles, title, limit=limit)
+    identity_query_terms = set(title_terms) | set(keyword_terms) | set(alert_terms)
+    if not query_counts or not identity_query_terms:
+        return []
 
     article_fields: list[tuple[ArticleRecord, dict[str, set[str]]]] = []
     document_frequency: Counter[str] = Counter()
@@ -497,6 +511,10 @@ def research_match_candidates(
     alert_phrase = normalize(alert_name)
     results: list[dict[str, Any]] = []
     for article, fields in article_fields:
+        identity_terms = fields["title"] | fields["tags"] | fields["path"]
+        entity_matches = identity_terms & identity_query_terms
+        if not entity_matches:
+            continue
         contributions: dict[str, float] = {}
         matched_terms: set[str] = set()
         score = 0.0
@@ -528,6 +546,8 @@ def research_match_candidates(
                 "score": round(score, 2),
                 "match_method": "research_hybrid",
                 "matched_terms": sorted(matched_terms),
+                "entity_matches": sorted(entity_matches),
+                "entity_compatible": True,
                 "score_components": contributions,
             }
         )
@@ -2518,12 +2538,12 @@ def build_parser() -> argparse.ArgumentParser:
     local_publish_parser.add_argument(
         "--allow-critic-rejection",
         action="store_true",
-        help="Allow a required-mode critic rejection only after explicit human review; requires --publish and --override-reason.",
+        help="Record a human critic-rejection override request for audit; it never bypasses the publication gate and requires --publish and --override-reason.",
     )
     local_publish_parser.add_argument(
         "--override-reason",
         default="",
-        help="Human audit reason recorded in the report and draft PR when overriding a critic rejection.",
+        help="Human audit reason recorded with a critic-rejection override request.",
     )
     local_publish_parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Packet, report, and patch directory.")
     local_publish_parser.add_argument(
