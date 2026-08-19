@@ -1867,7 +1867,7 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
     from .local_publish import configured_client_values, run_local_publish
 
     default_base_url, default_model = configured_client_values()
-    print(json.dumps({"local_publish_progress": "scraping"}), file=sys.stderr, flush=True)
+    print(json.dumps({"local_publish_progress": "starting"}), file=sys.stderr, flush=True)
 
     def progress(state: str) -> None:
         print(json.dumps({"local_publish_progress": state}), file=sys.stderr, flush=True)
@@ -1890,6 +1890,8 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
         override_reason=args.override_reason,
         domain=args.domain,
         abstract_mode=args.abstract_mode,
+        pipeline=args.pipeline,
+        allow_duplicate_pr=args.allow_duplicate_pr,
         progress=progress,
     )
     candidates = result.get("candidates") or []
@@ -1910,6 +1912,7 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
         "critic": result.get("critic"),
         "balance_repair": result.get("balance_repair"),
         "critic_mode": result.get("critic_mode"),
+        "pipeline": result.get("pipeline"),
         "claim_policy": result.get("claim_policy"),
         "domain": result.get("domain"),
         "run_id": result.get("run_id"),
@@ -1917,6 +1920,7 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
         "artifacts": result.get("artifacts"),
         "critic_override": result.get("critic_override"),
         "publication_suppressed": result.get("publication_suppressed"),
+        "allow_duplicate_pr": result.get("allow_duplicate_pr"),
         "top_candidate": candidates[0] if candidates else None,
         "duplicate": result.get("duplicate"),
         "new_article_recommendation": result.get("new_article_recommendation"),
@@ -2035,6 +2039,7 @@ def local_worker_command(args: argparse.Namespace) -> dict[str, Any]:
                 override_reason="",
                 passive_worker=True,
                 domain=str(job.get("domain") or "Natural Healing"),
+                pipeline=args.pipeline,
                 progress=progress,
             )
             status = str(report.get("status") or "needs_review")
@@ -2641,12 +2646,18 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Required top-level content domain, for example 'Natural Healing'.",
     )
-    local_publish_parser.add_argument("--max-draft-attempts", type=int, default=3, help="Maximum draft/critic repair passes.")
+    local_publish_parser.add_argument(
+        "--pipeline",
+        choices=["simple", "legacy"],
+        default="simple",
+        help="simple (default) makes one extraction/placement call and uses deterministic gates; legacy retains the multi-pass critic workflow.",
+    )
+    local_publish_parser.add_argument("--max-draft-attempts", type=int, default=3, help="Maximum draft/critic repair passes in the legacy pipeline; simple always makes one model call.")
     local_publish_parser.add_argument(
         "--critic-mode",
         choices=["required", "advisory", "off"],
         default="required",
-        help="required gates publication; advisory writes a patch but suppresses publication; off is manual dry-run only.",
+        help="Legacy pipeline only: required gates publication; advisory writes a patch but suppresses publication; off is manual dry-run only.",
     )
     local_publish_parser.add_argument(
         "--claim-policy",
@@ -2675,6 +2686,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--publish",
         action="store_true",
         help="Commit, push, and open a draft PR after all quality gates pass.",
+    )
+    local_publish_parser.add_argument(
+        "--allow-duplicate-pr",
+        action="store_true",
+        help="With --publish, retain duplicate evidence but allow a separate draft PR for side-by-side comparison.",
     )
 
     enqueue_local_parser = subparsers.add_parser(
@@ -2717,6 +2733,12 @@ def build_parser() -> argparse.ArgumentParser:
     local_worker_parser.add_argument("--base-ref", default="origin/main")
     local_worker_parser.add_argument("--limit", type=int, default=12)
     local_worker_parser.add_argument("--max-draft-attempts", type=int, default=3)
+    local_worker_parser.add_argument(
+        "--pipeline",
+        choices=["simple", "legacy"],
+        default="simple",
+        help="Use the single-pass publisher by default; legacy retains the critic loop for compatibility.",
+    )
     local_worker_parser.add_argument(
         "--claim-policy",
         choices=["integrated", "strict"],

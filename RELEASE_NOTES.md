@@ -11,6 +11,24 @@ Read this before changing production paths, dotenv behavior, backups, or FlareSo
 
 ---
 
+## Single-pass publisher redesign (2026-08-18)
+
+`local-publish` and `local-worker` now default to `--pipeline simple`:
+
+- one bounded model call extracts core results plus background/traditional uses
+  and chooses existing-page updates or a focused new page;
+- deterministic exact-quote, evidence-scope, entity/path, Markdown, and Git
+  gates remain;
+- all claims cite only the main scraped article through one shared footnote;
+- reference-list expansion, model critics, feedback repairs, and approval loops
+  are absent from the default path;
+- a publisher lock fails overlapping runs quickly on the `-np 1` llama server;
+  and
+- open PR heads are checked for the source DOI/URL before a new branch is made.
+
+Use `--pipeline legacy` only when reproducing or diagnosing an older critic-loop
+report.
+
 ## Local publisher implementation (2026-08-09, working tree)
 
 The production path now includes:

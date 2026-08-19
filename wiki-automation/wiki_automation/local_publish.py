@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import json
+import fcntl
 import hashlib
 import io
+import json
 import os
 import re
 import shutil
@@ -53,6 +54,7 @@ ALLOWED_EVIDENCE_SCOPES = {
 }
 DOI_PATTERN = re.compile(r"^10\.\d{4,9}/[-._;()/:a-z0-9]+$", re.IGNORECASE)
 CRITIC_MODES = {"required", "advisory", "off"}
+PIPELINE_MODES = {"simple", "legacy"}
 CLAIM_POLICIES = {"integrated", "strict", "compendium"}
 ABSTRACT_MODES = {"full", "truncated", "omit"}
 CLAIM_KINDS = {"source_finding", "background_fact"}
@@ -61,6 +63,9 @@ MAX_SOURCE_REFERENCE_CONTEXT_CHARS = 60000
 MAX_CANDIDATE_CONTEXT_CHARS = 20000
 MAX_ALL_CANDIDATE_CONTEXT_CHARS = 80000
 MAX_DRAFT_OUTPUT_TOKENS = 10000
+SIMPLE_MAX_SOURCE_CONTEXT_CHARS = 55000
+SIMPLE_MAX_ALL_CANDIDATE_CONTEXT_CHARS = 20000
+SIMPLE_MAX_DRAFT_OUTPUT_TOKENS = 6000
 CRITIC_SEVERITIES = {"warning", "review", "blocking"}
 CRITIC_SEVERITY_RANK = {"warning": 0, "review": 1, "blocking": 2}
 PLACEMENT_ISSUE_CODES = {
@@ -178,6 +183,27 @@ def study_type_matches_packet(plan_study_type: str, packet: dict[str, Any]) -> b
 def exact_source_passage(packet: dict[str, Any], passage: str) -> bool:
     """Return whether a claim passage is an exact contiguous source span."""
     return bool(passage and passage in source_evidence(packet))
+
+
+def whitespace_exact_source_passage(
+    packet: dict[str, Any], passage: str
+) -> str:
+    """Recover a source span when only its whitespace differs.
+
+    Browser extraction commonly preserves non-breaking spaces around units
+    while model output normalizes them to ordinary spaces.  Treating that as a
+    hallucinated quote needlessly blocks an otherwise source-exact plan.  This
+    helper changes no words or punctuation: every non-whitespace token must
+    still match the scraped article exactly.
+    """
+
+    if exact_source_passage(packet, passage):
+        return passage
+    tokens = re.split(r"\s+", passage.strip())
+    if not tokens:
+        return ""
+    match = re.search(r"\s+".join(re.escape(token) for token in tokens), source_evidence(packet))
+    return match.group(0) if match else ""
 
 
 def source_section_present(packet: dict[str, Any], section: str) -> bool:
@@ -376,6 +402,155 @@ def prompt_source_packet(packet: dict[str, Any]) -> dict[str, Any]:
         "full_body_chars": len(str(packet.get("body_markdown") or "")),
     }
     return source
+
+
+def simple_prompt_source_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    """Return a bounded claim packet for the single-pass publisher.
+
+    The legacy planner sends most of the article, a normalized reference list,
+    and large candidate documents.  That made a single draft request exceed
+    180,000 characters in production.  The simple pipeline needs only the
+    paper's own metadata plus the sections that can support results or
+    background/traditional-use claims.  Earlier works cited by the paper are
+    deliberately omitted because published claims cite only this scraped
+    article.
+    """
+
+    source = {
+        key: packet.get(key)
+        for key in (
+            "url",
+            "requested_url",
+            "title",
+            "authors",
+            "abstract",
+            "doi",
+            "pmid",
+            "journal",
+            "pub_date",
+            "keywords",
+            "study_type",
+            "publication_types",
+            "mesh_terms",
+            "reference_url",
+        )
+        if packet.get(key) not in (None, "", [])
+    }
+    markdown = str(packet.get("body_markdown") or "")
+    references_match = re.search(
+        r"(?im)^#{1,6}\s+(?:references|bibliography|works cited)\s*$",
+        markdown,
+    )
+    claim_markdown = markdown[: references_match.start()] if references_match else markdown
+    matches = list(re.finditer(r"(?m)^(#{1,6})\s+(.+)$", claim_markdown))
+    grouped: dict[str, list[dict[str, str]]] = {
+        "abstract": [],
+        "results": [],
+        "conclusion": [],
+        "introduction": [],
+        "discussion": [],
+        "traditional": [],
+    }
+    inherited_group = ""
+
+    def section_group(heading: str, level: int) -> str:
+        nonlocal inherited_group
+        normalized = normalize_evidence(heading)
+        explicit = ""
+        if re.search(r"\babstract\b", normalized):
+            explicit = "abstract"
+        elif re.search(r"\b(?:results?|outcomes?|findings?)\b", normalized):
+            explicit = "results"
+        elif re.search(r"\bconclusions?\b", normalized):
+            explicit = "conclusion"
+        elif re.search(r"\b(?:introduction|background)\b", normalized):
+            explicit = "introduction"
+        elif re.search(r"\bdiscussion\b", normalized):
+            explicit = "discussion"
+        elif re.search(
+            r"\b(?:traditional|ethnobotan\w*|ethnomedic\w*|folk use|historical use)\b",
+            normalized,
+        ):
+            explicit = "traditional"
+        if explicit:
+            inherited_group = explicit
+            return explicit
+        if level <= 2:
+            inherited_group = ""
+        return inherited_group
+
+    for index, match in enumerate(matches):
+        heading = match.group(2).strip()
+        level = len(match.group(1))
+        group = section_group(heading, level)
+        if not group:
+            continue
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(claim_markdown)
+        text = claim_markdown[match.start() : end].strip()
+        if text:
+            grouped[group].append({"heading": heading, "text": text})
+
+    # Reserve space for both direct outcomes and background/traditional uses.
+    # A long Results section must not consume the whole prompt before the
+    # Introduction is reached.
+    priority = (
+        "abstract",
+        "results",
+        "traditional",
+        "introduction",
+        "conclusion",
+        "discussion",
+    )
+    group_budgets = {
+        "abstract": 7_000,
+        "results": 28_000,
+        "traditional": 5_000,
+        "introduction": 10_000,
+        "conclusion": 3_000,
+        "discussion": 2_000,
+    }
+    sections: list[dict[str, str]] = []
+    used = 0
+    chars_by_group: dict[str, int] = {}
+    for group in priority:
+        group_used = 0
+        for section in grouped[group]:
+            remaining = min(
+                SIMPLE_MAX_SOURCE_CONTEXT_CHARS - used,
+                group_budgets[group] - group_used,
+            )
+            if remaining <= 0:
+                break
+            text = section["text"][:remaining]
+            if text:
+                sections.append({"heading": section["heading"], "text": text})
+                used += len(text)
+                group_used += len(text)
+        chars_by_group[group] = group_used
+        if used >= SIMPLE_MAX_SOURCE_CONTEXT_CHARS:
+            break
+    source["claim_sections"] = sections
+    source["prompt_context"] = {
+        "pipeline": "simple",
+        "claim_chars": used,
+        "claim_chars_by_group": chars_by_group,
+        "claim_section_count": len(sections),
+        "reference_chars": 0,
+        "reference_entry_count": 0,
+        "full_body_chars": len(markdown),
+    }
+    return source
+
+
+def simple_candidate_document(markdown: str, max_chars: int) -> str:
+    """Expose page identity and headings without sending entire wiki pages."""
+
+    frontmatter = frontmatter_block(markdown)
+    headings = "\n".join(re.findall(r"(?m)^#{2,6}\s+.+$", markdown))
+    visible = markdown[len(frontmatter) :].strip()
+    lead = visible[:1000]
+    context = "\n\n".join(part for part in (frontmatter.strip(), headings, lead) if part)
+    return context[:max_chars]
 
 
 def candidate_document_excerpt(
@@ -890,12 +1065,62 @@ class ModelOutputJSONError(ValueError):
         self.raw_output = raw_output
 
 
+class LocalModelBusyError(RuntimeError):
+    """Another publisher owns the single-slot local model."""
+
+
 class LocalLLMClient:
-    def __init__(self, base_url: str, model: str, timeout_seconds: int = 600):
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        timeout_seconds: int = 600,
+        lock_path: Path | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.calls: list[dict[str, Any]] = []
+        self.lock_path = lock_path
+        self._lock_file: io.TextIOWrapper | None = None
+
+    def _acquire_lock(self) -> None:
+        if self.lock_path is None or self._lock_file is not None:
+            return
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = self.lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            lock_file.seek(0)
+            owner = lock_file.read().strip()
+            lock_file.close()
+            detail = f" ({owner})" if owner else ""
+            raise LocalModelBusyError(
+                "local model is already in use by another publisher run" + detail
+            ) from exc
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "model": self.model,
+                    "acquired_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        )
+        lock_file.flush()
+        self._lock_file = lock_file
+
+    def close(self) -> None:
+        if self._lock_file is None:
+            return
+        try:
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._lock_file.close()
+            self._lock_file = None
 
     def json_completion(
         self,
@@ -934,6 +1159,7 @@ class LocalLLMClient:
             method="POST",
         )
         try:
+            self._acquire_lock()
             with urlopen(request, timeout=self.timeout_seconds) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             choices = payload.get("choices") or []
@@ -1349,6 +1575,298 @@ def validate_draft_plan(
         sorted(set(issues)),
         sorted(set(warnings)),
     )
+
+
+def validate_simple_draft_plan(
+    plan: dict[str, Any],
+    *,
+    packet: dict[str, Any],
+    candidate_paths: set[str],
+    candidate_metadata: dict[str, dict[str, Any]],
+    existing_paths: set[str],
+    domain: str,
+) -> ValidationResult:
+    """Validate the single model pass with deterministic, source-backed rules.
+
+    This intentionally excludes critic judgments and cited-reference graph
+    validation.  Each accepted claim must still quote this paper exactly, stay
+    near that wording, fit the chosen entity/page, carry evidence scope, and
+    render with the one bibliographic footnote produced from the scraped
+    packet.
+    """
+
+    issues: list[str] = []
+    warnings: list[str] = []
+    decision = str(plan.get("decision") or "")
+    if decision not in {"publish_changes", "duplicate", "needs_review"}:
+        issues.append("invalid_decision")
+    if decision not in CHANGE_DECISIONS:
+        return ValidationResult(not issues, sorted(set(issues)), warnings)
+    proposals = plan_target_proposals(plan)
+    if not 1 <= len(proposals) <= 4:
+        issues.append("invalid_target_proposal_count")
+        return ValidationResult(False, sorted(set(issues)), warnings)
+    if not study_type_matches_packet(str(plan.get("study_type") or ""), packet):
+        issues.append("study_type_mismatch")
+
+    assigned_quotes: dict[str, int] = {}
+    seen_sections: set[tuple[str, str]] = set()
+    for target_index, proposal in enumerate(proposals):
+        prefix = f"target_{target_index}"
+        target = str(proposal.get("target_path") or "")
+        operation = proposal_operation(plan, proposal)
+        if operation not in PROPOSAL_OPERATIONS:
+            issues.append(f"{prefix}_invalid_operation")
+        elif operation == "append_existing" and target not in candidate_paths:
+            issues.append(f"{prefix}_not_in_candidates")
+        elif operation == "create_new":
+            if not safe_new_article_path(target, domain):
+                issues.append(f"{prefix}_invalid_new_article_path")
+            if target in existing_paths:
+                issues.append(f"{prefix}_new_article_already_exists")
+
+        heading = str(proposal.get("heading") or "")
+        parent_heading = str(proposal.get("parent_heading") or "")
+        if not re.match(r"^#{2,6}\s+\S", heading):
+            issues.append(f"{prefix}_invalid_heading")
+        if parent_heading and not re.match(r"^#{2,5}\s+\S", parent_heading):
+            issues.append(f"{prefix}_invalid_parent_heading")
+        section_key = (target, normalize_evidence(heading))
+        if section_key in seen_sections:
+            issues.append(f"{prefix}_duplicate_target")
+        seen_sections.add(section_key)
+
+        target_entity = str(proposal.get("target_entity") or "").strip()
+        if not target_entity:
+            issues.append(f"{prefix}_missing_target_entity")
+        identity_metadata = (
+            candidate_metadata
+            if operation == "append_existing"
+            else {
+                target: {
+                    "title": str(((proposal.get("new_article") or {}).get("title") or ""))
+                }
+            }
+        )
+        if target_entity and not target_entity_matches_candidate(
+            target_entity, target, identity_metadata
+        ):
+            issues.append(f"{prefix}_entity_mismatch")
+        if not str(proposal.get("rationale") or "").strip():
+            issues.append(f"{prefix}_missing_rationale")
+
+        if operation == "create_new":
+            metadata = proposal.get("new_article")
+            if not isinstance(metadata, dict):
+                issues.append(f"{prefix}_missing_new_article_metadata")
+            else:
+                title = str(metadata.get("title") or "").strip()
+                tags = metadata.get("tags")
+                lead_kind = str(metadata.get("lead_kind") or "definition")
+                lead = str(metadata.get("lead_text") or "").strip()
+                lead_quote = str(metadata.get("lead_source_quote") or "").strip()
+                if not title:
+                    issues.append(f"{prefix}_missing_new_article_title")
+                if not isinstance(tags, list) or not tags or any(
+                    not isinstance(tag, str) or not tag.strip() for tag in tags
+                ):
+                    issues.append(f"{prefix}_invalid_new_article_tags")
+                elif target_entity and not any(
+                    phrase_in_text(target_entity, str(tag)) for tag in tags
+                ):
+                    issues.append(f"{prefix}_missing_new_article_entity_tag")
+                if not str(metadata.get("category_rationale") or "").strip():
+                    issues.append(f"{prefix}_missing_category_rationale")
+                if lead_kind not in {"definition", "source_grounded"}:
+                    issues.append(f"{prefix}_invalid_lead_kind")
+                if not lead or not lead_is_definition_form(target_entity, lead):
+                    issues.append(f"{prefix}_lead_not_definition_form")
+                elif lead_kind == "definition" and re.search(
+                    HEALTH_CLAIM_PATTERN, normalize_evidence(lead)
+                ):
+                    issues.append(f"{prefix}_definition_lead_contains_health_claim")
+                elif lead_kind == "source_grounded" and (
+                    not exact_source_passage(packet, lead_quote)
+                    or word_token_similarity(lead, lead_quote) < 0.68
+                ):
+                    issues.append(f"{prefix}_lead_not_source_grounded")
+
+        bullets = proposal.get("bullets")
+        if not isinstance(bullets, list) or not 1 <= len(bullets) <= 10:
+            issues.append(f"{prefix}_invalid_bullet_count")
+            continue
+        source_findings = 0
+        for bullet_index, item in enumerate(bullets):
+            bullet_prefix = f"{prefix}_bullet_{bullet_index}"
+            if not isinstance(item, dict):
+                issues.append(f"{bullet_prefix}_invalid")
+                continue
+            text = str(item.get("text") or "").strip()
+            quote = str(item.get("source_quote") or "").strip()
+            section = str(item.get("source_section") or "").strip()
+            claim_kind = str(item.get("claim_kind") or "")
+            scope = str(item.get("evidence_scope") or "")
+            if not text or text.startswith("-") or "[^" in text:
+                issues.append(f"{bullet_prefix}_invalid_text")
+            if len(normalize_evidence(quote)) < 35 or not exact_source_passage(packet, quote):
+                issues.append(f"{bullet_prefix}_quote_not_in_source")
+            elif word_token_similarity(strip_scope_prefix(text, packet), quote) < 0.68:
+                issues.append(f"{bullet_prefix}_not_near_verbatim")
+            if claim_kind not in CLAIM_KINDS:
+                issues.append(f"{bullet_prefix}_invalid_claim_kind")
+            if scope not in ALLOWED_EVIDENCE_SCOPES:
+                issues.append(f"{bullet_prefix}_invalid_evidence_scope")
+            if not source_section_present(packet, section):
+                issues.append(f"{bullet_prefix}_source_section_not_found")
+            if any(
+                forbidden in normalize_evidence(section)
+                for forbidden in ("references", "bibliography", "works cited")
+            ):
+                issues.append(f"{bullet_prefix}_source_section_not_claim_bearing")
+            if claim_kind == "source_finding":
+                source_findings += 1
+                if "introduction" in normalize_evidence(section):
+                    issues.append(f"{bullet_prefix}_claim_origin_misclassified")
+                if source_is_preclinical(packet) and scope not in {"animal", "composition"}:
+                    issues.append(f"{bullet_prefix}_source_finding_scope_must_be_animal")
+            if target_entity and (
+                not phrase_in_text(target_entity, quote)
+                or not phrase_in_text(target_entity, text)
+                or passage_is_mere_mention(target_entity, quote)
+            ):
+                issues.append(f"{bullet_prefix}_entity_not_supported_by_passage")
+            if bullet_cited_references(item):
+                issues.append(f"{bullet_prefix}_external_reference_not_allowed")
+            if (
+                scope != "composition"
+                and "composition" not in normalize_evidence(heading)
+                and is_methods_statement(strip_scope_prefix(text, packet))
+            ):
+                issues.append(f"{bullet_prefix}_methods_statement_not_effect_claim")
+            normalized_quote = normalize_evidence(quote)
+            if normalized_quote:
+                prior_target = assigned_quotes.setdefault(normalized_quote, target_index)
+                if prior_target != target_index:
+                    issues.append(f"{bullet_prefix}_claim_assigned_to_multiple_targets")
+        if operation == "create_new" and source_findings == 0:
+            issues.append(f"{prefix}_new_article_requires_source_finding")
+        if source_findings and results_quantitative_sentences(packet, limit=1) and not any(
+            isinstance(item, dict)
+            and item.get("claim_kind") == "source_finding"
+            and has_quantitative_content(str(item.get("text") or ""))
+            for item in bullets
+        ):
+            warnings.append(f"{prefix}_missing_quantitative_outcome")
+    return ValidationResult(not issues, sorted(set(issues)), sorted(set(warnings)))
+
+
+def simple_bullet_text_from_quote(quote: str) -> str:
+    """Make an exact source passage safe as visible wiki bullet text."""
+
+    text = quote.strip()
+    for marker in cited_markers(text):
+        text = text.replace(marker, "")
+    text = re.sub(r"\[([^\]\n]+)\]\(#[^)]+\)", r"\1", text)
+    text = re.sub(r"\[\^\d+\]", "", text)
+    text = re.sub(r"\(\s*\)", "", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    return re.sub(r"\s+", " ", text).strip().lstrip("- ")
+
+
+def normalize_simple_draft_plan(
+    plan: dict[str, Any], *, packet: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Apply bounded, auditable cleanup after the one model pass.
+
+    This is deliberately not a second drafting pass.  It can only restore the
+    article's exact whitespace, remove disallowed external-reference fields,
+    use an exact source quote as bullet text, or drop an unprovable bullet.
+    """
+
+    actions: list[dict[str, Any]] = []
+    for target_index, proposal in enumerate(plan_target_proposals(plan)):
+        bullets = proposal.get("bullets")
+        if not isinstance(bullets, list):
+            continue
+        retained: list[Any] = []
+        for bullet_index, item in enumerate(bullets):
+            location = {
+                "target_index": target_index,
+                "original_bullet_index": bullet_index,
+            }
+            if not isinstance(item, dict):
+                retained.append(item)
+                continue
+            quote = str(item.get("source_quote") or "").strip()
+            canonical_quote = whitespace_exact_source_passage(packet, quote)
+            if len(normalize_evidence(canonical_quote)) < 35:
+                actions.append(
+                    {
+                        **location,
+                        "action": "dropped_unprovable_bullet",
+                        "source_quote": quote,
+                    }
+                )
+                continue
+            if canonical_quote != quote:
+                item["source_quote"] = canonical_quote
+                quote = canonical_quote
+                actions.append(
+                    {**location, "action": "restored_source_whitespace"}
+                )
+
+            removed_reference_fields = [
+                key
+                for key in ("cited_reference", "cited_references")
+                if key in item
+            ]
+            for key in removed_reference_fields:
+                item.pop(key, None)
+            if removed_reference_fields:
+                actions.append(
+                    {
+                        **location,
+                        "action": "removed_external_reference_fields",
+                        "fields": removed_reference_fields,
+                    }
+                )
+
+            text = str(item.get("text") or "").strip()
+            cleaned_text = simple_bullet_text_from_quote(quote)
+            text_is_safe = bool(text and not text.startswith("-") and "[^" not in text)
+            if text_is_safe:
+                safe_text = simple_bullet_text_from_quote(text)
+                text_is_safe = word_token_similarity(
+                    strip_scope_prefix(safe_text, packet), quote
+                ) >= 0.68
+            else:
+                safe_text = ""
+            if not text_is_safe:
+                if not cleaned_text or word_token_similarity(cleaned_text, quote) < 0.68:
+                    actions.append(
+                        {
+                            **location,
+                            "action": "dropped_unrenderable_bullet",
+                            "source_quote": quote,
+                        }
+                    )
+                    continue
+                item["text"] = cleaned_text
+                actions.append(
+                    {
+                        **location,
+                        "action": "replaced_text_with_source_quote",
+                        "original_text": text,
+                    }
+                )
+            elif safe_text != text:
+                item["text"] = safe_text
+                actions.append(
+                    {**location, "action": "removed_publisher_markers"}
+                )
+            retained.append(item)
+        proposal["bullets"] = retained
+    return actions
 
 
 def next_footnote_number(markdown: str) -> int:
@@ -1970,6 +2488,84 @@ def run_command(args: list[str], *, cwd: Path) -> str:
     return result.stdout.strip()
 
 
+def find_open_pr_duplicate(
+    *,
+    content_repo: Path,
+    identifiers: list[str],
+) -> dict[str, Any]:
+    """Find a source citation on an open PR head, not only on the base branch.
+
+    Ad-hoc publication does not necessarily have a pre-existing database row,
+    so the open draft PR itself is authoritative in-flight state.  Failure to
+    query GitHub is reported but remains non-gating; the normal base/database
+    duplicate checks still run.
+    """
+
+    gh = shutil.which("gh")
+    if not gh:
+        return {"checked": False, "reason": "gh_not_available", "matches": []}
+    result = subprocess.run(
+        [
+            gh,
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "100",
+            "--json",
+            "number,url,title,headRefName,headRefOid",
+        ],
+        cwd=content_repo,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return {
+            "checked": False,
+            "reason": "gh_query_failed",
+            "error": (result.stderr or result.stdout).strip()[:1000],
+            "matches": [],
+        }
+    try:
+        pull_requests = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return {
+            "checked": False,
+            "reason": "gh_response_invalid",
+            "error": str(exc),
+            "matches": [],
+        }
+    matches: list[dict[str, Any]] = []
+    for pull_request in pull_requests if isinstance(pull_requests, list) else []:
+        if not isinstance(pull_request, dict):
+            continue
+        revision = str(pull_request.get("headRefOid") or "")
+        if not revision:
+            continue
+        for identifier in identifiers:
+            grep = subprocess.run(
+                ["git", "grep", "-F", "-i", "-n", identifier, revision, "--", "*.md"],
+                cwd=content_repo,
+                text=True,
+                capture_output=True,
+            )
+            if grep.returncode == 0:
+                matches.append(
+                    {
+                        "identifier": identifier,
+                        "number": pull_request.get("number"),
+                        "url": pull_request.get("url"),
+                        "title": pull_request.get("title"),
+                        "head_ref": pull_request.get("headRefName"),
+                        "head_revision": revision,
+                        "content_hits": grep.stdout.splitlines()[:20],
+                    }
+                )
+                break
+    return {"checked": True, "matches": matches}
+
+
 def git_revision(repo: Path, ref: str = "HEAD") -> str:
     """Return a revision for run provenance without making reporting brittle."""
     try:
@@ -2046,6 +2642,89 @@ def style_context(tools_root: Path) -> str:
         tools_root.parent / "docs" / "natural-healing-content-style-guide.md"
     ).read_text(encoding="utf-8")
     return f"GENERAL GUIDE:\n{general}\n\nNATURAL HEALING GUIDE:\n{natural}"
+
+
+def simple_draft_prompt(
+    *,
+    packet: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    candidate_documents: dict[str, str],
+    domain: str,
+    category_catalog: list[str],
+    new_article_seed: dict[str, str] | None,
+) -> str:
+    """One bounded extraction-and-placement request with no critic feedback loop."""
+
+    contract = {
+        "decision": "publish_changes | duplicate | needs_review",
+        "reason": "required only for duplicate or needs_review",
+        "study_type": "specific design supported by the paper",
+        "target_proposals": [
+            {
+                "operation": "append_existing | create_new",
+                "target_path": "candidate path, or safe new Markdown path under DOMAIN",
+                "target_entity": "page's exact primary entity",
+                "new_article": {
+                    "title": "required for create_new",
+                    "tags": ["focused tags including the exact entity"],
+                    "lead_kind": "definition | source_grounded",
+                    "lead_text": "one-sentence definition of what the entity is, with no health claim",
+                    "lead_source_quote": "exact passage only when source_grounded; otherwise empty",
+                    "category_rationale": "why this category fits",
+                },
+                "parent_heading": "existing parent heading only when adding a child heading; otherwise empty",
+                "heading": "exact existing heading or new ## heading",
+                "rationale": "why these claims belong on this page",
+                "bullets": [
+                    {
+                        "text": "one near-verbatim idea without a footnote marker",
+                        "source_quote": "one exact contiguous passage from SOURCE_PACKET",
+                        "source_section": "exact section heading",
+                        "claim_kind": "source_finding | background_fact",
+                        "evidence_scope": "review_summary | human | animal | in_vitro | mechanistic | composition",
+                        "subsection": "short property heading for background facts; empty for animal findings",
+                    }
+                ],
+            }
+        ],
+    }
+    candidate_summary = [
+        {
+            key: candidate.get(key)
+            for key in (
+                "path",
+                "title",
+                "tags",
+                "entity_matches",
+                "category_matches",
+                "score",
+            )
+        }
+        for candidate in candidates
+    ]
+    rules = """Extract and place the paper in this same pass.
+
+1. Extract the paper's core results as source_finding bullets. Also extract useful traditional, historical, or background healing uses explicitly stated in the paper as background_fact bullets. Do not follow or cite the paper's references.
+2. Every bullet must carry one exact contiguous source_quote from the supplied article and stay as close to that wording as possible. Remove publisher citation markers from bullet text when useful; never add a footnote marker because the renderer adds one citation to the main scraped article.
+3. Preserve evidence strength and limitations. Rat/mouse/animal findings use evidence_scope animal and must not imply human efficacy. Composition measurements use composition.
+4. Map each claim only to a page whose primary entity appears in both the claim text and exact quote. Prefer one focused target. Use an existing candidate when it is genuinely compatible; otherwise create the seeded entity page or another safe page under DOMAIN.
+5. For a new page, provide a neutral definition lead saying what the entity is, focused tags, and an existing category rationale. Do not put a health claim in an uncited definition lead.
+6. Prefer concrete Results outcomes, including quantitative findings when available. Keep the update concise: at most four target sections and ten bullets per section.
+7. Return needs_review only when source identity, evidence, taxonomy, or placement truly cannot be resolved from this packet. Return only the JSON object; there will be no repair or critic pass."""
+    return "\n\n".join(
+        (
+            "JSON_CONTRACT:\n" + json.dumps(contract, indent=2),
+            f"DOMAIN: {domain}",
+            rules,
+            "MISSING_ENTITY_PAGE_SEED:\n" + json.dumps(new_article_seed or {}, indent=2),
+            "AVAILABLE_CATEGORY_DIRECTORIES:\n" + json.dumps(category_catalog, indent=2),
+            "MATCH_CANDIDATES:\n" + json.dumps(candidate_summary, indent=2),
+            "CANDIDATE_PAGE_STRUCTURE:\n" + json.dumps(candidate_documents, indent=2),
+            "SOURCE_PACKET:\n" + json.dumps(simple_prompt_source_packet(packet), indent=2),
+            "QUANTITATIVE_RESULTS_CANDIDATES:\n"
+            + json.dumps(results_quantitative_sentences(packet), indent=2),
+        )
+    )
 
 
 def draft_prompt(
@@ -2510,6 +3189,18 @@ def format_gate_summary(
         ((duplicate.get("paper_result") or {}).get("paper") or {}).get("workflow_state")
         or "none"
     )
+    open_pr_count = len(
+        ((duplicate.get("open_pull_requests") or {}).get("matches") or [])
+    )
+    duplicate_detail = (
+        f"{duplicate.get('content_hit_count', 0)} base-content hits; "
+        f"{open_pr_count} open PR matches; prior paper state: {paper_state}"
+    )
+    duplicate_outcome = (
+        f"bypass — explicit A/B comparison; {duplicate_detail}"
+        if duplicate.get("bypass_requested")
+        else outcome(True, duplicate_detail)
+    )
     lines = [
         "### Gate summary",
         "",
@@ -2518,11 +3209,7 @@ def format_gate_summary(
             bool(packet_validation.get("ok")),
             f"{len(packet_validation.get('issues') or [])} issues",
         ),
-        "- Duplicate: "
-        + outcome(
-            True,
-            f"{duplicate.get('content_hit_count', 0)} content hits; prior paper state: {paper_state}",
-        ),
+        "- Duplicate: " + duplicate_outcome,
         "- Plan (entity, exact-quote, near-verbatim, preclinical placement): "
         + outcome(
             deterministic.ok,
@@ -3176,6 +3863,8 @@ def run_local_publish(
     passive_worker: bool = False,
     domain: str = "Natural Healing",
     abstract_mode: str = "full",
+    pipeline: str = "legacy",
+    allow_duplicate_pr: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     # Imported lazily to keep the pure validators independently testable.
@@ -3191,6 +3880,8 @@ def run_local_publish(
 
     if critic_mode not in CRITIC_MODES:
         raise ValueError(f"critic_mode must be one of: {', '.join(sorted(CRITIC_MODES))}")
+    if pipeline not in PIPELINE_MODES:
+        raise ValueError(f"pipeline must be one of: {', '.join(sorted(PIPELINE_MODES))}")
     if claim_policy not in CLAIM_POLICIES:
         raise ValueError(f"claim_policy must be one of: {', '.join(sorted(CLAIM_POLICIES))}")
     if abstract_mode not in ABSTRACT_MODES:
@@ -3198,18 +3889,28 @@ def run_local_publish(
     domain = normalize_domain(domain)
     if passive_worker and allow_critic_rejection:
         raise ValueError("Critic rejection overrides are prohibited in the passive database worker")
-    if passive_worker and critic_mode != "required":
+    if pipeline == "legacy" and passive_worker and critic_mode != "required":
         raise ValueError("The passive database worker requires --critic-mode required")
+    if pipeline == "simple" and allow_critic_rejection:
+        raise ValueError("Critic overrides do not apply to the single-pass pipeline")
     if allow_critic_rejection and critic_mode != "required":
         raise ValueError("--allow-critic-rejection requires --critic-mode required")
     if allow_critic_rejection and not override_reason.strip():
         raise ValueError("--allow-critic-rejection requires a non-empty --override-reason")
     if allow_critic_rejection and not publish:
         raise ValueError("--allow-critic-rejection is only valid with --publish")
-    if publish and critic_mode == "off":
+    if pipeline == "legacy" and publish and critic_mode == "off":
         raise ValueError("--critic-mode off is manual dry-run only and cannot be used with --publish")
+    if allow_duplicate_pr and not publish:
+        raise ValueError("--allow-duplicate-pr requires --publish")
+    if pipeline == "simple":
+        max_draft_attempts = 1
 
-    publication_suppressed = "critic_mode_advisory" if publish and critic_mode == "advisory" else ""
+    publication_suppressed = (
+        "critic_mode_advisory"
+        if pipeline == "legacy" and publish and critic_mode == "advisory"
+        else ""
+    )
     run_started = datetime.now(timezone.utc)
     run_started_monotonic = time.monotonic()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -3242,7 +3943,9 @@ def run_local_publish(
         report.setdefault("domain", domain)
         report.setdefault("critic_mode", critic_mode)
         report.setdefault("claim_policy", claim_policy)
+        report.setdefault("pipeline", pipeline)
         report.setdefault("publication_requested", publish)
+        report.setdefault("allow_duplicate_pr", allow_duplicate_pr)
         report.setdefault("publication_suppressed", publication_suppressed)
         report.setdefault("duplicate", duplicate)
         report.update(
@@ -3278,6 +3981,8 @@ def run_local_publish(
                         "alert_name": alert_name,
                         "max_candidates": max_candidates,
                         "max_draft_attempts": max_draft_attempts,
+                        "pipeline": pipeline,
+                        "allow_duplicate_pr": allow_duplicate_pr,
                         "critic_mode": critic_mode,
                         "claim_policy": claim_policy,
                         "domain": domain,
@@ -3291,10 +3996,57 @@ def run_local_publish(
         if isinstance(packet_value, dict):
             packet_path.write_text(json.dumps(packet_value, indent=2), encoding="utf-8")
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        close_client = getattr(client, "close", None)
+        if callable(close_client):
+            close_client()
         if base_snapshot_temp is not None:
             base_snapshot_temp.cleanup()
         return report
 
+    publication_enabled = publish and (
+        pipeline == "simple" or critic_mode == "required"
+    )
+    if publication_enabled:
+        # The caller-supplied URL is sufficient to detect many in-flight
+        # duplicates. Do this before scraping so a transient publisher outage
+        # cannot hide an already-open draft PR.
+        run_command(["git", "fetch", "origin"], cwd=content_repo)
+        source_pr_check = find_open_pr_duplicate(
+            content_repo=content_repo,
+            identifiers=[source],
+        )
+        if source_pr_check.get("matches") and not allow_duplicate_pr:
+            first_match = source_pr_check["matches"][0]
+            duplicate = {
+                "identifiers": [source],
+                "checks": [],
+                "content_hit_count": 0,
+                "content_hits": [],
+                "paper_result": None,
+                "open_pull_requests": source_pr_check,
+            }
+            return finish(
+                {
+                    "status": "duplicate",
+                    "source": source,
+                    "reason": "open_pull_request",
+                    "pr_url": first_match.get("url"),
+                    "duplicate": duplicate,
+                }
+            )
+        if source_pr_check.get("matches"):
+            duplicate = {
+                "identifiers": [source],
+                "checks": [],
+                "content_hit_count": 0,
+                "content_hits": [],
+                "paper_result": None,
+                "open_pull_requests": source_pr_check,
+                "bypass_requested": True,
+            }
+
+    if progress:
+        progress("scraping")
     try:
         packet = scrape_source_packet(source, scrape_markdown)
     except Exception as exc:
@@ -3318,9 +4070,6 @@ def run_local_publish(
     if progress:
         progress("matching")
 
-    publication_enabled = publish and critic_mode == "required"
-    if publication_enabled:
-        run_command(["git", "fetch", "origin", "main"], cwd=content_repo)
     base_snapshot_temp = materialize_git_ref(content_repo=content_repo, git_ref=base_ref)
     base_snapshot = Path(base_snapshot_temp.name)
 
@@ -3334,12 +4083,42 @@ def run_local_publish(
         )
         for identifier in duplicate_identifiers(packet, source)
     ]
+    preflight_open_pr_check = (
+        duplicate.get("open_pull_requests")
+        if isinstance(duplicate, dict)
+        else None
+    )
     duplicate = merge_duplicate_checks(duplicate_checks)
+    if preflight_open_pr_check:
+        duplicate["open_pull_requests"] = preflight_open_pr_check
+    if publication_enabled:
+        open_pr_check = find_open_pr_duplicate(
+            content_repo=content_repo,
+            identifiers=duplicate_identifiers(packet, source),
+        )
+        duplicate["open_pull_requests"] = open_pr_check
+        open_pr_matches = open_pr_check.get("matches") or []
+        if open_pr_matches and not allow_duplicate_pr:
+            first_match = open_pr_matches[0]
+            return finish(
+                {
+                    "status": "duplicate",
+                    "source": source,
+                    "reason": "open_pull_request",
+                    "pr_url": first_match.get("url"),
+                    "duplicate": duplicate,
+                    "packet": packet,
+                    "packet_validation": asdict(packet_validation),
+                }
+            )
+        if open_pr_matches:
+            duplicate["bypass_requested"] = True
     paper_result = duplicate.get("paper_result") or {}
     paper_state = str((paper_result.get("paper") or {}).get("workflow_state") or "")
-    if duplicate.get("content_hit_count", 0) > 0 or paper_state in {
+    has_base_duplicate = duplicate.get("content_hit_count", 0) > 0 or paper_state in {
         "drafted", "committed", "pr_open", "merged"
-    }:
+    }
+    if has_base_duplicate and not allow_duplicate_pr:
         report = {
             "status": "duplicate",
             "source": source,
@@ -3349,6 +4128,8 @@ def run_local_publish(
             "packet_validation": asdict(packet_validation),
         }
         return finish(report)
+    if has_base_duplicate:
+        duplicate["bypass_requested"] = True
 
     articles = load_articles(base_snapshot)
     existing_paths = {article.path for article in articles}
@@ -3369,16 +4150,26 @@ def run_local_publish(
         "rejected_candidates": ranked_candidates[max_candidates : max_candidates + 20],
     }
     candidate_documents: dict[str, str] = {}
+    candidate_context_budget = (
+        SIMPLE_MAX_ALL_CANDIDATE_CONTEXT_CHARS
+        if pipeline == "simple"
+        else MAX_ALL_CANDIDATE_CONTEXT_CHARS
+    )
     per_candidate_context = max(
-        2000,
-        MAX_ALL_CANDIDATE_CONTEXT_CHARS // max(len(candidates), 1),
+        1200 if pipeline == "simple" else 2000,
+        candidate_context_budget // max(len(candidates), 1),
     )
     for candidate in candidates:
         path = base_snapshot / candidate["path"]
-        candidate_documents[candidate["path"]] = candidate_document_excerpt(
-            path.read_text(encoding="utf-8"),
-            [str(value) for value in candidate.get("entity_matches") or []],
-            max_chars=per_candidate_context,
+        markdown = path.read_text(encoding="utf-8")
+        candidate_documents[candidate["path"]] = (
+            simple_candidate_document(markdown, per_candidate_context)
+            if pipeline == "simple"
+            else candidate_document_excerpt(
+                markdown,
+                [str(value) for value in candidate.get("entity_matches") or []],
+                max_chars=per_candidate_context,
+            )
         )
     candidate_retrieval.update(
         {
@@ -3403,9 +4194,18 @@ def run_local_publish(
     )
     candidate_retrieval["new_article_seed"] = new_article_seed
 
-    client = LocalLLMClient(base_url, model)
+    client = LocalLLMClient(
+        base_url,
+        model,
+        lock_path=tools_root / "runtime" / "local-publisher" / "model.lock",
+    )
     system = (
-        "You are a conservative research publishing planner. Follow the supplied style guides and JSON contract exactly.\n\n"
+        (
+            "You are a conservative single-pass research extractor and wiki placement planner. "
+            "Follow the supplied style guides and JSON contract exactly.\n\n"
+            if pipeline == "simple"
+            else "You are a conservative research publishing planner. Follow the supplied style guides and JSON contract exactly.\n\n"
+        )
         + style_context(tools_root)
     )
     plan: dict[str, Any] = {}
@@ -3427,10 +4227,19 @@ def run_local_publish(
         raise ValueError("max_draft_attempts must be at least 1")
 
     def model_failure(phase: str, exc: Exception) -> dict[str, Any]:
+        prompt_packet = (
+            simple_prompt_source_packet(packet)
+            if pipeline == "simple"
+            else prompt_source_packet(packet)
+        )
         return finish(
             {
                 "status": "needs_review",
-                "reason": "model_call_failed",
+                "reason": (
+                    "local_model_busy"
+                    if isinstance(exc, LocalModelBusyError)
+                    else "model_call_failed"
+                ),
                 "failure_phase": phase,
                 "model_error": str(exc)[:4000],
                 "source": source,
@@ -3438,9 +4247,7 @@ def run_local_publish(
                 "packet_validation": asdict(packet_validation),
                 "candidates": candidates,
                 "candidate_retrieval": candidate_retrieval,
-                "source_prompt_context": prompt_source_packet(packet).get(
-                    "prompt_context", {}
-                ),
+                "source_prompt_context": prompt_packet.get("prompt_context", {}),
                 "attempt_history": attempt_history,
                 "format_repairs": format_repairs,
             }
@@ -3452,21 +4259,38 @@ def run_local_publish(
         try:
             plan = client.json_completion(
                 system=system,
-                user=draft_prompt(
-                    packet=packet,
-                    candidates=candidates,
-                    candidate_documents=candidate_documents,
-                    prior_issues=prior_issues,
-                    previous_plan=previous_plan,
-                    previous_critic=previous_critic,
-                    claim_policy=claim_policy,
-                    domain=domain,
-                    category_catalog=category_catalog,
-                    new_article_seed=new_article_seed,
+                user=(
+                    simple_draft_prompt(
+                        packet=packet,
+                        candidates=candidates,
+                        candidate_documents=candidate_documents,
+                        domain=domain,
+                        category_catalog=category_catalog,
+                        new_article_seed=new_article_seed,
+                    )
+                    if pipeline == "simple"
+                    else draft_prompt(
+                        packet=packet,
+                        candidates=candidates,
+                        candidate_documents=candidate_documents,
+                        prior_issues=prior_issues,
+                        previous_plan=previous_plan,
+                        previous_critic=previous_critic,
+                        claim_policy=claim_policy,
+                        domain=domain,
+                        category_catalog=category_catalog,
+                        new_article_seed=new_article_seed,
+                    )
                 ),
-                max_tokens=MAX_DRAFT_OUTPUT_TOKENS,
+                max_tokens=(
+                    SIMPLE_MAX_DRAFT_OUTPUT_TOKENS
+                    if pipeline == "simple"
+                    else MAX_DRAFT_OUTPUT_TOKENS
+                ),
             )
         except ModelOutputJSONError as exc:
+            if pipeline == "simple":
+                return model_failure("drafting_invalid_json", exc)
             source_call = client.calls[-1] if client.calls else {}
             repair_record: dict[str, Any] = {
                 "attempt": attempt_number,
@@ -3517,14 +4341,30 @@ def run_local_publish(
                 return model_failure("draft_format_repair", repair_exc)
         except Exception as exc:
             return model_failure("drafting", exc)
-        deterministic = validate_draft_plan(
-            plan,
-            packet=packet,
-            candidate_paths=candidate_paths,
-            candidate_metadata={str(item["path"]): item for item in candidates},
-            existing_paths=existing_paths,
-            domain=domain,
-            claim_policy=claim_policy,
+        simple_normalization = (
+            normalize_simple_draft_plan(plan, packet=packet)
+            if pipeline == "simple"
+            else []
+        )
+        deterministic = (
+            validate_simple_draft_plan(
+                plan,
+                packet=packet,
+                candidate_paths=candidate_paths,
+                candidate_metadata={str(item["path"]): item for item in candidates},
+                existing_paths=existing_paths,
+                domain=domain,
+            )
+            if pipeline == "simple"
+            else validate_draft_plan(
+                plan,
+                packet=packet,
+                candidate_paths=candidate_paths,
+                candidate_metadata={str(item["path"]): item for item in candidates},
+                existing_paths=existing_paths,
+                domain=domain,
+                claim_policy=claim_policy,
+            )
         )
         if progress:
             progress(f"deterministic_validation_attempt_{attempt_number}")
@@ -3564,7 +4404,7 @@ def run_local_publish(
                     candidates=candidates,
                     candidate_documents=candidate_documents,
                     deterministic_issues=deterministic.issues + deterministic.warnings,
-                    critic_mode=critic_mode,
+                    critic_mode=("off" if pipeline == "simple" else critic_mode),
                     claim_policy=claim_policy,
                     new_article_seed=new_article_seed,
                 )
@@ -3577,6 +4417,8 @@ def run_local_publish(
             "plan_validation": asdict(deterministic),
             "critic": critic,
         }
+        if pipeline == "simple":
+            attempt_record["normalization"] = simple_normalization
         attempt_history.append(attempt_record)
         if deterministic.ok and plan.get("decision") in CHANGE_DECISIONS:
             if best_valid_attempt is None or attempt_quality(attempt_record) < attempt_quality(best_valid_attempt):
@@ -3613,7 +4455,8 @@ def run_local_publish(
     # below downgrades the run to needs_review.
     balance_repair_record: dict[str, Any] | None = None
     if (
-        critic_mode == "required"
+        pipeline == "legacy"
+        and critic_mode == "required"
         and plan.get("decision") in CHANGE_DECISIONS
         and deterministic.ok
         and not critic_blocks_publication(critic)
@@ -3729,15 +4572,21 @@ def run_local_publish(
         "packet_validation": asdict(packet_validation),
         "candidates": candidates,
         "candidate_retrieval": candidate_retrieval,
-        "source_prompt_context": prompt_source_packet(packet).get("prompt_context", {}),
+        "source_prompt_context": (
+            simple_prompt_source_packet(packet).get("prompt_context", {})
+            if pipeline == "simple"
+            else prompt_source_packet(packet).get("prompt_context", {})
+        ),
         "domain": domain,
         "plan": plan,
         "plan_validation": asdict(deterministic),
         "critic": critic,
         "critic_mode": critic_mode,
+        "pipeline": pipeline,
         "claim_policy": claim_policy,
         "abstract_mode": abstract_mode,
         "publication_requested": publish,
+        "allow_duplicate_pr": allow_duplicate_pr,
         "publication_suppressed": publication_suppressed,
         "attempt_history": attempt_history,
         "format_repairs": format_repairs,
@@ -3778,7 +4627,7 @@ def run_local_publish(
             reason="No deterministic-valid existing-target plan remained after repairs.",
         )
         return finish(report)
-    if critic_mode == "required" and critic_blocks_publication(critic):
+    if pipeline == "legacy" and critic_mode == "required" and critic_blocks_publication(critic):
         report["status"] = "needs_review"
         report["reason"] = "critic_quality_gate_failed"
         if critic_rejects_all_target_entities(critic):
@@ -3794,16 +4643,22 @@ def run_local_publish(
     # A validated balance/omitted-qualifier finding may never publish
     # unresolved: the repair pass either fixed it (and the critic re-approved
     # the repaired plan) or the run stops here for a human.
-    if critic_mode == "required" and unresolved_balance_findings(critic):
+    if pipeline == "legacy" and critic_mode == "required" and unresolved_balance_findings(critic):
         report["status"] = "needs_review"
         report["reason"] = "balance_finding_unresolved"
         return finish(report)
-    if critic_mode == "required" and not critic_approved:
+    if pipeline == "legacy" and critic_mode == "required" and not critic_approved:
         report["critic_publication_note"] = (
             "published_with_review_findings: validated review-severity critic findings "
             "are recorded in the draft PR audit for the human reviewer; each finding is "
             "also persisted as a critic comment beside its bullet so the caveat survives merge"
         )
+
+    # Model work is complete. Release the single-slot service before Git,
+    # rendering, or PR operations so another publisher can begin extraction.
+    close_client = getattr(client, "close", None)
+    if callable(close_client):
+        close_client()
 
     if publication_enabled and progress:
         progress("publishing")
@@ -3928,10 +4783,20 @@ def run_local_publish(
             + "\n".join(f"- `{path}`" for path in target_relatives)
             + "\n\n"
             f"{gate_summary}\n\n"
-            f"Critic mode: `{critic_mode}`\n\n"
-            f"Claim policy: `{claim_policy}`\n\n"
-            f"{critic_audit}\n\n"
-            "This pull request is intentionally a draft and is never auto-merged."
+            f"Pipeline: `{pipeline}`\n\n"
+            + (
+                "Duplicate comparison: explicitly allowed; see gate telemetry for the existing citation/PR.\n\n"
+                if allow_duplicate_pr and duplicate and duplicate.get("bypass_requested")
+                else ""
+            )
+            + (
+                "Review model calls: `none` (single-pass extraction with deterministic validation)\n\n"
+                if pipeline == "simple"
+                else f"Critic mode: `{critic_mode}`\n\n"
+            )
+            + f"Claim policy: `{claim_policy}`\n\n"
+            + f"{critic_audit}\n\n"
+            + "This pull request is intentionally a draft and is never auto-merged."
         )
         pr_url = run_command(
             [

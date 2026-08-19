@@ -1,480 +1,235 @@
 # Local Research Publisher
 
-This is the production path for turning an ad-hoc source URL or a queued Google
-Scholar result into a reviewed draft pull request in `content` using the local
-llama.cpp model.
+The production publisher turns an ad-hoc article URL, local PDF, or queued
+Google Scholar result into a validated Markdown patch and, when explicitly
+requested, a draft pull request in `content`.
 
-For host-wide service administration, backup/recovery procedures, diagrams,
-and downstream deployment, use the canonical workspace guide at
+The default is deliberately small: deterministic intake, one local-model pass,
+deterministic validation, rendering, and optional draft-PR delivery. The former
+multi-pass planner/critic workflow remains available as `--pipeline legacy` for
+compatibility, but it is no longer the production default.
+
+For host services, backup/recovery, queue administration, and downstream site
+deployment, see
 [`../../docs/research-production-operations.md`](../../docs/research-production-operations.md).
 
-## Packet Contract
+## Default architecture
 
-A packet is the normalized evidence bundle produced before the LLM runs. It
-contains the requested and resolved URLs, title, DOI/PMID, authors, journal,
-date, study type, abstract, extracted body, scraper backend, citation metadata,
-and retrieval/consistency warnings.
+1. Scrape the original URL with the existing Scrapling, FlareSolverr, and
+   browser fallback chain.
+2. Validate source identity, full-text sufficiency, DOI/title consistency, and
+   citation metadata before invoking the model.
+3. Check the content base, canonical paper state, and open draft-PR heads for
+   the DOI and source URL.
+4. Rank compatible pages inside the required top-level domain and suggest a
+   safe new entity path when no exact page exists.
+5. Build one bounded prompt from the abstract, Results, Conclusion,
+   traditional-use sections, Introduction, and Discussion plus compact page
+   identity/heading context.
+6. Make exactly one local-model call that extracts both the study's core
+   results and useful traditional or background healing uses stated in the
+   paper, then maps them to existing pages or a focused new page.
+7. Deterministically validate exact quotations, near-verbatim bullets, study
+   type, evidence scope, entity/page compatibility, safe paths, and new-page
+   metadata.
+8. Render every accepted claim with one shared bibliographic footnote for the
+   main scraped article, validate Markdown and Git scope, and write an immutable
+   run report and patch.
+9. With `--publish`, commit in an isolated `origin/main` worktree, push a new
+   branch, and open a draft PR. Nothing auto-merges.
 
-The scraper accepts only a syntactically valid bare DOI, recovers one from the
-article URL or extracted body when publisher fields contain labels such as
-`DOI:`, discards placeholder authors/journals/dates, and uses Crossref or PubMed
-to fill missing citation metadata. A complete abstract in the article body is
-preferred over an ellipsized metadata preview. Repairs and remaining
-`citation_metadata_issues` are recorded in the packet.
+There are no model critic calls, approval loops, syntax-repair calls, or cited-
+reference graph in the default path. Malformed or deterministically invalid
+model output stops as `needs_review`; it does not consume another model pass.
 
-The packet gate rejects unresolved placeholder citation metadata, truncated
-abstracts, malformed DOI/reference pairs, CAPTCHA, robot, challenge,
-access-error, and publisher error pages regardless of body length. It also
-rejects a DOI when its Crossref title is inconsistent with the scraped article
-title. FlareSolverr receives the
-original article URL as a fallback; CAPTCHA HTML from an earlier scraper is not
-passed into FlareSolverr. A challenge response returned by FlareSolverr is still
-invalid and can fall through to agent-browser.
+## Why the prompt is bounded
 
-## Quality Gates
+The earlier production prompt combined nearly the entire paper, normalized
+reference entries, and large candidate-page documents. A live citrus run sent
+187,213 user characters (62,624 prompt tokens) to a 27B local model. Overlapping
+runs on a `-np 1` llama server then spent the same 600-second HTTP timeout partly
+waiting in the server queue.
 
-The publisher:
+The simple prompt reserves portions of a 55,000-character source budget for
+both direct results and background/traditional sections, caps candidate-page
+context at 20,000 characters total, omits the paper's reference list, and caps
+completion at 6,000 tokens. An OS advisory lock fails a second publisher run
+quickly with `local_model_busy` instead of allowing two HTTP requests to
+compete for the single model slot.
 
-1. scrapes with the existing Scrapling → FlareSolverr → agent-browser path;
-2. validates retrieval plus enriched citation metadata before model use;
-3. checks duplicates using the DOI, DOI URL, resolved URL, requested URL, and
-   original intake URL rather than trusting one identifier;
-4. restricts retrieval to the required top-level domain, then establishes page
-   eligibility from exact title/stem entity phrases; title, keyword, and alert
-   matches carry the most weight, while tags, category folders, and body
-   overlap only rank an already eligible page;
-5. asks the local model for a structured plan containing one or more separate
-   target proposals, each with its own primary target entity, claims, evidence
-   scopes, rationale, and explicit exclusions;
-6. requires each proposed bullet to carry an exact contiguous source passage,
-   source section, claim kind, and evidence scope, and checks that the bullet
-   remains near-verbatim; background claims also retain every associated
-   reference record;
-7. runs separate target-placement and evidence-support reviews for every
-   proposed target against that candidate's metadata and Markdown only after
-   the complete structured plan passes deterministic validation;
-8. accepts critic issues only from fixed code/severity sets and only when each
-   objection contains an exact source or target-page quotation; self-
-   contradictory or ungrounded findings are recorded but cannot gate a draft;
-   published PRs show these separately under **Rejected critic observations
-   (non-blocking)** with their validation errors, so reviewers can inspect them
-   without mistaking them for authoritative findings;
-   only `blocking` findings and invalid critic responses stop a publication:
-   validated `review`-severity findings still drive draft repair attempts, but
-   once attempts are exhausted the best deterministic-valid draft publishes with
-   those findings listed in the draft PR's critic audit
-   (`critic_publication_note: published_with_review_findings`), because the
-   draft-PR reviewer — PRs are never auto-merged — is the intended judge of
-   review-severity placement questions;
-9. retains every repair attempt, complete critic feedback, and the best
-   deterministic-valid attempt rather than replacing useful history with a
-   later invalid repair;
-10. may mix guarded existing-page updates with creation of focused new entity
-    pages below the requested domain when no exact page exists;
-11. applies only a validated plan in an isolated git worktree based on
-    `origin/main`; and
-12. opens a draft PR only when `--publish` is supplied and every target's gate
-    passes.
+## Packet contract
 
-A single paper may have several target proposals, but each claim belongs to one
-target and every target is validated and criticized independently. A plan may
-propose multiple sections of the same page — for example `## Composition` and
-`## Healing Properties` on one new entity page — as separate proposals sharing
-the target path with different headings. Broad study vocabulary (for example
-`metabolic`) is not treated as entity identity.
+The packet is the normalized evidence bundle produced before model use. It
+contains requested and resolved URLs, title, DOI/PMID, authors, journal, date,
+study type, abstract, extracted body, retrieval backend, enrichment metadata,
+and warnings.
 
-**New-article creation, precisely.** Earlier revisions of this document stated
-that the publisher does not create new articles; that statement was wrong — the
-document had drifted behind the code, whose behavior is intended (PR #27
-legitimately created `Natural Healing/Fruits/Citrus/citrus.md`). The actual
-contract: under every claim policy, the planner may propose `create_new` with a
-safe new Markdown path below the required domain when no existing page is
-compatible, including the seeded category catch-all. No extra flag is required
-— creation rides the ordinary `--publish` gate. A new page requires a
-definition-form lead (`lead_kind: definition` for uncited general-knowledge
-definitions, or `source_grounded` when the source itself contains one — a
-topic-relevance framing sentence is rejected as `lead_not_definition_form`),
-focused tags including its exact entity/title, category rationale, at least one
-direct finding, exact quotes, both critics, rendered-Markdown validation, and
-the same draft-PR gate as an existing-page update. The run returns
-`needs_review` with a human-only `new_article_recommendation` instead of
-creating anything when the plan is not deterministically valid, when the critic
-raises a blocking finding or rejects every proposed target's entity placement,
-or when a validated balance finding cannot be repaired.
+The packet gate rejects CAPTCHA, robot, challenge, login, publisher-error, and
+insufficient-content pages even when the HTML is large. It also rejects invalid
+or placeholder citation metadata, truncated abstracts, malformed DOIs, and a
+DOI whose enriched title conflicts with the scraped paper.
 
-The planner is steered toward concrete evidence: when the packet's Results
-sections contain quantitative sentences, they are surfaced verbatim in the
-prompt (`QUANTITATIVE_RESULTS_CANDIDATES`) and a plan whose supplied-paper
-bullets are all qualitative records the warning `missing_quantitative_outcome`;
-when the source quantifies constituent compounds, a missing `## Composition`
-proposal records `missing_composition_section`. Composition bullets use the
-`composition` evidence scope, which is exempt from the animal-scope rule
-because measurements are not outcome claims.
+## One-pass output contract
 
-Wrong-entity and mere-mention placements remain gating failures. The exact
-passage for every target must assert that target's primary title/path entity;
-tag overlap is not sufficient for a target discovered only from full text. In
-particular, a clementine/pink-grapefruit or generic citrus blend cannot be filed
-under Bergamot.
+The model returns one JSON object with:
 
-The seeded category catch-all page is the deliberate exception: it exists to
-host findings about blends, concentrates, extracts, juices, and other products
-derived from its category, provided each bullet keeps its formulation or
-processing scope explicit in near-verbatim text. The placement critic receives
-the seed and is told the derived-product-versus-whole-category distinction is
-at most a `warning` there, and a deterministic backstop demotes an
-`entity_not_supported` objection on the seeded catch-all to `warning` whenever
-the objection's own exact quote contains the target entity (recorded as
-`severity_demoted_from_*_seeded_catch_all_scope`). Objections whose quote does
-not involve the target category at all keep their severity. This resolves the
-earlier planner/critic contradiction where the planner was required to create
-`Natural Healing/Fruits/Citrus/citrus.md` for a citrus-concentrate study and
-the critic then blocked every concentrate-scoped bullet on that same page.
+- `decision`: `publish_changes`, `duplicate`, or `needs_review`;
+- the source-supported study type;
+- one to four target proposals;
+- `append_existing` or `create_new`, a domain-safe target path, the exact target
+  entity, heading, and placement rationale;
+- new-page title, tags, definition lead, and category rationale when needed;
+- one-idea bullets containing `text`, an exact contiguous `source_quote`, the
+  exact `source_section`, `claim_kind`, `evidence_scope`, and optional property
+  subsection.
 
-A retry that abandons an earlier deterministically valid plan by returning
-`needs_review` is treated as capitulation while attempts remain: the planner is
-re-prompted (`planner_abandoned_valid_plan`) to keep unobjected targets and
-rescope, retarget, or exclude only the claims a critic objected to.
+`source_finding` is reserved for the paper's own results.
+`background_fact` covers useful background, traditional, historical, or
+healing-use statements made by the paper. Both kinds cite the main article.
 
-`rat`, `rats`, `mouse`, and `mice` are explicit preclinical cues, alongside
-animal/preclinical/in-vivo labels. Direct preclinical findings require `animal`
-evidence scope. If a suitable heading is not explicitly animal/preclinical, the
-integrated renderer inserts and validates an evidence warning. Near-verbatim validation
-compares normalized word-token sequences with automatic junk suppression
-disabled, making the threshold stable for long or repetitive source text.
+Earlier works mentioned by the paper are intentionally not modeled as
+bibliographic dependencies. The published Markdown never links those earlier
+references from this pipeline.
 
-### Claim policies
+## Deterministic gates
 
-Accepted claim policies: `integrated`, `strict`, `compendium`.
+The single pass may publish only when all applicable checks pass:
 
-That line is the canonical enum. The CLI exposes `--claim-policy integrated`
-(default) and `--claim-policy strict`; `compendium` is a legacy stored alias
-that old queue jobs may still carry, and a unit test
-(`test_documented_claim_policies_match_code_enum`) fails CI whenever this
-documented set diverges from the code's `CLAIM_POLICIES` enum.
+- source packet and DOI/title identity are valid;
+- DOI/URL is absent from the base content, active paper state, and open PR
+  heads;
+- an existing target is one of the domain-scoped entity candidates, or a new
+  path is safely below the selected domain;
+- every bullet has an exact source passage and remains near-verbatim;
+- every target entity appears in the bullet and its source passage;
+- source findings are not mislabeled as Introduction background;
+- animal findings remain animal-scoped and receive the rendered preclinical
+  warning/species context;
+- new pages have a definition-form lead, focused tags, a category rationale,
+  and at least one direct source finding;
+- no bullet introduces an external cited-reference record;
+- frontmatter, headings, one shared source footnote, Markdown structure, and
+  intended-file Git scope validate.
 
-How the three differ:
+Warnings such as a missing quantitative result are retained in the report for
+human review. A deterministic issue stops publication.
 
-- **`integrated`** (default, production): extracts direct `source_finding`
-  claims from the supplied paper *and* passage-grounded `background_fact`
-  claims from claim-bearing full-text sections (Introduction, Discussion),
-  each with full cited-reference provenance. All deterministic gates apply —
-  packet/citation metadata, duplicate, entity assertion, exact-quote,
-  near-verbatim, preclinical scope (`source_finding` from a preclinical paper
-  must be `animal` or `composition` scope), section provenance, rendered
-  Markdown — plus both critics.
-- **`strict`**: direct findings only; background facts are rejected
-  (`background_claim_not_allowed`), Introduction-sourced findings are
-  misclassifications, and every preclinical claim must be `animal`-scoped
-  (composition measurements excepted). Same gates otherwise; retained for
-  focused diagnostics.
-- **`compendium`** (legacy alias): interpreted exactly as `integrated`; it is
-  accepted so historical queue jobs and stored reports remain replayable,
-  and it selects the same extraction and gate behavior. New jobs should not
-  use it.
+## Citation behavior
 
-Every integrated bullet records:
+Each source is keyed by DOI, with a normalized source-URL fallback. All bullets
+from that paper reuse one footnote. The footnote links the title to the DOI and
+the publication/source field to the main scraped article. Study type and date
+are normalized deterministically.
 
-- `claim_kind`: `source_finding` or `background_fact`;
-- the exact `source_quote` and `source_section`;
-- the target's primary `target_entity` and the claim-specific evidence scope;
-- and, when the passage cites earlier work, `cited_references` entries retaining
-  every exact citation marker, exact reference-list entry, and source-provided
-  URL.
+After the single model response, bounded deterministic cleanup may restore
+source whitespace, replace an over-paraphrase with its exact source quote,
+remove external-reference fields, or drop an unprovable bullet. It cannot
+invent or rewrite a claim, and every action is recorded in the run report.
 
-Missing or invented passage/reference provenance is a deterministic rejection.
-Global exclusions must describe material genuinely omitted from every target;
-reasons saying a passage was already captured, integrated, or not excluded are
-also rejected as contradictory.
-### Evidence-tier structure under Healing Properties
+Per-bullet exact quotation and source-section provenance remains in adjacent
+HTML comments for PR review. These comments contain no independently followed
+or generated citation link.
 
-For Healing Properties targets (and any plan with animal-scope or
-subsection-tagged bullets) the renderer groups claims by evidence tier
-instead of emitting one flat list:
+## Ad-hoc usage
 
-- Animal-scope findings render under `### Preclinical Evidence (Animal
-  Studies)` — this rendered subsection also satisfies the strict-policy
-  preclinical heading requirement, so the plan-level heading gap is now the
-  warning `preclinical_heading_scope_warning`, never a gate failure. The
-  animal/preclinical evidence blockquote is scoped inside that subsection
-  only.
-- Background facts render under property-named `###` subsections taken from
-  each bullet's new `subsection` field (fallback `Supporting Background`),
-  without the animal warning unless their own evidence scope is animal.
-- When animal findings concern a specific formulation (bullet text mentions a
-  concentrate/formulation/extract/blend), the plan must supply
-  `formulation_definition` — one near-verbatim line with an exact
-  `source_quote` — and the subsection opens with it, before the warning and
-  bullets, so product-specific findings cannot be read as generic entity
-  claims (`formulation_definition_missing` otherwise).
-- Animal bullets whose near-verbatim text lacks a species/model cue get the
-  packet's single standardized scope prefix (for example `In fructose-fed
-  rats, `, derived by `packet_animal_model`). The near-verbatim gate excludes
-  exactly that whitelisted comma-terminated prefix from token comparison; the
-  0.68 threshold is unchanged and applies fully to any other lead-in.
-- Methods/process statements (how a formulation was produced or assessed) are
-  rejected as effect bullets (`methods_statement_not_effect_claim`); their
-  essential content belongs in `formulation_definition`.
-- Multi-sentence bullet texts are split into one-idea bullets sharing the same
-  footnote, each with its own provenance comment.
-
-The rendered-Markdown gate enforces the structure independently:
-`bullet_outside_property_subsection`, `animal_subsection_missing_warning`,
-`animal_warning_misapplied_to_background`, `animal_bullet_missing_species_scope`,
-`bullet_not_single_idea`, and `formulation_definition_missing_or_misplaced`.
-
-### Citation rendering: one footnote per source, provenance in comments
-
-The renderer emits exactly one bibliographic footnote per unique source, keyed
-by DOI with a normalized-URL fallback. Every bullet citing that source —
-direct finding or background fact — reuses the same `[^n]` marker, and a
-repeated application against a page that already carries the source's footnote
-reuses the existing number instead of emitting a second block. The
-rendered-Markdown gate rejects `duplicate_source_footnote` if the same DOI ever
-appears in two footnote blocks.
-
-Per-claim provenance no longer lives in the footnote. Each bullet is followed
-by an adjacent, two-space-indented HTML comment carrying `claim_kind`, the
-`source_section`, the exact `source_quote`, and any `cited_references` —
-invisible on the rendered site but reviewable in the PR diff. Supplied-paper
-findings carry the same provenance fields as background facts. Within
-`cited_references`, source-internal fragment anchors (for example
-`[Aruoma et al., 2012](#bb0010)`) are collapsed to plain text; when the
-reference record carries a resolvable URL or an embedded DOI, the entry links
-`https://doi.org/…` instead. The gate independently rejects any rendered link
-whose target starts with `#` and matches no in-page anchor
-(`dead_anchor_link_*`).
-
-Footnote hygiene rules:
-
-- The **Title** strips publisher suffixes such as ` - ScienceDirect` (Crossref
-  enrichment supplies the canonical form when it agrees) and links to the DOI.
-- **Study Type** is classified deterministically from content signals (title,
-  keywords, abstract, then publication types/MeSH) into the style guide
-  vocabulary — Meta Analysis, Review, Animal Study, Human Study, In Vitro. The
-  publisher's genre label (for example "Research Article") is only a fallback
-  when no signal matches and never overrides a successful classification.
-- **Date** is normalized to `YYYY-MM-DD`, degrading to `YYYY-MM` or `YYYY` for
-  partial source dates.
-- **Institution(s)** and **Copy** (archive links) render only when the packet
-  provides them.
-- The abstract is emitted at most once per source, controlled by
-  `--abstract-mode full|truncated|omit` (default `full`); the complete abstract
-  always remains in the packet and report artifacts.
-
-Under the integrated policy, an animal-scoped claim may use an otherwise appropriate
-existing heading. When the heading does not itself say Animal/Preclinical, the
-renderer inserts a mandatory, validated animal/preclinical evidence warning.
-This relaxation does not change the evidence scope or imply human efficacy.
-
-Increasing the llama.cpp context window is not the primary provenance fix. The
-current service already has a large context, and sending an unstructured full
-article plus every full candidate page makes associations less reliable. The
-publisher instead normalizes claim-bearing sections and reference-list entries,
-keeps exact citation markers with their records, caps total candidate context,
-and reports the actual source/candidate character budgets used. The active
-262,144-token server remains ample headroom for this bounded prompt.
-
-Draft generation has a separate 10,000-token completion budget. A response that
-reaches that ceiling is recorded as truncated and fails closed; it is not sent
-through a futile syntax repair. If a response stops normally but contains
-malformed JSON, the raw output, SHA-256, usage, and finish reason are retained
-and one syntax-only repair call is allowed before deterministic validation.
-
-For paths under `Natural Healing/`,
-`Research/docs/natural-healing-content-style-guide.md` is authoritative. Its
-near-verbatim, bullet-first style is intentionally preserved.
-
-## Ad-hoc Usage
-
-Dry-run first. `--domain` is required so retrieval and any new path stay within
-one top-level content domain:
+Start with a dry run:
 
 ```bash
 ./agent-workflow local-publish "https://example.org/article" \
   --domain "Natural Healing" --alert-name "Quercetin"
 ```
 
-Every invocation writes a new immutable
-`out/runs/<timestamp>-<source-slug>-<source-hash>/` directory. It contains
-`source.md`, `packet.json`, `report.json`, and `proposed.patch` when rendering
-succeeds. The report records start/end/duration, repository revisions, options,
-domain, candidate scoring and context budgets, duplicate checks, each model
-call's duration and token usage, every draft/critic attempt, malformed raw
-model output and format-repair history when applicable, artifact paths, and an
-explicit `publication_outcome`. Re-running a source never overwrites a prior
-run.
-
-The CLI also emits JSON progress records to stderr for scraping, matching, each
-draft/format-repair/deterministic-validation/critic attempt, and final render
-validation so a long local generation is distinguishable from a stalled job.
-
-After reviewing pilot output, allow a validated draft PR:
+Review `source.md`, `packet.json`, `report.json`, and `proposed.patch` in the
+reported immutable run directory. Then request a draft PR:
 
 ```bash
 ./agent-workflow local-publish "https://example.org/article" \
   --domain "Natural Healing" --alert-name "Quercetin" --publish
 ```
 
-### Critic modes
+If the DOI or source URL is already present on an open PR, the command returns
+`duplicate` with `reason: open_pull_request` and that PR URL without invoking
+the model or creating another branch.
 
-`required` is the default and is the only mode that can publish normally:
-
-```bash
-./agent-workflow local-publish URL --domain "Natural Healing" --critic-mode required
-```
-
-`advisory` still runs both reviews and records their findings. It may produce a
-validated patch after deterministic gates pass, but it suppresses commit, push,
-and PR creation even when `--publish` is present:
+For an intentional side-by-side comparison, explicitly retain the duplicate
+telemetry but allow a second draft PR:
 
 ```bash
-./agent-workflow local-publish URL --domain "Natural Healing" --critic-mode advisory --publish
+./agent-workflow local-publish URL --domain "Natural Healing" \
+  --publish --allow-duplicate-pr
 ```
 
-`off` skips both critic calls and is limited to manual ad-hoc dry runs. Combining
-it with `--publish` is an error:
+This flag requires `--publish`. The new PR body records that the duplicate stop
+was deliberately bypassed; it never auto-merges either PR.
+
+Only use the compatibility pipeline for diagnosis of older reports:
 
 ```bash
-./agent-workflow local-publish URL --domain "Natural Healing" --critic-mode off
+./agent-workflow local-publish URL --domain "Natural Healing" \
+  --pipeline legacy --critic-mode required
 ```
 
-After a human reviews the packet, selected targets, plan, deterministic results,
-and critic findings, an override request can be recorded only with both an
-explicit flag and audit reason:
+Legacy-only flags include `--critic-mode`, `--max-draft-attempts`,
+`--allow-critic-rejection`, and `--override-reason`. They do not alter the
+single-pass production path.
 
-```bash
-./agent-workflow local-publish URL --domain "Natural Healing" --critic-mode required --publish \
-  --allow-critic-rejection \
-  --override-reason "Human reviewed target and evidence"
-```
+## Database queue
 
-The override request and reason are retained for audit, but do not bypass a
-failed critic or any packet/citation metadata, duplicate, entity, exact-quote,
-near-verbatim, preclinical-placement, or rendered-Markdown gate. It is
-unavailable to `local-worker`, and no path auto-merges. Every validated
-review-severity finding that publishes — via the override or the ordinary
-publish-with-findings path — is also persisted as a `<!-- critic | … -->`
-comment adjacent to the affected bullet in the generated Markdown, so the
-caveat survives once the PR merges instead of living only in the PR body.
-
-### Balance-finding repair pass
-
-A validated finding of the balance/omitted-qualifier class (currently
-`limitation_omitted`) never publishes unresolved in `required` mode. When the
-selected attempt would otherwise proceed and such a finding remains, the
-pipeline runs exactly one bounded repair:
-
-1. The finding — whose `source_quote` must be a verbatim source passage — is
-   fed back to the planner with a constrained prompt allowing only (a) one new
-   near-verbatim bullet quoting the qualifier passage, or (b) extending the
-   flagged bullet with the qualifier clause under a covering exact quote.
-2. The repaired plan re-runs full deterministic validation plus a repair-scope
-   diff check (`validate_balance_repair`) that rejects dropped, reworded, or
-   unrelated added bullets, then both critics. Because qualifier sentences
-   rarely restate the target entity, the entity-assertion and bullet-count
-   caps are waived only for the qualifier bullets themselves
-   (`*_waived_balance_qualifier` warnings); exact-passage and near-verbatim
-   gates are never waived.
-3. If the repair validates and the critics no longer report an unresolved
-   balance finding, the repaired attempt publishes and is appended to
-   `attempt_history` with `balance_repair: true`. On any failure — model error,
-   scope violation, failed gates, or a qualifier that is not verbatim in the
-   source — the pre-repair best attempt is retained and the run downgrades to
-   `needs_review` with reason `balance_finding_unresolved`.
-
-The repair pass is available to the passive `local-worker` (it adds one model
-round trip, no new permissions); the critic-rejection override remains
-forbidden there. `advisory` and `off` modes are unchanged. The outcome is
-recorded under `balance_repair` in the report.
-
-## Database Queue
-
-Queue one known row or a score-ordered batch:
+Queue one article or a bounded backlog:
 
 ```bash
 ./agent-workflow enqueue-local ARTICLE_KEY --domain "Natural Healing"
 ./agent-workflow enqueue-local-backlog --domain "Natural Healing" \
-  --min-score 12 --limit 10
+  --status selected --min-score 12 --limit 10
 ```
 
-Process one job without publishing, or enable draft PR publication:
+Process one job as a dry run or allow a passing job to open a draft PR:
 
 ```bash
 ./agent-workflow local-worker --max-jobs 1
 ./agent-workflow local-worker --max-jobs 1 --publish
 ```
 
-The domain and claim policy are persisted when the job is enqueued; the worker
-does not reinterpret them from whichever flags happen to be present later.
-Canonicalized source URLs prevent query-string, scheme, or `www` variants from
-creating parallel active jobs. Jobs use atomic leases and retain state/event
-history. The terminal states
-`pr_open`, `duplicate`, and `rejected` mark an article processed. A failure does
-not. Exhausted failures remain visible for diagnosis instead of disappearing
-from the backlog.
-
-Inspect queue state without changing it:
-
-```bash
-uv run --directory gmail-reader gmail-reader \
-  --db gmail-reader/data/scholar-alerts.db \
-  publication-jobs --state all --limit 50
-```
-
-`validated` is a successful dry run and is distinct from `needs_review`.
-Neither is automatically claimed again. `retry` carries an attempt count and a
-real `next_run_at`; delays begin at five minutes and double up to six hours.
-`failed` means the retry budget was exhausted. To publish a reviewed dry run or
-retry a repaired stopped job, explicitly reset it with an audit reason:
+The worker uses the simple pipeline by default. Queue leasing, retries,
+`validated`, `needs_review`, `duplicate`, `failed`, and `pr_open` states are
+unchanged. Requeue a reviewed stopped job explicitly:
 
 ```bash
 ./agent-workflow requeue-local JOB_ID \
-  --reason "Reviewed dry-run; ready for one publication attempt"
-./agent-workflow local-worker --max-jobs 1 --publish
+  --reason "Reviewed prior result and authorized one new attempt"
 ```
 
-Every transition, including explicit requeue and prior artifact pointers, is
-appended to `publication_job_events`.
+## Claim-policy compatibility
 
-The passive worker always uses `critic-mode=required` and the job's persisted
-integrated policy. It exposes no critic override flags, and the publisher also
-rejects an override when invoked with the internal passive-worker context.
+Accepted claim policies: `integrated`, `strict`, `compendium`.
 
-Historical article rows can be linked to canonical papers in bounded batches.
-The command is a dry run unless `--apply` is explicit:
+The simple pipeline always asks for both direct and background/traditional
+claims and applies its own deterministic contract. `integrated` remains the
+stored/default policy name, `strict` remains available to the legacy pipeline,
+and `compendium` remains a legacy stored alias for historical queue jobs.
+
+## Operational outcomes
+
+- `duplicate`: already cited, already active in paper state, or found on an
+  open PR.
+- `needs_review`: invalid packet, model busy/error, malformed JSON, uncertain
+  model decision, deterministic failure, or rendered-Markdown failure.
+- `validated_draft`: dry-run patch passed all gates.
+- `pr_open`: draft PR URL was verified.
+
+The passive queue maps these outcomes to its existing durable states and event
+history. `pr_open`, `duplicate`, and `rejected` are terminal processing
+outcomes; `validated` and `needs_review` require an explicit requeue before a
+new attempt.
+
+## Validation after changes
 
 ```bash
-uv run --directory gmail-reader gmail-reader backfill-paper-keys \
-  --status selected --limit 1000
-./gmail-reader/backup-db.sh
-uv run --directory gmail-reader gmail-reader backfill-paper-keys \
-  --status selected --limit 1000 --apply
+bash -n agent-workflow scripts/sync-scholar-alerts
+uv run python -m unittest discover -s tests -v
+uv run --directory gmail-reader python -m unittest discover -s tests -v
+uv run --directory web-scraper python -m unittest discover -s tests -v
+uv run --directory wiki-automation python -m unittest discover -s tests -v
+uv run --directory image-upload python -m unittest discover -s tests -v
+./agent-workflow doctor
 ```
-
-## Timers
-
-Tracked user-service templates are in `systemd/`:
-
-- `research-scholar-sync.{service,timer}` syncs Gmail every 30 minutes.
-- `research-local-publisher.{service,timer}` queues and processes one article
-  at a time every 15 minutes.
-
-Install and enable them only after the dry-run pilot has been reviewed:
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp systemd/research-scholar-sync.* systemd/research-local-publisher.* \
-  ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now research-scholar-sync.timer
-systemctl --user enable --now research-local-publisher.timer
-```
-
-The local publisher service includes `--publish`, but draft PRs are never
-auto-merged. Edit the copied unit paths if the workspace moves.
-
-On iconium as observed 2026-08-09, these two timers are **not installed or
-enabled**. The triage UI, local Qwen llama.cpp service, FlareSolverr container,
-and nightly database backup are active. Do not describe the passive publisher
-as running until `systemctl --user list-timers 'research-*' --all` confirms it.

@@ -18,14 +18,19 @@ from wiki_automation.local_publish import (
     critic_blocks_publication,
     deterministic_placement_review_issues,
     duplicate_identifiers,
+    format_gate_summary,
     format_critic_pr_audit,
     merge_duplicate_checks,
     missing_entity_page_seed,
     run_local_publish,
+    normalize_simple_draft_plan,
+    simple_draft_prompt,
+    simple_prompt_source_packet,
     source_is_preclinical,
     study_type_matches_packet,
     validate_critic_review,
     validate_draft_plan,
+    validate_simple_draft_plan,
     validate_rendered_markdown,
     validate_source_packet,
     word_token_similarity,
@@ -84,6 +89,22 @@ class LocalPublishTests(unittest.TestCase):
         self.assertEqual(client.calls[0]["response_chars"], len(malformed))
         self.assertEqual(client.calls[0]["status"], "error")
 
+    def test_model_lock_fails_fast_for_overlapping_publishers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = Path(tmpdir) / "model.lock"
+            first = local_publish.LocalLLMClient(
+                "http://127.0.0.1:1/v1", "first", lock_path=lock_path
+            )
+            second = local_publish.LocalLLMClient(
+                "http://127.0.0.1:1/v1", "second", lock_path=lock_path
+            )
+            first._acquire_lock()
+            try:
+                with self.assertRaises(local_publish.LocalModelBusyError):
+                    second._acquire_lock()
+            finally:
+                first.close()
+
     def test_packet_rejects_placeholder_citation_metadata(self) -> None:
         packet = dict(self.packet)
         packet.update(
@@ -135,6 +156,234 @@ class LocalPublishTests(unittest.TestCase):
         )
         self.assertEqual(merged["content_hit_count"], 1)
         self.assertEqual(merged["paper_result"]["paper"]["workflow_state"], "pr_open")
+
+    def test_simple_prompt_is_bounded_and_omits_reference_graph(self) -> None:
+        packet = dict(self.packet)
+        packet["body_markdown"] = (
+            "## Abstract\n\nA direct quercetin finding was reported in this review.\n\n"
+            "## 1. Introduction\n\nQuercetin has a traditional background use described by the paper [1].\n\n"
+            "## 2. Methods\n\nAssay detail. "
+            + ("excluded method text " * 5000)
+            + "\n\n## 3. Results\n\nQuercetin produced a measured result of 12 mg in the study.\n\n"
+            "## References\n\n1. An earlier paper that must not enter the prompt."
+        )
+        source = simple_prompt_source_packet(packet)
+        rendered = json.dumps(source)
+        self.assertLessEqual(source["prompt_context"]["claim_chars"], 55000)
+        self.assertEqual(source["prompt_context"]["reference_entry_count"], 0)
+        self.assertNotIn("An earlier paper that must not enter the prompt", rendered)
+        self.assertNotIn("excluded method text", rendered)
+
+        prompt = simple_draft_prompt(
+            packet=packet,
+            candidates=[],
+            candidate_documents={},
+            domain="Natural Healing",
+            category_catalog=["Natural Healing/Chemicals"],
+            new_article_seed=None,
+        )
+        self.assertIn("core results", prompt)
+        self.assertIn("traditional", prompt)
+        self.assertNotIn('"cited_references"', prompt)
+
+    def test_simple_prompt_reserves_context_for_results_and_background(self) -> None:
+        packet = dict(self.packet)
+        packet["body_markdown"] = (
+            "## 1. Introduction\n\n"
+            "Quercetin has a traditional background use explicitly described here.\n\n"
+            "## 3. Results\n\n"
+            + ("Quercetin produced a measured animal result. " * 3000)
+        )
+
+        source = simple_prompt_source_packet(packet)
+        rendered = json.dumps(source)
+
+        self.assertLessEqual(source["prompt_context"]["claim_chars"], 55000)
+        self.assertGreater(source["prompt_context"]["claim_chars_by_group"]["results"], 0)
+        self.assertGreater(
+            source["prompt_context"]["claim_chars_by_group"]["introduction"], 0
+        )
+        self.assertIn("measured animal result", rendered)
+        self.assertIn("traditional background use", rendered)
+
+    def test_simple_validator_accepts_main_source_only_plan(self) -> None:
+        quote = (
+            "Poor aqueous solubility and extensive metabolism limit the clinical "
+            "translation of quercetin."
+        )
+        plan = {
+            "decision": "publish_changes",
+            "study_type": "Review",
+            "target_proposals": [
+                {
+                    "operation": "append_existing",
+                    "target_path": "Natural Healing/quercetin.md",
+                    "target_entity": "quercetin",
+                    "parent_heading": "",
+                    "heading": "## Safety",
+                    "rationale": "The finding directly concerns quercetin.",
+                    "bullets": [
+                        {
+                            "text": quote,
+                            "source_quote": quote,
+                            "source_section": "Abstract",
+                            "claim_kind": "source_finding",
+                            "evidence_scope": "review_summary",
+                            "subsection": "",
+                        }
+                    ],
+                }
+            ],
+        }
+        validation = validate_simple_draft_plan(
+            plan,
+            packet=self.packet,
+            candidate_paths={"Natural Healing/quercetin.md"},
+            candidate_metadata={
+                "Natural Healing/quercetin.md": {"title": "Quercetin"}
+            },
+            existing_paths={"Natural Healing/quercetin.md"},
+            domain="Natural Healing",
+        )
+        self.assertTrue(validation.ok, validation.issues)
+
+        plan["target_proposals"][0]["bullets"][0]["cited_references"] = [
+            {"citation_marker": "[1]", "reference_text": "Earlier work"}
+        ]
+        validation = validate_simple_draft_plan(
+            plan,
+            packet=self.packet,
+            candidate_paths={"Natural Healing/quercetin.md"},
+            candidate_metadata={
+                "Natural Healing/quercetin.md": {"title": "Quercetin"}
+            },
+            existing_paths={"Natural Healing/quercetin.md"},
+            domain="Natural Healing",
+        )
+        self.assertIn(
+            "target_0_bullet_0_external_reference_not_allowed", validation.issues
+        )
+
+    def test_simple_normalization_uses_only_exact_source_text(self) -> None:
+        exact_quote = (
+            "Poor aqueous solubility and extensive metabolism limit the clinical "
+            "translation of quercetin."
+        )
+        spaced_source = "Quercetin measured 12\u00a0mg in the source animal study."
+        packet = {
+            **self.packet,
+            "body_markdown": f"{self.packet['body_markdown']}\n{spaced_source}",
+        }
+        plan = {
+            "target_proposals": [
+                {
+                    "bullets": [
+                        {
+                            "text": "Quercetin has limited clinical use.",
+                            "source_quote": exact_quote,
+                            "cited_references": [{"reference_text": "Do not cite this"}],
+                        },
+                        {
+                            "text": "Quercetin measured 12 mg in the source animal study.",
+                            "source_quote": "Quercetin measured 12 mg in the source animal study.",
+                        },
+                        {
+                            "text": "Unsupported claim.",
+                            "source_quote": "This passage does not occur in the article at all.",
+                        },
+                    ]
+                }
+            ]
+        }
+
+        actions = normalize_simple_draft_plan(plan, packet=packet)
+
+        bullets = plan["target_proposals"][0]["bullets"]
+        self.assertEqual(len(bullets), 2)
+        self.assertEqual(bullets[0]["text"], exact_quote)
+        self.assertNotIn("cited_references", bullets[0])
+        self.assertEqual(bullets[1]["source_quote"], spaced_source)
+        self.assertTrue(
+            any(item["action"] == "dropped_unprovable_bullet" for item in actions)
+        )
+
+    def test_publish_detects_open_pr_before_scraping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = "https://example.org/article"
+            open_pr = {
+                "checked": True,
+                "matches": [
+                    {
+                        "identifier": source,
+                        "number": 27,
+                        "url": "https://github.com/example/content/pull/27",
+                    }
+                ],
+            }
+            with patch.object(local_publish, "run_command", return_value="revision"), patch.object(
+                local_publish, "find_open_pr_duplicate", return_value=open_pr
+            ), patch.object(cli, "scrape_source_packet") as scrape:
+                report = run_local_publish(
+                    source=source,
+                    alert_name="Citrus",
+                    content_repo=root / "content",
+                    tools_root=root / "tools",
+                    output_dir=root / "out",
+                    base_url="http://127.0.0.1:8080/v1",
+                    model="test",
+                    publish=True,
+                    pipeline="simple",
+                )
+        scrape.assert_not_called()
+        self.assertEqual(report["status"], "duplicate")
+        self.assertEqual(report["reason"], "open_pull_request")
+        self.assertEqual(report["pr_url"], "https://github.com/example/content/pull/27")
+        self.assertEqual(report["model_calls"], [])
+
+    def test_duplicate_pr_bypass_is_explicit_and_publish_only(self) -> None:
+        args = cli.build_parser().parse_args(
+            [
+                "local-publish",
+                "https://example.org/article",
+                "--domain",
+                "Natural Healing",
+                "--publish",
+                "--allow-duplicate-pr",
+            ]
+        )
+        self.assertEqual(args.pipeline, "simple")
+        self.assertTrue(args.allow_duplicate_pr)
+        with self.assertRaisesRegex(ValueError, "requires --publish"):
+            run_local_publish(
+                source="https://example.org/article",
+                alert_name="",
+                content_repo=Path("/tmp/content"),
+                tools_root=Path("/tmp/tools"),
+                output_dir=Path("/tmp/output"),
+                base_url="http://127.0.0.1:8080/v1",
+                model="test",
+                publish=False,
+                pipeline="simple",
+                allow_duplicate_pr=True,
+            )
+
+    def test_gate_summary_labels_duplicate_comparison_as_bypass(self) -> None:
+        summary = format_gate_summary(
+            packet=self.packet,
+            packet_validation={"ok": True, "issues": []},
+            duplicate={
+                "bypass_requested": True,
+                "content_hit_count": 0,
+                "open_pull_requests": {"matches": [{"number": 27}]},
+            },
+            plan={"target_proposals": []},
+            deterministic=local_publish.ValidationResult(True, []),
+            rendered_results=[],
+        )
+
+        self.assertIn("Duplicate: bypass — explicit A/B comparison", summary)
+        self.assertIn("1 open PR matches", summary)
 
     def test_sciencedirect_visible_marker_remains_linked_to_reference(self) -> None:
         source_marker = "[Liu et al., 2016](#bb0115)"
@@ -1500,6 +1749,7 @@ tags:
         critics: list | None = None,
         critic_mode: str = "required",
         max_draft_attempts: int = 1,
+        pipeline: str = "legacy",
     ) -> tuple[dict, Mock]:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -1557,8 +1807,28 @@ tags:
                     base_ref="HEAD",
                     max_draft_attempts=max_draft_attempts,
                     critic_mode=critic_mode,
+                    pipeline=pipeline,
                 )
         return report, client
+
+    def test_simple_pipeline_uses_one_model_call_and_no_repair_loop(self) -> None:
+        plan = self._quercetin_valid_plan()
+        plan["decision"] = "publish_changes"
+        report, client = self._run_with_mocked_model(
+            plans=[plan],
+            pipeline="simple",
+            max_draft_attempts=3,
+            critic={
+                "approved": True,
+                "recommendation": "skipped",
+                "issues": [],
+                "mode": "off",
+            },
+        )
+        self.assertEqual(report["status"], "validated_draft")
+        self.assertEqual(report["pipeline"], "simple")
+        self.assertEqual(client.json_completion.call_count, 1)
+        self.assertEqual(report["runtime"]["options"]["max_draft_attempts"], 1)
 
     def test_review_severity_critic_findings_publish_validated_draft(self) -> None:
         revise_critic = {

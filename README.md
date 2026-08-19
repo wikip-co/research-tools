@@ -13,7 +13,7 @@ This repository separates the operational tooling from the markdown content repo
 - `wiki-automation`: build queues, search content, and prepare scrape packets
 - `image-upload`: upload article images to Cloudinary, including browser-captured screenshots
 - `web-scraper`: scrape source URLs into structured packets, with optional FlareSolverr (Cloudflare) and `agent-browser` fallbacks
-- local llama.cpp publisher: guarded ad-hoc URL processing plus a durable SQLite queue, a structured draft with separate placement/evidence reviews, deterministic gates, isolated worktrees, and optional draft PRs
+- local llama.cpp publisher: guarded ad-hoc URL processing plus a durable SQLite queue, one bounded extraction/placement pass, deterministic gates, isolated worktrees, and optional draft PRs
 
 ## Runtime Model
 
@@ -319,25 +319,30 @@ The web-scraper now automatically detects study types (Review, Meta-Analysis, RC
 ### Local llama.cpp Publisher
 
 - `agent-workflow local-publish URL --domain "Natural Healing"` runs an ad-hoc dry-run through packet,
-  retrieval, draft, split placement/evidence critics, deterministic validation,
+  retrieval, one bounded extraction-and-placement pass, deterministic validation,
   and isolated-worktree gates.
 - Add `--publish` to open a draft PR after every gate passes.
 - A plan may update several compatible pages and create a focused new entity
   page below the required domain when no exact page exists.
+- The one pass extracts both the paper's own findings and useful traditional or
+  background healing uses stated in the paper. All rendered claims reuse one
+  bibliographic footnote for the main scraped article; earlier works cited by
+  the paper are not followed or linked.
 - Every invocation has an immutable `out/runs/<run-id>/` source, packet, report,
   and optional patch with repository, model-call, timing, and publication
   outcome telemetry.
-- Drafts use a 10,000-token completion budget. Truncated output fails closed;
-  normally completed malformed JSON is preserved and receives at most one
-  syntax-only repair before validation.
-- The default integrated policy proposes supplied-paper findings and useful
-  full-text background facts with exact passage, claim-origin, entity,
-  evidence-scope, and cited-reference provenance gates.
-- Use `--critic-mode advisory` for patch-only review or `--critic-mode off` for
-  a manual ad-hoc dry run. Only default `required` mode can publish normally.
-- A required critic rejection can be published only with the explicit audited
-  `--allow-critic-rejection --override-reason "..."` pair; passive workers can
-  never use it, and deterministic/citation gates still apply.
+- The prompt is capped to claim-bearing sections and compact candidate-page
+  structure, with a 6,000-token completion budget. Malformed or invalid output
+  fails closed without another model call.
+- An OS lock prevents overlapping publisher runs from queueing against the
+  single-slot llama server. Publication also checks open PR heads for the DOI
+  and source URL before generating another branch.
+- `--publish --allow-duplicate-pr` is the explicit A/B escape hatch: existing
+  duplicate evidence is retained in the report and PR body while a separate
+  draft PR is allowed for side-by-side comparison.
+- `--pipeline legacy` retains the prior multi-pass critic workflow for
+  compatibility and diagnosis; its critic flags do not apply to the default
+  `simple` pipeline.
 - `enqueue-local`, `enqueue-local-backlog`, and `local-worker` provide the durable
   SQLite queue used by the passive database workflow. Jobs persist their domain
   and policy, delay retries with `next_run_at`, and require `requeue-local` plus

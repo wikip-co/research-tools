@@ -158,7 +158,7 @@ Usage:
   agent-workflow search "<query>" [wiki-automation search args...]
   agent-workflow prepare "<url>" [wiki-automation prepare args...]
   agent-workflow intake "<url-or-pdf>" [wiki-automation intake args...]
-  agent-workflow local-publish "<url-or-pdf>" --domain "Natural Healing" [--critic-mode required|advisory|off] [--publish]
+  agent-workflow local-publish "<url-or-pdf>" --domain "Natural Healing" [--pipeline simple|legacy] [--publish] [--allow-duplicate-pr]
   agent-workflow enqueue-local "<article-key-or-url>" --domain "Natural Healing"
   agent-workflow enqueue-local-backlog --domain "Natural Healing" [--min-score N] [--limit N]
   agent-workflow local-worker [--max-jobs N] [--publish]
