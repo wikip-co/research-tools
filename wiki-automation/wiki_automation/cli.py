@@ -1889,6 +1889,7 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
         allow_critic_rejection=args.allow_critic_rejection,
         override_reason=args.override_reason,
         domain=args.domain,
+        abstract_mode=args.abstract_mode,
         progress=progress,
     )
     candidates = result.get("candidates") or []
@@ -1907,6 +1908,7 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
         "plan_validation": result.get("plan_validation"),
         "rendered_validation": result.get("rendered_validation"),
         "critic": result.get("critic"),
+        "balance_repair": result.get("balance_repair"),
         "critic_mode": result.get("critic_mode"),
         "claim_policy": result.get("claim_policy"),
         "domain": result.get("domain"),
@@ -2661,6 +2663,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--override-reason",
         default="",
         help="Human audit reason recorded with a critic-rejection override request.",
+    )
+    local_publish_parser.add_argument(
+        "--abstract-mode",
+        choices=["full", "truncated", "omit"],
+        default="full",
+        help="How much of the source abstract the published footnote carries; the full abstract always stays in the packet and report.",
     )
     local_publish_parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Packet, report, and patch directory.")
     local_publish_parser.add_argument(

@@ -59,6 +59,13 @@ The publisher:
    published PRs show these separately under **Rejected critic observations
    (non-blocking)** with their validation errors, so reviewers can inspect them
    without mistaking them for authoritative findings;
+   only `blocking` findings and invalid critic responses stop a publication:
+   validated `review`-severity findings still drive draft repair attempts, but
+   once attempts are exhausted the best deterministic-valid draft publishes with
+   those findings listed in the draft PR's critic audit
+   (`critic_publication_note: published_with_review_findings`), because the
+   draft-PR reviewer — PRs are never auto-merged — is the intended judge of
+   review-severity placement questions;
 9. retains every repair attempt, complete critic feedback, and the best
    deterministic-valid attempt rather than replacing useful history with a
    later invalid repair;
@@ -70,22 +77,64 @@ The publisher:
     passes.
 
 A single paper may have several target proposals, but each claim belongs to one
-target and every target is validated and criticized independently. Broad study
-vocabulary (for example `metabolic`) is not treated as entity identity. When no
-existing page is compatible, the planner may propose a safe new Markdown path
-below the required domain—for example
-`Natural Healing/Fruits/Citrus/citrus.md`. A new page requires a source-grounded
-lead, focused tags including its exact entity/title, category rationale, at
-least one direct finding, exact quotes, both critics, rendered-Markdown
-validation, and the same draft-PR gate
-as an existing-page update. If those conditions are not met, it stops at
-`needs_review`.
+target and every target is validated and criticized independently. A plan may
+propose multiple sections of the same page — for example `## Composition` and
+`## Healing Properties` on one new entity page — as separate proposals sharing
+the target path with different headings. Broad study vocabulary (for example
+`metabolic`) is not treated as entity identity.
+
+**New-article creation, precisely.** Earlier revisions of this document stated
+that the publisher does not create new articles; that statement was wrong — the
+document had drifted behind the code, whose behavior is intended (PR #27
+legitimately created `Natural Healing/Fruits/Citrus/citrus.md`). The actual
+contract: under every claim policy, the planner may propose `create_new` with a
+safe new Markdown path below the required domain when no existing page is
+compatible, including the seeded category catch-all. No extra flag is required
+— creation rides the ordinary `--publish` gate. A new page requires a
+definition-form lead (`lead_kind: definition` for uncited general-knowledge
+definitions, or `source_grounded` when the source itself contains one — a
+topic-relevance framing sentence is rejected as `lead_not_definition_form`),
+focused tags including its exact entity/title, category rationale, at least one
+direct finding, exact quotes, both critics, rendered-Markdown validation, and
+the same draft-PR gate as an existing-page update. The run returns
+`needs_review` with a human-only `new_article_recommendation` instead of
+creating anything when the plan is not deterministically valid, when the critic
+raises a blocking finding or rejects every proposed target's entity placement,
+or when a validated balance finding cannot be repaired.
+
+The planner is steered toward concrete evidence: when the packet's Results
+sections contain quantitative sentences, they are surfaced verbatim in the
+prompt (`QUANTITATIVE_RESULTS_CANDIDATES`) and a plan whose supplied-paper
+bullets are all qualitative records the warning `missing_quantitative_outcome`;
+when the source quantifies constituent compounds, a missing `## Composition`
+proposal records `missing_composition_section`. Composition bullets use the
+`composition` evidence scope, which is exempt from the animal-scope rule
+because measurements are not outcome claims.
 
 Wrong-entity and mere-mention placements remain gating failures. The exact
 passage for every target must assert that target's primary title/path entity;
 tag overlap is not sufficient for a target discovered only from full text. In
 particular, a clementine/pink-grapefruit or generic citrus blend cannot be filed
 under Bergamot.
+
+The seeded category catch-all page is the deliberate exception: it exists to
+host findings about blends, concentrates, extracts, juices, and other products
+derived from its category, provided each bullet keeps its formulation or
+processing scope explicit in near-verbatim text. The placement critic receives
+the seed and is told the derived-product-versus-whole-category distinction is
+at most a `warning` there, and a deterministic backstop demotes an
+`entity_not_supported` objection on the seeded catch-all to `warning` whenever
+the objection's own exact quote contains the target entity (recorded as
+`severity_demoted_from_*_seeded_catch_all_scope`). Objections whose quote does
+not involve the target category at all keep their severity. This resolves the
+earlier planner/critic contradiction where the planner was required to create
+`Natural Healing/Fruits/Citrus/citrus.md` for a citrus-concentrate study and
+the critic then blocked every concentrate-scoped bullet on that same page.
+
+A retry that abandons an earlier deterministically valid plan by returning
+`needs_review` is treated as capitulation while attempts remain: the planner is
+re-prompted (`planner_abandoned_valid_plan`) to keep unobjected targets and
+rescope, retarget, or exclude only the claims a critic objected to.
 
 `rat`, `rats`, `mouse`, and `mice` are explicit preclinical cues, alongside
 animal/preclinical/in-vivo labels. Direct preclinical findings require `animal`
@@ -94,14 +143,35 @@ integrated renderer inserts and validates an evidence warning. Near-verbatim val
 compares normalized word-token sequences with automatic junk suppression
 disabled, making the threshold stable for long or repetitive source text.
 
-### Integrated claim policy and prompt context
+### Claim policies
 
-The default `integrated` policy combines direct findings from the supplied
-paper with useful background facts from claim-bearing full-text sections such
-as the Introduction and Discussion. There is no separate compendium workflow.
-The legacy stored value `compendium` is interpreted as integrated behavior for
-old jobs, while `--claim-policy strict` remains available only for focused
-direct-finding diagnostics.
+Accepted claim policies: `integrated`, `strict`, `compendium`.
+
+That line is the canonical enum. The CLI exposes `--claim-policy integrated`
+(default) and `--claim-policy strict`; `compendium` is a legacy stored alias
+that old queue jobs may still carry, and a unit test
+(`test_documented_claim_policies_match_code_enum`) fails CI whenever this
+documented set diverges from the code's `CLAIM_POLICIES` enum.
+
+How the three differ:
+
+- **`integrated`** (default, production): extracts direct `source_finding`
+  claims from the supplied paper *and* passage-grounded `background_fact`
+  claims from claim-bearing full-text sections (Introduction, Discussion),
+  each with full cited-reference provenance. All deterministic gates apply —
+  packet/citation metadata, duplicate, entity assertion, exact-quote,
+  near-verbatim, preclinical scope (`source_finding` from a preclinical paper
+  must be `animal` or `composition` scope), section provenance, rendered
+  Markdown — plus both critics.
+- **`strict`**: direct findings only; background facts are rejected
+  (`background_claim_not_allowed`), Introduction-sourced findings are
+  misclassifications, and every preclinical claim must be `animal`-scoped
+  (composition measurements excepted). Same gates otherwise; retained for
+  focused diagnostics.
+- **`compendium`** (legacy alias): interpreted exactly as `integrated`; it is
+  accepted so historical queue jobs and stored reports remain replayable,
+  and it selects the same extraction and gate behavior. New jobs should not
+  use it.
 
 Every integrated bullet records:
 
@@ -116,10 +186,81 @@ Missing or invented passage/reference provenance is a deterministic rejection.
 Global exclusions must describe material genuinely omitted from every target;
 reasons saying a passage was already captured, integrated, or not excluded are
 also rejected as contradictory.
-Published background bullets receive their own footnote containing the supplied
-paper metadata, exact source passage, section, and earlier cited reference, so
-the secondary provenance is not mistaken for a direct finding. Direct findings
-remain labeled with the supplied paper's actual study type.
+### Evidence-tier structure under Healing Properties
+
+For Healing Properties targets (and any plan with animal-scope or
+subsection-tagged bullets) the renderer groups claims by evidence tier
+instead of emitting one flat list:
+
+- Animal-scope findings render under `### Preclinical Evidence (Animal
+  Studies)` — this rendered subsection also satisfies the strict-policy
+  preclinical heading requirement, so the plan-level heading gap is now the
+  warning `preclinical_heading_scope_warning`, never a gate failure. The
+  animal/preclinical evidence blockquote is scoped inside that subsection
+  only.
+- Background facts render under property-named `###` subsections taken from
+  each bullet's new `subsection` field (fallback `Supporting Background`),
+  without the animal warning unless their own evidence scope is animal.
+- When animal findings concern a specific formulation (bullet text mentions a
+  concentrate/formulation/extract/blend), the plan must supply
+  `formulation_definition` — one near-verbatim line with an exact
+  `source_quote` — and the subsection opens with it, before the warning and
+  bullets, so product-specific findings cannot be read as generic entity
+  claims (`formulation_definition_missing` otherwise).
+- Animal bullets whose near-verbatim text lacks a species/model cue get the
+  packet's single standardized scope prefix (for example `In fructose-fed
+  rats, `, derived by `packet_animal_model`). The near-verbatim gate excludes
+  exactly that whitelisted comma-terminated prefix from token comparison; the
+  0.68 threshold is unchanged and applies fully to any other lead-in.
+- Methods/process statements (how a formulation was produced or assessed) are
+  rejected as effect bullets (`methods_statement_not_effect_claim`); their
+  essential content belongs in `formulation_definition`.
+- Multi-sentence bullet texts are split into one-idea bullets sharing the same
+  footnote, each with its own provenance comment.
+
+The rendered-Markdown gate enforces the structure independently:
+`bullet_outside_property_subsection`, `animal_subsection_missing_warning`,
+`animal_warning_misapplied_to_background`, `animal_bullet_missing_species_scope`,
+`bullet_not_single_idea`, and `formulation_definition_missing_or_misplaced`.
+
+### Citation rendering: one footnote per source, provenance in comments
+
+The renderer emits exactly one bibliographic footnote per unique source, keyed
+by DOI with a normalized-URL fallback. Every bullet citing that source —
+direct finding or background fact — reuses the same `[^n]` marker, and a
+repeated application against a page that already carries the source's footnote
+reuses the existing number instead of emitting a second block. The
+rendered-Markdown gate rejects `duplicate_source_footnote` if the same DOI ever
+appears in two footnote blocks.
+
+Per-claim provenance no longer lives in the footnote. Each bullet is followed
+by an adjacent, two-space-indented HTML comment carrying `claim_kind`, the
+`source_section`, the exact `source_quote`, and any `cited_references` —
+invisible on the rendered site but reviewable in the PR diff. Supplied-paper
+findings carry the same provenance fields as background facts. Within
+`cited_references`, source-internal fragment anchors (for example
+`[Aruoma et al., 2012](#bb0010)`) are collapsed to plain text; when the
+reference record carries a resolvable URL or an embedded DOI, the entry links
+`https://doi.org/…` instead. The gate independently rejects any rendered link
+whose target starts with `#` and matches no in-page anchor
+(`dead_anchor_link_*`).
+
+Footnote hygiene rules:
+
+- The **Title** strips publisher suffixes such as ` - ScienceDirect` (Crossref
+  enrichment supplies the canonical form when it agrees) and links to the DOI.
+- **Study Type** is classified deterministically from content signals (title,
+  keywords, abstract, then publication types/MeSH) into the style guide
+  vocabulary — Meta Analysis, Review, Animal Study, Human Study, In Vitro. The
+  publisher's genre label (for example "Research Article") is only a fallback
+  when no signal matches and never overrides a successful classification.
+- **Date** is normalized to `YYYY-MM-DD`, degrading to `YYYY-MM` or `YYYY` for
+  partial source dates.
+- **Institution(s)** and **Copy** (archive links) render only when the packet
+  provides them.
+- The abstract is emitted at most once per source, controlled by
+  `--abstract-mode full|truncated|omit` (default `full`); the complete abstract
+  always remains in the packet and report artifacts.
 
 Under the integrated policy, an animal-scoped claim may use an otherwise appropriate
 existing heading. When the heading does not itself say Animal/Preclinical, the
@@ -211,7 +352,41 @@ explicit flag and audit reason:
 The override request and reason are retained for audit, but do not bypass a
 failed critic or any packet/citation metadata, duplicate, entity, exact-quote,
 near-verbatim, preclinical-placement, or rendered-Markdown gate. It is
-unavailable to `local-worker`, and no path auto-merges.
+unavailable to `local-worker`, and no path auto-merges. Every validated
+review-severity finding that publishes — via the override or the ordinary
+publish-with-findings path — is also persisted as a `<!-- critic | … -->`
+comment adjacent to the affected bullet in the generated Markdown, so the
+caveat survives once the PR merges instead of living only in the PR body.
+
+### Balance-finding repair pass
+
+A validated finding of the balance/omitted-qualifier class (currently
+`limitation_omitted`) never publishes unresolved in `required` mode. When the
+selected attempt would otherwise proceed and such a finding remains, the
+pipeline runs exactly one bounded repair:
+
+1. The finding — whose `source_quote` must be a verbatim source passage — is
+   fed back to the planner with a constrained prompt allowing only (a) one new
+   near-verbatim bullet quoting the qualifier passage, or (b) extending the
+   flagged bullet with the qualifier clause under a covering exact quote.
+2. The repaired plan re-runs full deterministic validation plus a repair-scope
+   diff check (`validate_balance_repair`) that rejects dropped, reworded, or
+   unrelated added bullets, then both critics. Because qualifier sentences
+   rarely restate the target entity, the entity-assertion and bullet-count
+   caps are waived only for the qualifier bullets themselves
+   (`*_waived_balance_qualifier` warnings); exact-passage and near-verbatim
+   gates are never waived.
+3. If the repair validates and the critics no longer report an unresolved
+   balance finding, the repaired attempt publishes and is appended to
+   `attempt_history` with `balance_repair: true`. On any failure — model error,
+   scope violation, failed gates, or a qualifier that is not verbatim in the
+   source — the pre-repair best attempt is retained and the run downgrades to
+   `needs_review` with reason `balance_finding_unresolved`.
+
+The repair pass is available to the passive `local-worker` (it adds one model
+round trip, no new permissions); the critic-rejection override remains
+forbidden there. `advisory` and `off` modes are unchanged. The outcome is
+recorded under `balance_repair` in the report.
 
 ## Database Queue
 
