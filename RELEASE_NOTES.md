@@ -11,6 +11,17 @@ Read this before changing production paths, dotenv behavior, backups, or FlareSo
 
 ---
 
+## Property-grouped output and optional agent backends (2026-08-19)
+
+- `## Healing Properties` now supports a cited source thesis before its
+  subsections and groups every bullet by the healing property it addresses;
+- individual animal claims retain their species/model scope, replacing the
+  generic Preclinical Evidence heading and warning blockquote;
+- the one-pass extractor can retain up to sixteen useful direct and background
+  claims per section; and
+- local llama.cpp remains the default, while `--backend codex`, `claude`, or
+  `grok` uses the corresponding authenticated CLI without write authority.
+
 ## Single-pass publisher redesign (2026-08-18)
 
 `local-publish` and `local-worker` now default to `--pipeline simple`:

@@ -4,7 +4,7 @@ Standalone runtime for the `content` repo's agent tooling.
 
 This repository separates the operational tooling from the markdown content repository so you can run agents on a stable machine instead of a laptop. It packages the current tools into one image and expects the content repo to be mounted at runtime.
 
-**Operators / Hermes handoff:** see [`RELEASE_NOTES.md`](./RELEASE_NOTES.md) for current host layout and [`docs/local-research-publisher.md`](docs/local-research-publisher.md) for the production local-model path. The canonical cross-repository administration guide is [`../docs/research-production-operations.md`](../docs/research-production-operations.md).
+**Operators / Hermes handoff:** see [`RELEASE_NOTES.md`](./RELEASE_NOTES.md) for current host layout and [`docs/local-research-publisher.md`](docs/local-research-publisher.md) for the production publisher path. The canonical cross-repository administration guide is [`../docs/research-production-operations.md`](../docs/research-production-operations.md).
 
 ## Included Tools
 
@@ -13,7 +13,7 @@ This repository separates the operational tooling from the markdown content repo
 - `wiki-automation`: build queues, search content, and prepare scrape packets
 - `image-upload`: upload article images to Cloudinary, including browser-captured screenshots
 - `web-scraper`: scrape source URLs into structured packets, with optional FlareSolverr (Cloudflare) and `agent-browser` fallbacks
-- local llama.cpp publisher: guarded ad-hoc URL processing plus a durable SQLite queue, one bounded extraction/placement pass, deterministic gates, isolated worktrees, and optional draft PRs
+- research publisher: guarded ad-hoc URL processing plus a durable SQLite queue, one bounded extraction/placement pass (local llama.cpp by default, optional Codex/Claude/Grok CLI), deterministic gates, isolated worktrees, and optional draft PRs
 
 ## Runtime Model
 
@@ -69,7 +69,7 @@ Important runtime environment variables:
 - `VAULT_GOOGLE_SECRET_PATH=secret/data/Google/oauth/credentials`
 - `VAULT_CLOUDINARY_SECRET_PATH=secret/data/cloudinary`
 - `LOCAL_LLM_BASE_URL=http://127.0.0.1:8080/v1`
-- `LOCAL_LLM_MODEL=qwen3.6-35b-a3b-q8_0-mtp`
+- `LOCAL_LLM_MODEL=qwen3.8-27b-q8_0-mtp`
 
 Vault bootstrap variables:
 
@@ -158,7 +158,7 @@ source auth-bootstrap                     # Load Google credentials
 ./agent-workflow open-pr --fill
 ./agent-workflow publish-pr --draft
 
-# Production local-model path (dry run is the default)
+# Production publisher path (local llama.cpp default; dry run default)
 ./agent-workflow local-publish "<url-or-pdf>" --domain "Natural Healing"
 ./agent-workflow enqueue-local-backlog --domain "Natural Healing" --status selected --min-score 12 --limit 10
 ./agent-workflow local-worker --max-jobs 1
@@ -316,7 +316,7 @@ The web-scraper now automatically detects study types (Review, Meta-Analysis, RC
 - Selected rows can launch background Codex jobs that update `content` and submit draft PRs
 - Web job state is stored in `article_jobs` and `article_job_items`
 
-### Local llama.cpp Publisher
+### Single-pass Research Publisher
 
 - `agent-workflow local-publish URL --domain "Natural Healing"` runs an ad-hoc dry-run through packet,
   retrieval, one bounded extraction-and-placement pass, deterministic validation,
@@ -328,6 +328,14 @@ The web-scraper now automatically detects study types (Review, Meta-Analysis, RC
   background healing uses stated in the paper. All rendered claims reuse one
   bibliographic footnote for the main scraped article; earlier works cited by
   the paper are not followed or linked.
+- `## Healing Properties` may begin with the article's cited thesis, and every
+  bullet is grouped under a property-specific `###` heading. Animal claims keep
+  their species/model cue; no generic preclinical-warning blockquote is added.
+- llama.cpp is the default. `--backend codex|claude|grok [--model MODEL_ID]`
+  selects an installed, authenticated frontier-agent CLI for the same one JSON
+  planning pass. Those CLIs have no write authority (Claude/Grok tools are
+  disabled; Codex uses a read-only sandbox); the publisher alone renders,
+  validates, commits, pushes, and opens the PR.
 - Every invocation has an immutable `out/runs/<run-id>/` source, packet, report,
   and optional patch with repository, model-call, timing, and publication
   outcome telemetry.

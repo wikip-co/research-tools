@@ -10,7 +10,7 @@ Environment=PATH=/home/anthony/.local/bin:/home/anthony/n/bin:/usr/local/bin:/us
 Environment=GMAIL_READER_DB=/home/anthony/Research/research-tools/gmail-reader/data/scholar-alerts.db
 Environment=CONTENT_REPO_ROOT=/home/anthony/Research/content
 Environment=LOCAL_LLM_BASE_URL=http://127.0.0.1:8080/v1
-Environment=LOCAL_LLM_MODEL=qwen3.6-35b-a3b-q8_0-mtp
+Environment=LOCAL_LLM_MODEL=qwen3.8-27b-q8_0-mtp
 ExecStart=/home/anthony/Research/research-tools/agent-workflow enqueue-local-backlog --domain "Natural Healing" --min-score 12 --limit 1
 ExecStart=/home/anthony/Research/research-tools/agent-workflow local-worker --max-jobs 1 --publish
 TimeoutStartSec=45min

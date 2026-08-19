@@ -55,6 +55,7 @@ ALLOWED_EVIDENCE_SCOPES = {
 DOI_PATTERN = re.compile(r"^10\.\d{4,9}/[-._;()/:a-z0-9]+$", re.IGNORECASE)
 CRITIC_MODES = {"required", "advisory", "off"}
 PIPELINE_MODES = {"simple", "legacy"}
+COMPLETION_BACKENDS = {"local", "codex", "claude", "grok"}
 CLAIM_POLICIES = {"integrated", "strict", "compendium"}
 ABSTRACT_MODES = {"full", "truncated", "omit"}
 CLAIM_KINDS = {"source_finding", "background_fact"}
@@ -503,11 +504,11 @@ def simple_prompt_source_packet(packet: dict[str, Any]) -> dict[str, Any]:
     )
     group_budgets = {
         "abstract": 7_000,
-        "results": 28_000,
+        "results": 25_000,
         "traditional": 5_000,
         "introduction": 10_000,
         "conclusion": 3_000,
-        "discussion": 2_000,
+        "discussion": 5_000,
     }
     sections: list[dict[str, str]] = []
     used = 0
@@ -653,28 +654,6 @@ def target_entity_matches_candidate(
     )
 
 
-def proposal_has_animal_claim(proposal: dict[str, Any], packet: dict[str, Any], claim_policy: str) -> bool:
-    bullets = proposal.get("bullets") if isinstance(proposal.get("bullets"), list) else []
-    if includes_background_claims(claim_policy):
-        return any(
-            isinstance(item, dict) and item.get("evidence_scope") == "animal"
-            for item in bullets
-        )
-    return source_is_preclinical(packet)
-
-
-def has_preclinical_heading_scope(proposal: dict[str, Any]) -> bool:
-    placement = normalize_evidence(
-        f"{proposal.get('parent_heading') or ''} {proposal.get('heading') or ''}"
-    )
-    return bool(
-        re.search(
-            r"\b(?:animal evidence|animal model|animal models|preclinical evidence|preclinical context)\b",
-            placement,
-        )
-    )
-
-
 def word_token_similarity(left: str, right: str) -> float:
     """Predictable near-verbatim similarity over normalized word tokens."""
     return SequenceMatcher(
@@ -685,11 +664,6 @@ def word_token_similarity(left: str, right: str) -> float:
     ).ratio()
 
 
-ANIMAL_SUBSECTION_TITLE = "Preclinical Evidence (Animal Studies)"
-ANIMAL_EVIDENCE_WARNING = (
-    "> **Evidence warning — animal/preclinical evidence:** These findings do not "
-    "by themselves establish effects in humans."
-)
 SPECIES_CUE_PATTERN = (
     r"\b(?:rats?|mice|mouse|murine|rodents?|rabbits?|piglets?|zebrafish|in vivo|animals?)\b"
 )
@@ -815,6 +789,49 @@ def results_quantitative_sentences(packet: dict[str, Any], limit: int = 12) -> l
     return sentences
 
 
+def section_summary_candidates(
+    packet: dict[str, Any], limit: int = 4
+) -> list[dict[str, str]]:
+    """Exact objective/thesis sentences suitable above property subsections."""
+
+    candidates: list[dict[str, str]] = []
+    sections, _references = source_prompt_sections(
+        str(packet.get("body_markdown") or "")
+    )
+    for section in sections:
+        heading = str(section.get("heading") or "")
+        if not re.search(
+            r"\b(?:introduction|background|objective|aim)\b",
+            normalize_evidence(heading),
+        ):
+            continue
+        text = re.sub(r"^#{1,6}[^\n]*\n+", "", str(section.get("text") or ""))
+        for sentence in re.split(r"(?<=[.!?])\s+(?=[A-Z])", text):
+            sentence = sentence.strip()
+            normalized = normalize_evidence(sentence)
+            if not 100 <= len(sentence) <= 650:
+                continue
+            if not re.search(r"\b(?:objective|aim|hypothes\w*)\b", normalized):
+                continue
+            if not re.search(
+                r"\b(?:effect|improv\w*|attenuat\w*|investigat\w*|evaluat\w*|assess\w*)\b",
+                normalized,
+            ):
+                continue
+            if not exact_source_passage(packet, sentence):
+                continue
+            candidates.append(
+                {
+                    "text": section_summary_text_from_quote(sentence),
+                    "source_quote": sentence,
+                    "source_section": heading,
+                }
+            )
+            if len(candidates) >= limit:
+                return candidates
+    return candidates
+
+
 def packet_has_composition_data(packet: dict[str, Any]) -> bool:
     """True when the source quantifies constituent compounds (Table 1-style data)."""
     body = str(packet.get("body_markdown") or "").replace("\u202f", " ")
@@ -856,8 +873,6 @@ def truncate_at_word(text: str, limit: int) -> str:
 
 
 def bullet_subsection_title(item: dict[str, Any]) -> str:
-    if bullet_is_animal_scope(item):
-        return ANIMAL_SUBSECTION_TITLE
     custom = " ".join(str(item.get("subsection") or "").split()).lstrip("#").strip()
     if custom:
         return custom
@@ -869,7 +884,7 @@ def bullet_subsection_title(item: dict[str, Any]) -> str:
 
 
 def grouped_rendering_enabled(plan: dict[str, Any]) -> bool:
-    """Evidence-tier grouping applies to Healing Properties and scoped/animal plans."""
+    """Property grouping applies to Healing Properties and explicitly scoped plans."""
     if normalize_evidence(str(plan.get("heading") or "")).endswith("healing properties"):
         return True
     bullets = plan.get("bullets") if isinstance(plan.get("bullets"), list) else []
@@ -1211,6 +1226,194 @@ class LocalLLMClient:
             self.calls.append(call)
 
 
+class AgentCLIClient:
+    """Run the one-pass JSON planner through an installed frontier-agent CLI.
+
+    The agents receive the same bounded prompt as llama.cpp.  They run in a
+    write-restricted mode and return only their final text, so the publisher
+    remains the sole component allowed to render, commit, push, or open a PR.
+    Claude and Grok have tools disabled explicitly; Codex uses its read-only
+    sandbox because its built-in execution tools cannot be removed by a flag.
+    """
+
+    def __init__(
+        self,
+        backend: str,
+        model: str,
+        workspace: Path,
+        timeout_seconds: int = 900,
+    ):
+        if backend not in COMPLETION_BACKENDS - {"local"}:
+            raise ValueError(f"Unsupported agent backend: {backend}")
+        self.backend = backend
+        self.model = model
+        self.workspace = workspace
+        self.timeout_seconds = timeout_seconds
+        self.calls: list[dict[str, Any]] = []
+
+    def _binary(self) -> str:
+        environment_name = f"{self.backend.upper()}_BIN"
+        configured = os.environ.get(environment_name, "").strip()
+        discovered = shutil.which(self.backend)
+        binary = configured or discovered
+        if not binary:
+            raise FileNotFoundError(
+                f"{self.backend} CLI was not found; install it or set {environment_name}"
+            )
+        return binary
+
+    def _command(self, binary: str, prompt_path: str = "") -> list[str]:
+        if self.backend == "codex":
+            command = [
+                binary,
+                "exec",
+                "--ephemeral",
+                "--sandbox",
+                "read-only",
+                "--skip-git-repo-check",
+                "--color",
+                "never",
+                "--cd",
+                str(self.workspace),
+            ]
+            if self.model:
+                command.extend(["--model", self.model])
+            return [*command, "-"]
+        if self.backend == "claude":
+            command = [
+                binary,
+                "--print",
+                "--output-format",
+                "text",
+                "--tools",
+                "",
+                "--permission-mode",
+                "dontAsk",
+                "--no-session-persistence",
+            ]
+            if self.model:
+                command.extend(["--model", self.model])
+            return command
+        command = [
+            binary,
+            "--prompt-file",
+            prompt_path,
+            "--output-format",
+            "plain",
+            "--tools",
+            "",
+            "--disable-web-search",
+            "--no-subagents",
+            "--permission-mode",
+            "dontAsk",
+            "--verbatim",
+            "--cwd",
+            str(self.workspace),
+        ]
+        if self.model:
+            command.extend(["--model", self.model])
+        return command
+
+    def close(self) -> None:
+        return
+
+    def json_completion(
+        self,
+        *,
+        system: str,
+        user: str,
+        max_tokens: int = 5000,
+    ) -> dict[str, Any]:
+        started_at = datetime.now(timezone.utc)
+        started_monotonic = time.monotonic()
+        prompt = (
+            f"{system}\n\n{user}\n\n"
+            "FINAL RESPONSE REQUIREMENT: Return only the requested JSON object."
+        )
+        call: dict[str, Any] = {
+            "call": len(self.calls) + 1,
+            "started_at": started_at.isoformat(),
+            "backend": self.backend,
+            "model": self.model or "cli-default",
+            "system_chars": len(system),
+            "user_chars": len(user),
+            "max_tokens": max_tokens,
+        }
+        temporary_prompt: tempfile.NamedTemporaryFile[str] | None = None
+        try:
+            binary = self._binary()
+            prompt_path = ""
+            if self.backend == "grok":
+                temporary_prompt = tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    prefix="research-publisher-",
+                    suffix=".txt",
+                )
+                temporary_prompt.write(prompt)
+                temporary_prompt.flush()
+                prompt_path = temporary_prompt.name
+            command = self._command(binary, prompt_path)
+            call["command"] = [
+                "<prompt-file>" if argument == prompt_path and prompt_path else argument
+                for argument in command
+            ]
+            result = subprocess.run(
+                command,
+                cwd=self.workspace,
+                input=None if self.backend == "grok" else prompt,
+                text=True,
+                capture_output=True,
+                timeout=self.timeout_seconds,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip()
+                raise RuntimeError(
+                    f"{self.backend} agent exited {result.returncode}: {detail[:2000]}"
+                )
+            content = result.stdout.strip()
+            if not content:
+                raise RuntimeError(f"{self.backend} agent returned no final output")
+            try:
+                response = extract_json_object(content)
+            except ValueError as exc:
+                call.update(
+                    {
+                        "response_chars": len(content),
+                        "response_sha256": hashlib.sha256(
+                            content.encode("utf-8")
+                        ).hexdigest(),
+                        "response_text": content,
+                    }
+                )
+                raise ModelOutputJSONError(str(exc), content) from exc
+            call.update(
+                {
+                    "status": "ok",
+                    "response_chars": len(content),
+                    "stderr_chars": len(result.stderr),
+                    "usage": {},
+                    "finish_reason": "process_exit_0",
+                }
+            )
+            return response
+        except Exception as exc:
+            call.update({"status": "error", "error": str(exc)[:2000]})
+            raise
+        finally:
+            if temporary_prompt is not None:
+                temporary_prompt.close()
+            call.update(
+                {
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "duration_seconds": round(
+                        time.monotonic() - started_monotonic, 3
+                    ),
+                }
+            )
+            self.calls.append(call)
+
+
 def validate_draft_plan(
     plan: dict[str, Any],
     *,
@@ -1377,12 +1580,6 @@ def validate_draft_plan(
         if not isinstance(bullets, list) or not 1 <= len(bullets) <= 8:
             issues.append(f"{target_prefix}_invalid_bullet_count")
             continue
-        # The renderer now groups every animal-scope claim under a
-        # "### Preclinical Evidence (Animal Studies)" subsection, which
-        # satisfies the strict-policy heading requirement deterministically;
-        # the warning records that the plan itself did not scope its heading.
-        if proposal_has_animal_claim(proposal, packet, claim_policy) and not has_preclinical_heading_scope(proposal):
-            warnings.append(f"{target_prefix}_preclinical_heading_scope_warning")
         definition = proposal.get("formulation_definition")
         if definition is not None and not isinstance(definition, dict):
             issues.append(f"{target_prefix}_invalid_formulation_definition")
@@ -1691,8 +1888,34 @@ def validate_simple_draft_plan(
                 ):
                     issues.append(f"{prefix}_lead_not_source_grounded")
 
+        summary = proposal.get("section_summary")
+        if summary is not None and not isinstance(summary, dict):
+            issues.append(f"{prefix}_invalid_section_summary")
+        elif isinstance(summary, dict):
+            summary_text = str(summary.get("text") or "").strip()
+            summary_quote = str(summary.get("source_quote") or "").strip()
+            summary_section = str(summary.get("source_section") or "").strip()
+            if not summary_text or "\n" in summary_text or "[^" in summary_text:
+                issues.append(f"{prefix}_invalid_section_summary_text")
+            if (
+                len(normalize_evidence(summary_quote)) < 35
+                or not exact_source_passage(packet, summary_quote)
+            ):
+                issues.append(f"{prefix}_section_summary_quote_not_in_source")
+            elif word_token_similarity(summary_text, summary_quote) < 0.68:
+                issues.append(f"{prefix}_section_summary_not_near_verbatim")
+            if not source_section_present(packet, summary_section):
+                issues.append(f"{prefix}_section_summary_section_not_found")
+            if target_entity and (
+                not phrase_in_text(target_entity, summary_quote)
+                or not phrase_in_text(target_entity, summary_text)
+            ):
+                issues.append(f"{prefix}_section_summary_entity_not_supported")
+            if source_is_preclinical(packet) and not bullet_has_species_cue(summary_text):
+                issues.append(f"{prefix}_section_summary_missing_species_scope")
+
         bullets = proposal.get("bullets")
-        if not isinstance(bullets, list) or not 1 <= len(bullets) <= 10:
+        if not isinstance(bullets, list) or not 1 <= len(bullets) <= 16:
             issues.append(f"{prefix}_invalid_bullet_count")
             continue
         source_findings = 0
@@ -1706,6 +1929,7 @@ def validate_simple_draft_plan(
             section = str(item.get("source_section") or "").strip()
             claim_kind = str(item.get("claim_kind") or "")
             scope = str(item.get("evidence_scope") or "")
+            subsection = " ".join(str(item.get("subsection") or "").split())
             if not text or text.startswith("-") or "[^" in text:
                 issues.append(f"{bullet_prefix}_invalid_text")
             if len(normalize_evidence(quote)) < 35 or not exact_source_passage(packet, quote):
@@ -1716,6 +1940,12 @@ def validate_simple_draft_plan(
                 issues.append(f"{bullet_prefix}_invalid_claim_kind")
             if scope not in ALLOWED_EVIDENCE_SCOPES:
                 issues.append(f"{bullet_prefix}_invalid_evidence_scope")
+            if normalize_evidence(heading).endswith("healing properties") and (
+                generic_evidence_subsection(subsection)
+                or len(subsection) > 80
+                or subsection.startswith("#")
+            ):
+                issues.append(f"{bullet_prefix}_missing_property_subsection")
             if not source_section_present(packet, section):
                 issues.append(f"{bullet_prefix}_source_section_not_found")
             if any(
@@ -1768,9 +1998,161 @@ def simple_bullet_text_from_quote(quote: str) -> str:
         text = text.replace(marker, "")
     text = re.sub(r"\[([^\]\n]+)\]\(#[^)]+\)", r"\1", text)
     text = re.sub(r"\[\^\d+\]", "", text)
-    text = re.sub(r"\(\s*\)", "", text)
+    text = re.sub(r"\(\s*(?:[;,]\s*)*\)", "", text)
     text = re.sub(r"\s+([,.;:!?])", r"\1", text)
     return re.sub(r"\s+", " ", text).strip().lstrip("- ")
+
+
+def section_summary_text_from_quote(quote: str) -> str:
+    """Turn an exact objective sentence into a concise near-verbatim thesis."""
+
+    text = simple_bullet_text_from_quote(quote)
+    text = re.sub(
+        r"^(?:The\s+)?(?:objective|aim)\s+(?:of\s+(?:this|the)\s+study\s+)?"
+        r"was\s+to\s+(?:investigate|evaluate|assess|determine)\s+whether\s+",
+        "",
+        text,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if text:
+        text = text[0].upper() + text[1:]
+    return text
+
+
+def infer_property_subsection(item: dict[str, Any]) -> str:
+    """Assign a conservative property heading when the model omitted one."""
+
+    text = normalize_evidence(
+        f"{item.get('text') or ''} {item.get('source_quote') or ''}"
+    )
+    mappings = (
+        ("Blood Pressure", r"\bblood pressure\b|\bhypertension\b"),
+        ("Lipid Metabolism", r"\blipid\b|\btriglyceride\b|\bcholesterol\b|\bldl\b|\bhdl\b"),
+        ("Vitamin A Status", r"\bvitamin a\b|\bretinoid\b|\bretinol\b"),
+        ("Nutrient Composition", r"\bnutri\w*\b|\bvitamin\w*\b|\bmineral\w*\b|\bfibers?\b|\bphytochemical\w*\b"),
+        ("Carotenoid Content", r"\bcarotenoid\w*\b|\blycopene\b|\bcryptoxanthin\b|\bcarotene\w*\b"),
+        ("Glycemic Control", r"\bglucose\b|\bglyc\w*\b|\binsulin\w*\b|\bdiabet\w*\b|\bhoma ir\b"),
+        ("Antioxidant and Anti-inflammatory Activity", r"\bantioxidant\b|\banti inflammatory\b|\bcardioprotective\b"),
+        ("Traditional Uses", r"\btraditional\b|\bethnobotan\w*\b|\bfolk\b|\bhistorical\b"),
+    )
+    for title, pattern in mappings:
+        if re.search(pattern, text):
+            return title
+    return (
+        "Metabolic Health"
+        if item.get("claim_kind") == "source_finding"
+        else "Other Reported Properties"
+    )
+
+
+def generic_evidence_subsection(value: str) -> bool:
+    """Return whether a heading describes evidence tier rather than a property."""
+
+    normalized = normalize_evidence(value)
+    return not normalized or normalized in {
+        "animal evidence",
+        "animal models",
+        "preclinical evidence",
+        "preclinical evidence animal studies",
+        "research findings",
+        "supporting background",
+    }
+
+
+def core_result_candidates(
+    packet: dict[str, Any], preferred_entity: str = "", limit: int = 10
+) -> list[dict[str, str]]:
+    """Expose distinct high-signal abstract outcomes to the one-pass planner."""
+
+    abstract = str(packet.get("abstract") or "").strip()
+    scope = "animal" if source_is_preclinical(packet) else "review_summary"
+    candidates: list[dict[str, str]] = []
+    for sentence in re.split(r"(?<=[.!?])\s+(?=[A-Z])", abstract):
+        sentence = sentence.strip()
+        normalized = normalize_evidence(sentence)
+        if not 55 <= len(sentence) <= 700 or not exact_source_passage(packet, sentence):
+            continue
+        if preferred_entity and not phrase_in_text(preferred_entity, sentence):
+            continue
+        if is_methods_statement(sentence) or not re.search(
+            r"\b(?:improv\w*|enhanc\w*|attenuat\w*|decreas\w*|increas\w*|"
+            r"efficacy|beneficial|potential|support\w*|associated|accumulat\w*)\b",
+            normalized,
+        ):
+            continue
+        item = {
+            "text": simple_bullet_text_from_quote(sentence),
+            "source_quote": sentence,
+            "source_section": "Abstract",
+            "claim_kind": "source_finding",
+            "evidence_scope": scope,
+        }
+        item["suggested_subsection"] = infer_property_subsection(item)
+        candidates.append(item)
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def background_claim_candidates(
+    packet: dict[str, Any], preferred_entity: str = "", limit: int = 8
+) -> list[dict[str, str]]:
+    """Expose source-exact healing/nutrition background without its reference graph."""
+
+    candidates: list[dict[str, str]] = []
+    sections, _references = source_prompt_sections(
+        str(packet.get("body_markdown") or "")
+    )
+    signal = re.compile(
+        r"\b(?:traditional|ethnobotan\w*|folk|historical|nutri\w*|vitamin\w*|"
+        r"mineral\w*|fibers?|phytochemical\w*|flavonoid\w*|carotenoid\w*|pectin\w*|"
+        r"glyc\w*|insulin\w*|diabet\w*|metabolic|blood pressure|hypertension|"
+        r"cholesterol|lipid\w*|antioxidant|anti inflammatory|cardioprotective)\b"
+    )
+    for section in sections:
+        heading = str(section.get("heading") or "")
+        if not re.search(
+            r"\b(?:introduction|background|traditional|ethnobotan\w*|historical)\b",
+            normalize_evidence(heading),
+        ):
+            continue
+        text = re.sub(r"^#{1,6}[^\n]*\n+", "", str(section.get("text") or ""))
+        for sentence in re.split(r"(?<=[.!?])\s+(?=[A-Z])", text):
+            sentence = sentence.strip()
+            if not 55 <= len(sentence) <= 700 or not exact_source_passage(packet, sentence):
+                continue
+            if preferred_entity and not phrase_in_text(preferred_entity, sentence):
+                continue
+            normalized = normalize_evidence(sentence)
+            if (
+                not signal.search(normalized)
+                or is_methods_statement(sentence)
+                or re.search(
+                    r"\b(?:attracted significant attention|present study|objective was|"
+                    r"study evaluated|effects .* were also compared|environmentally friendly process|"
+                    r"sensory properties|first the efficacy|second the membrane)\b",
+                    normalized,
+                )
+            ):
+                continue
+            item = {
+                "text": simple_bullet_text_from_quote(sentence),
+                "source_quote": sentence,
+                "source_section": heading,
+                "claim_kind": "background_fact",
+                "evidence_scope": (
+                    "animal" if bullet_has_species_cue(sentence) else "review_summary"
+                ),
+            }
+            subsection = infer_property_subsection(item)
+            item["suggested_subsection"] = subsection
+            if subsection in {"Nutrient Composition", "Carotenoid Content"}:
+                item["evidence_scope"] = "composition"
+            candidates.append(item)
+            if len(candidates) >= limit:
+                return candidates
+    return candidates
 
 
 def normalize_simple_draft_plan(
@@ -1785,6 +2167,50 @@ def normalize_simple_draft_plan(
 
     actions: list[dict[str, Any]] = []
     for target_index, proposal in enumerate(plan_target_proposals(plan)):
+        if normalize_evidence(str(proposal.get("heading") or "")).endswith(
+            "healing properties"
+        ):
+            summary = proposal.get("section_summary")
+            target_entity = str(proposal.get("target_entity") or "")
+            candidate = next(
+                (
+                    item
+                    for item in section_summary_candidates(packet)
+                    if phrase_in_text(target_entity, item.get("source_quote") or "")
+                ),
+                None,
+            )
+            if not isinstance(summary, dict):
+                if candidate:
+                    proposal["section_summary"] = candidate
+                    actions.append(
+                        {
+                            "target_index": target_index,
+                            "action": "added_source_section_summary",
+                        }
+                    )
+            elif isinstance(summary, dict):
+                quote = str(summary.get("source_quote") or "").strip()
+                canonical_quote = whitespace_exact_source_passage(packet, quote)
+                if not canonical_quote and candidate:
+                    proposal["section_summary"] = candidate
+                    actions.append(
+                        {
+                            "target_index": target_index,
+                            "action": "replaced_unprovable_section_summary",
+                        }
+                    )
+                elif canonical_quote:
+                    summary["source_quote"] = canonical_quote
+                    summary_text = str(summary.get("text") or "").strip()
+                    if word_token_similarity(summary_text, canonical_quote) < 0.68:
+                        summary["text"] = section_summary_text_from_quote(canonical_quote)
+                        actions.append(
+                            {
+                                "target_index": target_index,
+                                "action": "replaced_section_summary_with_source_thesis",
+                            }
+                        )
         bullets = proposal.get("bullets")
         if not isinstance(bullets, list):
             continue
@@ -1828,6 +2254,18 @@ def normalize_simple_draft_plan(
                         **location,
                         "action": "removed_external_reference_fields",
                         "fields": removed_reference_fields,
+                    }
+                )
+
+            if normalize_evidence(str(proposal.get("heading") or "")).endswith(
+                "healing properties"
+            ) and generic_evidence_subsection(str(item.get("subsection") or "")):
+                item["subsection"] = infer_property_subsection(item)
+                actions.append(
+                    {
+                        **location,
+                        "action": "added_property_subsection",
+                        "subsection": item["subsection"],
                     }
                 )
 
@@ -2164,16 +2602,6 @@ def indexed_critic_findings(
     return by_bullet, target_level
 
 
-def compendium_evidence_warning(plan: dict[str, Any], packet: dict[str, Any], claim_policy: str) -> str:
-    if (
-        includes_background_claims(claim_policy)
-        and proposal_has_animal_claim(plan, packet, claim_policy)
-        and not has_preclinical_heading_scope(plan)
-    ):
-        return ANIMAL_EVIDENCE_WARNING
-    return ""
-
-
 def apply_draft_plan(
     markdown: str,
     plan: dict[str, Any],
@@ -2204,37 +2632,28 @@ def apply_draft_plan(
                 grouped[title] = []
                 order.append(title)
             grouped[title].append(index)
-        if ANIMAL_SUBSECTION_TITLE in order:
-            order.remove(ANIMAL_SUBSECTION_TITLE)
-            order.insert(0, ANIMAL_SUBSECTION_TITLE)
-        definition = (
-            plan.get("formulation_definition")
+        block_lines: list[str] = []
+        summary = (
+            plan.get("section_summary")
+            if isinstance(plan.get("section_summary"), dict)
+            else plan.get("formulation_definition")
             if isinstance(plan.get("formulation_definition"), dict)
             else None
         )
-        block_lines: list[str] = []
+        if summary is not None:
+            block_lines.append(f"{str(summary.get('text') or '').strip()}[^{ref_num}]")
+            block_lines.append(
+                render_bullet_provenance(
+                    {
+                        "claim_kind": "section_summary",
+                        "source_section": summary.get("source_section"),
+                        "source_quote": summary.get("source_quote"),
+                    }
+                ).lstrip()
+            )
+            block_lines.append("")
         for title in order:
             block_lines.extend([f"### {title}", ""])
-            animal_group = any(
-                bullet_is_animal_scope(plan["bullets"][index]) for index in grouped[title]
-            )
-            if animal_group and definition is not None:
-                block_lines.append(
-                    f"{str(definition.get('text') or '').strip()}[^{ref_num}]"
-                )
-                block_lines.append(
-                    render_bullet_provenance(
-                        {
-                            "claim_kind": "formulation_definition",
-                            "source_section": definition.get("source_section"),
-                            "source_quote": definition.get("source_quote"),
-                        }
-                    ).lstrip()
-                )
-                block_lines.append("")
-                definition = None
-            if animal_group:
-                block_lines.extend([ANIMAL_EVIDENCE_WARNING, ""])
             for index in grouped[title]:
                 block_lines.extend(item_lines(index, plan["bullets"][index]))
             block_lines.append("")
@@ -2249,8 +2668,7 @@ def apply_draft_plan(
             bullet_lines.extend(item_lines(index, item))
         for finding in target_level:
             bullet_lines.append(render_critic_annotation(finding).lstrip())
-        warning = compendium_evidence_warning(plan, packet, claim_policy)
-        bullets = "\n".join(([warning, ""] if warning else []) + bullet_lines)
+        bullets = "\n".join(bullet_lines)
     updated = insert_under_heading(
         markdown,
         heading=str(plan["heading"]).strip(),
@@ -2347,73 +2765,43 @@ def rendered_structure_issues(
 ) -> list[str]:
     """Structural rules for evidence-tier subsections under the target heading."""
     issues: set[str] = set()
-    prefix = scope_prefix(packet)
-    current: str | None = None
-    warned: dict[str, bool] = {}
-    section_bullets: dict[str, list[str]] = {}
-    for line in section_lines:
-        stripped = line.strip()
+    first_subsection_index: int | None = None
+    for line_index, line in enumerate(section_lines):
         if line.startswith("### "):
-            current = line[4:].strip()
-            warned.setdefault(current, False)
-            section_bullets.setdefault(current, [])
+            if first_subsection_index is None:
+                first_subsection_index = line_index
         elif line.startswith("- "):
-            if current is None:
+            if first_subsection_index is None:
                 issues.add("bullet_outside_property_subsection")
-            else:
-                section_bullets[current].append(line[2:])
             text = re.sub(r"\[\^\d+\]$", "", line[2:]).strip()
             if len(split_bullet_sentences(strip_scope_prefix(text, packet))) > 1:
                 issues.add("bullet_not_single_idea")
-        elif stripped.startswith("> **Evidence warning"):
-            if current is None:
-                issues.add("animal_warning_outside_subsection")
-            else:
-                warned[current] = True
-    for title, bullets in section_bullets.items():
-        animal_named = bool(re.search(r"preclinical|animal", title, re.IGNORECASE))
-        if animal_named:
-            if not warned.get(title):
-                issues.add("animal_subsection_missing_warning")
-            for bullet in bullets:
-                if not (
-                    bullet_has_species_cue(bullet)
-                    or (prefix and bullet.lower().startswith(prefix.lower()))
-                ):
-                    issues.add("animal_bullet_missing_species_scope")
-        elif warned.get(title) and not any(
-            bullet_has_species_cue(bullet) for bullet in bullets
-        ):
-            issues.add("animal_warning_misapplied_to_background")
-    definition = (
-        plan.get("formulation_definition")
+    summary = (
+        plan.get("section_summary")
+        if isinstance(plan.get("section_summary"), dict)
+        else plan.get("formulation_definition")
         if isinstance(plan.get("formulation_definition"), dict)
         else None
     )
-    if definition is not None:
-        definition_text = str(definition.get("text") or "").strip()
-        definition_index = next(
+    if summary is not None:
+        summary_text = str(summary.get("text") or "").strip()
+        summary_index = next(
             (
                 index
                 for index, line in enumerate(section_lines)
-                if definition_text and definition_text in line and "<!--" not in line
+                if summary_text and summary_text in line and "<!--" not in line
             ),
             None,
         )
-        first_animal_bullet = None
-        current = None
-        for index, line in enumerate(section_lines):
-            if line.startswith("### "):
-                current = line[4:].strip()
-            elif line.startswith("- ") and current and re.search(
-                r"preclinical|animal", current, re.IGNORECASE
-            ):
-                first_animal_bullet = index
-                break
-        if definition_index is None or (
-            first_animal_bullet is not None and definition_index > first_animal_bullet
+        if summary_index is None or (
+            first_subsection_index is not None and summary_index > first_subsection_index
         ):
-            issues.add("formulation_definition_missing_or_misplaced")
+            issues.add("section_summary_missing_or_misplaced")
+    for item in plan.get("bullets") or []:
+        if not isinstance(item, dict) or not bullet_is_animal_scope(item):
+            continue
+        if any(not bullet_has_species_cue(text) for text in rendered_bullet_texts(item, packet)):
+            issues.add("animal_bullet_missing_species_scope")
     return sorted(issues)
 
 
@@ -2452,6 +2840,26 @@ def validate_rendered_markdown(
                 issues.append(f"bullet_{index}_citation_missing")
         if render_bullet_provenance(item) not in updated:
             issues.append(f"bullet_{index}_provenance_missing")
+    summary = (
+        plan.get("section_summary")
+        if isinstance(plan.get("section_summary"), dict)
+        else plan.get("formulation_definition")
+        if isinstance(plan.get("formulation_definition"), dict)
+        else None
+    )
+    if summary is not None:
+        summary_text = str(summary.get("text") or "").strip()
+        if f"{summary_text}[^{ref_num}]" not in updated:
+            issues.append("section_summary_citation_missing")
+        summary_provenance = render_bullet_provenance(
+            {
+                "claim_kind": "section_summary",
+                "source_section": summary.get("source_section"),
+                "source_quote": summary.get("source_quote"),
+            }
+        ).lstrip()
+        if summary_provenance not in updated:
+            issues.append("section_summary_provenance_missing")
     if grouped_rendering_enabled(plan):
         issues.extend(
             rendered_structure_issues(
@@ -2472,9 +2880,6 @@ def validate_rendered_markdown(
             issues.append("target_critic_annotation_missing")
     for anchor in dead_anchor_links(updated):
         issues.append(f"dead_anchor_link_{anchor}")
-    warning = compendium_evidence_warning(plan, packet, claim_policy)
-    if warning and warning not in updated:
-        issues.append("preclinical_evidence_warning_missing")
     added_lines = max(0, len(updated.splitlines()) - len(original.splitlines()))
     if added_lines > 160:
         issues.append("change_scope_too_large")
@@ -2675,6 +3080,11 @@ def simple_draft_prompt(
                 "parent_heading": "existing parent heading only when adding a child heading; otherwise empty",
                 "heading": "exact existing heading or new ## heading",
                 "rationale": "why these claims belong on this page",
+                "section_summary": {
+                    "text": "concise near-verbatim study thesis placed below ## Healing Properties",
+                    "source_quote": "exact objective/thesis sentence from the paper",
+                    "source_section": "exact source section heading",
+                },
                 "bullets": [
                     {
                         "text": "one near-verbatim idea without a footnote marker",
@@ -2682,7 +3092,7 @@ def simple_draft_prompt(
                         "source_section": "exact section heading",
                         "claim_kind": "source_finding | background_fact",
                         "evidence_scope": "review_summary | human | animal | in_vitro | mechanistic | composition",
-                        "subsection": "short property heading for background facts; empty for animal findings",
+                        "subsection": "required short healing-property heading for every Healing Properties bullet",
                     }
                 ],
             }
@@ -2702,15 +3112,20 @@ def simple_draft_prompt(
         }
         for candidate in candidates
     ]
+    preferred_entity = str((new_article_seed or {}).get("target_entity") or "")
     rules = """Extract and place the paper in this same pass.
 
-1. Extract the paper's core results as source_finding bullets. Also extract useful traditional, historical, or background healing uses explicitly stated in the paper as background_fact bullets. Do not follow or cite the paper's references.
+1. Extract the paper's core results as source_finding bullets. Also extract as much useful, non-duplicative traditional, historical, nutritional, or background healing information as the paper itself states as background_fact bullets. Do not follow or cite the paper's references.
 2. Every bullet must carry one exact contiguous source_quote from the supplied article and stay as close to that wording as possible. Remove publisher citation markers from bullet text when useful; never add a footnote marker because the renderer adds one citation to the main scraped article.
-3. Preserve evidence strength and limitations. Rat/mouse/animal findings use evidence_scope animal and must not imply human efficacy. Composition measurements use composition.
+3. Preserve evidence strength and limitations. Rat/mouse/animal findings use evidence_scope animal, keep the species/model explicit in each bullet, and must not imply human efficacy. Do not request or emit a generic evidence-warning blockquote. Composition measurements use composition.
 4. Map each claim only to a page whose primary entity appears in both the claim text and exact quote. Prefer one focused target. Use an existing candidate when it is genuinely compatible; otherwise create the seeded entity page or another safe page under DOMAIN.
 5. For a new page, provide a neutral definition lead saying what the entity is, focused tags, and an existing category rationale. Do not put a health claim in an uncited definition lead.
-6. Prefer concrete Results outcomes, including quantitative findings when available. Keep the update concise: at most four target sections and ten bullets per section.
-7. Return needs_review only when source identity, evidence, taxonomy, or placement truly cannot be resolved from this packet. Return only the JSON object; there will be no repair or critic pass."""
+6. Under ## Healing Properties, give every bullet a concise property-named subsection such as Glycemic Control, Lipid Metabolism, Blood Pressure, Vitamin A Status, Nutrient Composition, or Carotenoid Content. Group related direct and background bullets under the same property where appropriate.
+7. When SECTION_SUMMARY_CANDIDATES contains an objective/thesis for the selected entity, include the best one as section_summary. Its text may remove an introductory phrase such as 'The objective was to investigate whether' but must remain near-verbatim and retain the animal model.
+8. CORE_RESULT_CANDIDATES identifies distinct high-signal abstract findings. Include every materially distinct candidate supported by the selected target entity unless a more specific Results bullet already captures the same outcome. Do not omit separate vitamin, sugar-independence, comparative-efficacy, or limitation findings merely because another metabolic outcome was included.
+9. BACKGROUND_CLAIM_CANDIDATES identifies useful source-exact background properties. When they support the selected target entity, include each distinct property and normally retain three to six such candidates when available. Publisher citation markers in their quotes are context only: remove those markers from visible text and still cite only the main scraped article.
+10. Prefer concrete Results outcomes, including quantitative findings when available. Keep the update useful but bounded: at most four target sections and sixteen bullets per section.
+11. Return needs_review only when source identity, evidence, taxonomy, or placement truly cannot be resolved from this packet. Return only the JSON object; there will be no repair or critic pass."""
     return "\n\n".join(
         (
             "JSON_CONTRACT:\n" + json.dumps(contract, indent=2),
@@ -2721,6 +3136,20 @@ def simple_draft_prompt(
             "MATCH_CANDIDATES:\n" + json.dumps(candidate_summary, indent=2),
             "CANDIDATE_PAGE_STRUCTURE:\n" + json.dumps(candidate_documents, indent=2),
             "SOURCE_PACKET:\n" + json.dumps(simple_prompt_source_packet(packet), indent=2),
+            "SECTION_SUMMARY_CANDIDATES:\n"
+            + json.dumps(section_summary_candidates(packet), indent=2),
+            "CORE_RESULT_CANDIDATES:\n"
+            + json.dumps(
+                core_result_candidates(packet, preferred_entity=preferred_entity),
+                indent=2,
+            ),
+            "BACKGROUND_CLAIM_CANDIDATES:\n"
+            + json.dumps(
+                background_claim_candidates(
+                    packet, preferred_entity=preferred_entity
+                ),
+                indent=2,
+            ),
             "QUANTITATIVE_RESULTS_CANDIDATES:\n"
             + json.dumps(results_quantitative_sentences(packet), indent=2),
         )
@@ -2771,7 +3200,7 @@ def draft_prompt(
                         "source_section": "exact source section heading, such as Abstract, Introduction, Results, or Discussion",
                         "claim_kind": "source_finding | background_fact",
                         "evidence_scope": "review_summary | human | animal | in_vitro | mechanistic | composition",
-                        "subsection": "for background_fact: short property name for its ### subsection, such as Nutrient Composition; empty for animal findings",
+                        "subsection": "short property name for its ### subsection, required for every Healing Properties bullet",
                         "cited_references": [
                             {
                                 "citation_marker": "exact marker in source_quote, such as [12]",
@@ -2802,8 +3231,11 @@ def draft_prompt(
     issues = prior_issues or []
     if any("invalid_text" in issue for issue in issues):
         repair_hints.append("For bullet text, remove every leading dash and every [^n] citation marker; the renderer adds both.")
-    if any("preclinical_heading_scope_missing" in issue for issue in issues):
-        repair_hints.append("Put 'Animal Evidence', 'Animal Models', or 'Preclinical Evidence' literally in the proposed heading.")
+    if any("missing_property_subsection" in issue for issue in issues):
+        repair_hints.append(
+            "Give every Healing Properties bullet a concise property subsection such as "
+            "Glycemic Control, Lipid Metabolism, Blood Pressure, or Vitamin A Status."
+        )
     if any("methods_statement_not_effect_claim" in issue for issue in issues):
         repair_hints.append(
             "Remove methods/process bullets describing how the formulation was produced or "
@@ -2878,8 +3310,7 @@ def draft_prompt(
         policy_rules = (
             "STRICT CLAIM POLICY: Propose only direct findings of the supplied paper. "
             "Use claim_kind source_finding and do not mine introductions or discussions for background facts. "
-            "Every preclinical claim must use evidence_scope animal and the heading context must explicitly "
-            "contain Animal Evidence, Animal Models, or Preclinical Evidence."
+            "Every preclinical claim must use evidence_scope animal and retain an explicit species/model cue."
         )
     else:
         policy_rules = (
@@ -2888,8 +3319,8 @@ def draft_prompt(
             "When a background passage cites earlier work, preserve its exact citation marker, exact reference-list "
             "entry, and source-provided URL in cited_references; missing provenance requires needs_review. Background "
             "evidence_scope describes the earlier evidence summarized by the passage, not the supplied paper's study "
-            "design. Animal-scoped claims should use an explicit preclinical heading when natural; otherwise the "
-            "renderer adds a mandatory animal/preclinical evidence warning."
+            "design. Every Healing Properties bullet uses a property-named subsection, while each animal-scoped "
+            "claim retains its explicit species/model cue."
         )
     sections = [
             (
@@ -2907,7 +3338,7 @@ def draft_prompt(
             "MISSING_ENTITY_PAGE_SEED (suggestion, not an automatic decision):\n"
             + json.dumps(new_article_seed or {}, indent=2),
             f"CLAIM_POLICY: {claim_policy}\n{policy_rules}",
-            "Rules: For Natural Healing use concise one-idea bullets as close to the source wording as possible. Each bullet states exactly one idea; give consecutive sentences their own bullets. A methods or process statement describing how a formulation was produced, prepared, or assessed is never a Healing Properties effect bullet; carry essential formulation detail in formulation_definition instead, which is required whenever animal findings concern a specific formulation rather than the page entity generally. Give every background_fact bullet a short property-named subsection such as Nutrient Composition; animal findings are grouped under a Preclinical Evidence (Animal Studies) subsection automatically and need no subsection value. The bullet text should normally equal source_quote exactly, except that a list number, section label, or citation marker may be removed. Do not add footnote markers; the renderer adds them. Every source_quote must be copied exactly from the normalized source sections. Preserve study limitations and never turn a review, animal, rat, mouse, in-vitro, or mechanistic statement into a human treatment claim. Omit internally contradictory, corrupted, dangerously mistyped, or statistically misleading source sentences. One plan may append to several compatible pages and create one or more missing entity pages. Use operation append_existing only for a supplied candidate. Use create_new when the source's primary entity has no suitable page, including a useful category-level catch-all such as DOMAIN/Fruits/Citrus/citrus.md; choose an existing category directory when appropriate and create a new sub-category only when its semantic scope is clear. When MISSING_ENTITY_PAGE_SEED is nonempty and direct source findings explicitly concern that entity, do not discard those primary findings in favor of component-only background updates: create the seeded catch-all page and keep formulation/cultivar scope explicit in each bullet. Every target_entity must match the target title/stem and be asserted by every quote assigned to that target; a mere mention is insufficient. Never reuse the same claim across targets. Do not place cultivar, blend, or isolated-compound findings on a broader page unless the exact passage supports the broader entity. A citrus blend never belongs on a Bergamot page. When the source body is available, prefer or supplement abstract claims with Results-section sentences carrying concrete quantitative outcomes (values, units, comparisons): include at least one quantitative Results bullet per supplied-paper target whenever QUANTITATIVE_RESULTS_CANDIDATES is nonempty; every quantitative bullet still needs its exact contiguous source_quote. When the source quantifies the entity's constituent compounds, also propose a '## Composition' section for the entity page as its own target proposal (same target_path, heading ## Composition, evidence_scope composition, repeated new_article metadata for a new page); composition bullets are measurements, not effect claims. A new page must include at least one direct source_finding, focused tags including the exact target entity/title, a category rationale, and a safe path under DOMAIN. Its lead must be definition-form: the entity name followed by what it is (genus, family, or class of products), like '**Citrus** is a genus of flowering trees and shrubs in the family Rutaceae whose fruits include oranges, clementines, and grapefruits.' Prefer lead_kind definition (uncited general knowledge, no health claims); use lead_kind source_grounded only when the source itself contains a definition-form sentence. A topic-relevance framing sentence from the paper is never a lead; if kept it becomes a cited bullet. For cited_references, never invent a DOI or URL and never use placeholder reference text; remove the background claim if its exact reference record is unavailable. Explicitly list material unused claims in exclusions. A critic objection to one target is a placement problem, not a stop signal: rescope or retarget the affected claims and keep the remaining safe targets. Return needs_review only when neither guarded existing-page updates nor a well-scoped new page can be proposed safely.",
+            "Rules: For Natural Healing use concise one-idea bullets as close to the source wording as possible. Each bullet states exactly one idea; give consecutive sentences their own bullets. A methods or process statement describing how a formulation was produced, prepared, or assessed is never a Healing Properties effect bullet; carry essential formulation detail in formulation_definition instead, which is required whenever animal findings concern a specific formulation rather than the page entity generally. Give every Healing Properties bullet a short property-named subsection such as Glycemic Control, Lipid Metabolism, Blood Pressure, Vitamin A Status, Nutrient Composition, or Carotenoid Content. Keep the species/model explicit in every animal bullet and do not emit a generic evidence-warning blockquote. The bullet text should normally equal source_quote exactly, except that a list number, section label, or citation marker may be removed. Do not add footnote markers; the renderer adds them. Every source_quote must be copied exactly from the normalized source sections. Preserve study limitations and never turn a review, animal, rat, mouse, in-vitro, or mechanistic statement into a human treatment claim. Omit internally contradictory, corrupted, dangerously mistyped, or statistically misleading source sentences. One plan may append to several compatible pages and create one or more missing entity pages. Use operation append_existing only for a supplied candidate. Use create_new when the source's primary entity has no suitable page, including a useful category-level catch-all such as DOMAIN/Fruits/Citrus/citrus.md; choose an existing category directory when appropriate and create a new sub-category only when its semantic scope is clear. When MISSING_ENTITY_PAGE_SEED is nonempty and direct source findings explicitly concern that entity, do not discard those primary findings in favor of component-only background updates: create the seeded catch-all page and keep formulation/cultivar scope explicit in each bullet. Every target_entity must match the target title/stem and be asserted by every exact source_quote; a mere mention is insufficient. Never reuse the same claim across targets. Do not place cultivar, blend, or isolated-compound findings on a broader page unless the exact passage supports the broader entity. A citrus blend never belongs on a Bergamot page. When the source body is available, prefer or supplement abstract claims with Results-section sentences carrying concrete quantitative outcomes (values, units, comparisons): include at least one quantitative Results bullet per supplied-paper target whenever QUANTITATIVE_RESULTS_CANDIDATES is nonempty; every quantitative bullet still needs its exact contiguous source_quote. When the source quantifies the entity's constituent compounds, also propose a '## Composition' section for the entity page as its own target proposal (same target_path, heading ## Composition, evidence_scope composition, repeated new_article metadata for a new page); composition bullets are measurements, not effect claims. A new page must include at least one direct source_finding, focused tags including the exact target entity/title, a category rationale, and a safe path under DOMAIN. Its lead must be definition-form: the entity name followed by what it is (genus, family, or class of products), like '**Citrus** is a genus of flowering trees and shrubs in the family Rutaceae whose fruits include oranges, clementines, and grapefruits.' Prefer lead_kind definition (uncited general knowledge, no health claims); use lead_kind source_grounded only when the source itself contains a definition-form sentence. A topic-relevance framing sentence from the paper is never a lead; if kept it becomes a cited bullet. For cited_references, never invent a DOI or URL and never use placeholder reference text; remove the background claim if its exact reference record is unavailable. Explicitly list material unused claims in exclusions. A critic objection to one target is a placement problem, not a stop signal: rescope or retarget the affected claims and keep the remaining safe targets. Return needs_review only when neither guarded existing-page updates nor a well-scoped new page can be proposed safely.",
             "QUANTITATIVE_RESULTS_CANDIDATES (exact Results sentences with concrete outcomes; prefer these for supplied-paper bullets):\n"
             + json.dumps(results_quantitative_sentences(packet), indent=2),
             "SOURCE_PACKET_WITH_NORMALIZED_SECTIONS_AND_REFERENCES:\n" + json.dumps(source, indent=2),
@@ -3852,6 +4283,7 @@ def run_local_publish(
     output_dir: Path,
     base_url: str,
     model: str,
+    backend: str = "local",
     publish: bool,
     base_ref: str = "origin/main",
     max_candidates: int = 12,
@@ -3882,6 +4314,12 @@ def run_local_publish(
         raise ValueError(f"critic_mode must be one of: {', '.join(sorted(CRITIC_MODES))}")
     if pipeline not in PIPELINE_MODES:
         raise ValueError(f"pipeline must be one of: {', '.join(sorted(PIPELINE_MODES))}")
+    if backend not in COMPLETION_BACKENDS:
+        raise ValueError(
+            f"backend must be one of: {', '.join(sorted(COMPLETION_BACKENDS))}"
+        )
+    if backend != "local" and pipeline != "simple":
+        raise ValueError("Frontier-agent backends require --pipeline simple")
     if claim_policy not in CLAIM_POLICIES:
         raise ValueError(f"claim_policy must be one of: {', '.join(sorted(CLAIM_POLICIES))}")
     if abstract_mode not in ABSTRACT_MODES:
@@ -3927,7 +4365,7 @@ def run_local_publish(
     report_path = run_dir / "report.json"
     diff_path = run_dir / "proposed.patch"
     base_snapshot_temp: tempfile.TemporaryDirectory[str] | None = None
-    client: LocalLLMClient | None = None
+    client: LocalLLMClient | AgentCLIClient | None = None
     duplicate: dict[str, Any] | None = None
 
     def finish(report: dict[str, Any]) -> dict[str, Any]:
@@ -3944,6 +4382,7 @@ def run_local_publish(
         report.setdefault("critic_mode", critic_mode)
         report.setdefault("claim_policy", claim_policy)
         report.setdefault("pipeline", pipeline)
+        report.setdefault("backend", backend)
         report.setdefault("publication_requested", publish)
         report.setdefault("allow_duplicate_pr", allow_duplicate_pr)
         report.setdefault("publication_suppressed", publication_suppressed)
@@ -3973,6 +4412,7 @@ def run_local_publish(
                 "runtime": {
                     "base_url": base_url,
                     "model": model,
+                    "backend": backend,
                     "tools_revision": git_revision(tools_root),
                     "tools_worktree": git_worktree_provenance(tools_root),
                     "content_base_ref": base_ref,
@@ -4194,10 +4634,14 @@ def run_local_publish(
     )
     candidate_retrieval["new_article_seed"] = new_article_seed
 
-    client = LocalLLMClient(
-        base_url,
-        model,
-        lock_path=tools_root / "runtime" / "local-publisher" / "model.lock",
+    client = (
+        LocalLLMClient(
+            base_url,
+            model,
+            lock_path=tools_root / "runtime" / "local-publisher" / "model.lock",
+        )
+        if backend == "local"
+        else AgentCLIClient(backend, model, tools_root)
     )
     system = (
         (
@@ -4583,6 +5027,7 @@ def run_local_publish(
         "critic": critic,
         "critic_mode": critic_mode,
         "pipeline": pipeline,
+        "backend": backend,
         "claim_policy": claim_policy,
         "abstract_mode": abstract_mode,
         "publication_requested": publish,
@@ -4784,6 +5229,7 @@ def run_local_publish(
             + "\n\n"
             f"{gate_summary}\n\n"
             f"Pipeline: `{pipeline}`\n\n"
+            f"Draft backend: `{backend}` ({model or 'CLI default'})\n\n"
             + (
                 "Duplicate comparison: explicitly allowed; see gate telemetry for the existing citation/PR.\n\n"
                 if allow_duplicate_pr and duplicate and duplicate.get("bypass_requested")
@@ -4823,5 +5269,5 @@ def run_local_publish(
 def configured_client_values() -> tuple[str, str]:
     return (
         os.environ.get("LOCAL_LLM_BASE_URL", "http://127.0.0.1:8080/v1"),
-        os.environ.get("LOCAL_LLM_MODEL", "qwen3.6-35b-a3b-q8_0-mtp"),
+        os.environ.get("LOCAL_LLM_MODEL", "qwen3.8-27b-q8_0-mtp"),
     )

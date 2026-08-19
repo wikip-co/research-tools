@@ -105,6 +105,48 @@ class LocalPublishTests(unittest.TestCase):
             finally:
                 first.close()
 
+    def test_frontier_agent_clients_remove_write_authority(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout='{"decision":"needs_review"}', stderr=""
+        )
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            local_publish.shutil, "which", side_effect=lambda name: f"/bin/{name}"
+        ), patch.object(local_publish.subprocess, "run", return_value=completed) as run:
+            for backend in ("codex", "claude", "grok"):
+                run.reset_mock()
+                client = local_publish.AgentCLIClient(
+                    backend, "frontier-test", Path(tmpdir)
+                )
+                response = client.json_completion(system="system", user="user")
+                self.assertEqual(response["decision"], "needs_review")
+                command = run.call_args.args[0]
+                if backend == "codex":
+                    self.assertIn("read-only", command)
+                    self.assertEqual(command[-1], "-")
+                elif backend == "claude":
+                    self.assertIn("--no-session-persistence", command)
+                    self.assertIn("--tools", command)
+                else:
+                    self.assertIn("--disable-web-search", command)
+                    self.assertIn("--no-subagents", command)
+                    self.assertIsNone(run.call_args.kwargs["input"])
+                self.assertEqual(client.calls[0]["status"], "ok")
+
+    def test_frontier_backend_requires_simple_pipeline(self) -> None:
+        with self.assertRaisesRegex(ValueError, "require --pipeline simple"):
+            run_local_publish(
+                source="https://example.org/article",
+                alert_name="",
+                content_repo=Path("/tmp/content"),
+                tools_root=Path("/tmp/tools"),
+                output_dir=Path("/tmp/output"),
+                base_url="http://127.0.0.1:8080/v1",
+                model="",
+                backend="codex",
+                publish=False,
+                pipeline="legacy",
+            )
+
     def test_packet_rejects_placeholder_citation_metadata(self) -> None:
         packet = dict(self.packet)
         packet.update(
@@ -205,6 +247,59 @@ class LocalPublishTests(unittest.TestCase):
         )
         self.assertIn("measured animal result", rendered)
         self.assertIn("traditional background use", rendered)
+
+    def test_simple_pipeline_extracts_source_thesis_for_section_summary(self) -> None:
+        thesis = (
+            "The objective was to investigate whether a citrus formulation composed of "
+            "clementine and pink grapefruit (60:40, v/v) and enriched in bioactive "
+            "compounds could improve glucose homeostasis, insulin sensitivity, lipid "
+            "metabolism, and vitamin A status following supplementation in fructose-fed rats."
+        )
+        packet = {
+            **self.packet,
+            "title": "Citrus formulation in fructose-fed rats",
+            "body_markdown": f"## 1. Introduction\n\n{thesis}\n\n## 2. Results\n\nResults.",
+        }
+
+        candidates = local_publish.section_summary_candidates(packet)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["source_quote"], thesis)
+        self.assertTrue(candidates[0]["text"].startswith("A citrus formulation"))
+        self.assertTrue(candidates[0]["text"].endswith("fructose-fed rats."))
+
+    def test_simple_prompt_surfaces_distinct_core_and_background_properties(self) -> None:
+        core = (
+            "Moreover, the citrus concentrates enhanced hepatic vitamin A stores in "
+            "prediabetic rats."
+        )
+        glycemic = (
+            "Diets rich in citrus fruits have been associated with improved glycemic "
+            "control ([Example et al., 2025](#bb0010))."
+        )
+        nutrient = (
+            "Citrus juices are nutrient-dense beverages that contain vitamins, minerals, "
+            "soluble fibers, phytochemicals, and carotenoids."
+        )
+        packet = {
+            **self.packet,
+            "title": "Citrus concentrates in fructose-fed rats",
+            "abstract": core,
+            "body_markdown": f"## 1. Introduction\n\n{glycemic} {nutrient}",
+            "study_type": "Animal Study",
+        }
+
+        core_candidates = local_publish.core_result_candidates(packet, "citrus")
+        background_candidates = local_publish.background_claim_candidates(
+            packet, "citrus"
+        )
+
+        self.assertEqual(core_candidates[0]["suggested_subsection"], "Vitamin A Status")
+        self.assertEqual(
+            [item["suggested_subsection"] for item in background_candidates],
+            ["Glycemic Control", "Nutrient Composition"],
+        )
+        self.assertNotIn("(;", background_candidates[0]["text"])
 
     def test_simple_validator_accepts_main_source_only_plan(self) -> None:
         quote = (
@@ -307,6 +402,49 @@ class LocalPublishTests(unittest.TestCase):
             any(item["action"] == "dropped_unprovable_bullet" for item in actions)
         )
 
+    def test_simple_normalization_adds_thesis_and_property_headings(self) -> None:
+        thesis = (
+            "The objective was to investigate whether a citrus formulation could improve "
+            "glucose homeostasis following supplementation in fructose-fed rats."
+        )
+        finding = (
+            "Consumption of the citrus concentrates improved glucose tolerance in "
+            "fructose-fed rats."
+        )
+        packet = {
+            **self.packet,
+            "title": "Citrus formulation in fructose-fed rats",
+            "abstract": finding,
+            "body_markdown": f"## 1. Introduction\n\n{thesis}\n\n## Results\n\n{finding}",
+            "study_type": "Animal Study",
+        }
+        plan = {
+            "target_proposals": [
+                {
+                    "target_entity": "citrus",
+                    "heading": "## Healing Properties",
+                    "bullets": [
+                        {
+                            "text": finding,
+                            "source_quote": finding,
+                            "source_section": "Results",
+                            "claim_kind": "source_finding",
+                            "evidence_scope": "animal",
+                            "subsection": "Preclinical Evidence (Animal Studies)",
+                        }
+                    ],
+                }
+            ]
+        }
+
+        actions = normalize_simple_draft_plan(plan, packet=packet)
+        proposal = plan["target_proposals"][0]
+
+        self.assertTrue(proposal["section_summary"]["text"].startswith("A citrus formulation"))
+        self.assertEqual(proposal["bullets"][0]["subsection"], "Glycemic Control")
+        self.assertIn("added_source_section_summary", {item["action"] for item in actions})
+        self.assertIn("added_property_subsection", {item["action"] for item in actions})
+
     def test_publish_detects_open_pr_before_scraping(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -353,7 +491,22 @@ class LocalPublishTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.pipeline, "simple")
+        self.assertEqual(args.backend, "local")
         self.assertTrue(args.allow_duplicate_pr)
+        agent_args = cli.build_parser().parse_args(
+            [
+                "local-publish",
+                "https://example.org/article",
+                "--backend",
+                "codex",
+                "--model",
+                "frontier-test",
+                "--domain",
+                "Natural Healing",
+            ]
+        )
+        self.assertEqual(agent_args.backend, "codex")
+        self.assertEqual(agent_args.model, "frontier-test")
         with self.assertRaisesRegex(ValueError, "requires --publish"):
             run_local_publish(
                 source="https://example.org/article",
@@ -492,7 +645,7 @@ tags:
         )
         self.assertTrue(rendered.ok, rendered.issues)
 
-    def test_preclinical_plan_requires_scoped_heading(self) -> None:
+    def test_preclinical_scope_does_not_require_evidence_tier_heading(self) -> None:
         packet = dict(self.packet)
         packet["title"] = "Resveratrol in animal models of pulmonary fibrosis"
         plan = {
@@ -513,10 +666,8 @@ tags:
             packet=packet,
             candidate_paths={"Natural Healing/resveratrol.md"},
         )
-        # The rendered Preclinical Evidence subsection now satisfies heading
-        # scope deterministically; the plan-level gap is a warning, not a gate.
         self.assertTrue(unscoped.ok, unscoped.issues)
-        self.assertIn("target_0_preclinical_heading_scope_warning", unscoped.warnings)
+        self.assertNotIn("target_0_preclinical_heading_scope_warning", unscoped.warnings)
         plan["heading"] = "### Pulmonary Fibrosis (Animal Evidence)"
         valid = validate_draft_plan(
             plan,
@@ -981,7 +1132,7 @@ tags:
                     packet=packet,
                     candidate_paths={"Natural Healing/example.md"},
                 )
-                self.assertIn(
+                self.assertNotIn(
                     "target_0_preclinical_heading_scope_warning", result.warnings
                 )
                 self.assertIn("bullet_0_preclinical_scope_must_be_animal", result.issues)
@@ -1221,7 +1372,7 @@ tags:
         self.assertEqual(client.json_completion.call_count, 2)
         self.assertIn("title: Citrus", created)
         self.assertIn(f"- {finding_quote}[^1]", created)
-        self.assertIn("**Evidence warning — animal/preclinical evidence:**", created)
+        self.assertNotIn("Evidence warning", created)
 
     def test_compendium_rat_source_supports_independent_background_targets(self) -> None:
         references = {
@@ -1485,7 +1636,7 @@ tags:
             invalid.issues,
         )
 
-    def test_compendium_preclinical_warning_replaces_heading_rejection(self) -> None:
+    def test_compendium_property_groups_do_not_add_preclinical_warning(self) -> None:
         background_quote = "Citrus fruits contain diverse flavonoids whose amounts vary among species and cultivars [15]."
         direct_quote = "The citrus intervention reduced body-weight gain in rats receiving the experimental diet."
         reference = "[15] Citrus composition review. Journal of Citrus. 2023."
@@ -1553,7 +1704,7 @@ tags:
             claim_policy="compendium",
         )
         self.assertTrue(valid.ok, valid.issues)
-        self.assertIn("target_0_preclinical_heading_scope_warning", valid.warnings)
+        self.assertNotIn("target_0_preclinical_heading_scope_warning", valid.warnings)
 
         strict = validate_draft_plan(
             plan,
@@ -1562,13 +1713,13 @@ tags:
             candidate_metadata=candidate,
             claim_policy="strict",
         )
-        self.assertIn("target_0_preclinical_heading_scope_warning", strict.warnings)
+        self.assertNotIn("target_0_preclinical_heading_scope_warning", strict.warnings)
 
         markdown = "---\ntitle: Citrus\n---\n\n## Composition\n"
         updated = apply_draft_plan(
             markdown, proposal, packet, claim_policy="compendium"
         )
-        self.assertIn("**Evidence warning — animal/preclinical evidence:**", updated)
+        self.assertNotIn("Evidence warning", updated)
         self.assertIn(f"{direct_quote}[^1]", updated)
         self.assertIn(f"{background_quote}[^1]", updated)
         self.assertEqual(updated.count("**Title:**"), 1)
@@ -2801,7 +2952,7 @@ class CitationRendererTests(unittest.TestCase):
         return {
             "heading": "## Healing Properties",
             "parent_heading": "",
-            "formulation_definition": {
+            "section_summary": {
                 "text": (
                     "A citrus formulation composed of clementine and pink grapefruit "
                     "was assessed in fructose-fed rats."
@@ -2819,6 +2970,7 @@ class CitationRendererTests(unittest.TestCase):
                     "source_section": "Abstract",
                     "claim_kind": "source_finding",
                     "evidence_scope": "animal",
+                    "subsection": "Glycemic Control",
                     "cited_references": [],
                 },
                 {
@@ -2827,6 +2979,7 @@ class CitationRendererTests(unittest.TestCase):
                     "source_section": "Abstract",
                     "claim_kind": "source_finding",
                     "evidence_scope": "animal",
+                    "subsection": "Vitamin A Status",
                     "cited_references": [],
                 },
                 {
@@ -2841,22 +2994,19 @@ class CitationRendererTests(unittest.TestCase):
             ],
         }
 
-    def test_bullets_group_into_evidence_tier_subsections(self) -> None:
+    def test_bullets_group_into_property_subsections_without_warning(self) -> None:
         plan = self._scoped_plan()
         updated = apply_draft_plan(self.markdown, plan, self.packet, claim_policy="integrated")
         lines = updated.splitlines()
-        animal_heading = lines.index("### Preclinical Evidence (Animal Studies)")
-        background_heading = lines.index("### Glycemic Control")
-        self.assertLess(animal_heading, background_heading)
-        warning_index = next(
-            i for i, line in enumerate(lines) if line.startswith("> **Evidence warning")
-        )
-        self.assertLess(animal_heading, warning_index)
-        self.assertLess(warning_index, background_heading)
+        glycemic_heading = lines.index("### Glycemic Control")
+        vitamin_heading = lines.index("### Vitamin A Status")
+        self.assertLess(glycemic_heading, vitamin_heading)
+        self.assertNotIn("Evidence warning", updated)
         background_bullet = next(
             i for i, line in enumerate(lines) if line.startswith("- Diets rich")
         )
-        self.assertGreater(background_bullet, background_heading)
+        self.assertGreater(background_bullet, glycemic_heading)
+        self.assertLess(background_bullet, vitamin_heading)
         rendered = validate_rendered_markdown(
             self.markdown, updated, plan=plan, packet=self.packet, claim_policy="integrated"
         )
@@ -2879,21 +3029,17 @@ class CitationRendererTests(unittest.TestCase):
             updated,
         )
 
-    def test_formulation_definition_opens_the_animal_subsection(self) -> None:
+    def test_section_summary_precedes_property_subsections(self) -> None:
         plan = self._scoped_plan()
         updated = apply_draft_plan(self.markdown, plan, self.packet, claim_policy="integrated")
         lines = updated.splitlines()
-        heading = lines.index("### Preclinical Evidence (Animal Studies)")
-        definition = next(
+        heading = lines.index("### Glycemic Control")
+        summary = next(
             i for i, line in enumerate(lines) if line.startswith("A citrus formulation composed")
         )
-        warning = next(
-            i for i, line in enumerate(lines) if line.startswith("> **Evidence warning")
-        )
         first_bullet = next(i for i, line in enumerate(lines) if line.startswith("- "))
-        self.assertLess(heading, definition)
-        self.assertLess(definition, warning)
-        self.assertLess(warning, first_bullet)
+        self.assertLess(summary, heading)
+        self.assertLess(heading, first_bullet)
         misplaced = updated.replace(
             "A citrus formulation composed of clementine and pink grapefruit was assessed "
             "in fructose-fed rats.[^1]\n",
@@ -2902,7 +3048,8 @@ class CitationRendererTests(unittest.TestCase):
         gated = validate_rendered_markdown(
             self.markdown, misplaced, plan=plan, packet=self.packet, claim_policy="integrated"
         )
-        self.assertIn("formulation_definition_missing_or_misplaced", gated.issues)
+        self.assertIn("section_summary_missing_or_misplaced", gated.issues)
+        self.assertIn("section_summary_citation_missing", gated.issues)
 
     def test_flat_before_fixture_fails_gate_and_grouped_after_passes(self) -> None:
         plan = self._scoped_plan()
@@ -2923,7 +3070,6 @@ class CitationRendererTests(unittest.TestCase):
             self.markdown, before, plan=plan, packet=self.packet, claim_policy="integrated"
         )
         self.assertIn("bullet_outside_property_subsection", gated.issues)
-        self.assertIn("animal_warning_outside_subsection", gated.issues)
         after = apply_draft_plan(self.markdown, plan, self.packet, claim_policy="integrated")
         rendered = validate_rendered_markdown(
             self.markdown, after, plan=plan, packet=self.packet, claim_policy="integrated"

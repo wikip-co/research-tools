@@ -4,8 +4,10 @@ The production publisher turns an ad-hoc article URL, local PDF, or queued
 Google Scholar result into a validated Markdown patch and, when explicitly
 requested, a draft pull request in `content`.
 
-The default is deliberately small: deterministic intake, one local-model pass,
-deterministic validation, rendering, and optional draft-PR delivery. The former
+The default is deliberately small: deterministic intake, one drafting pass,
+deterministic validation, rendering, and optional draft-PR delivery. Local
+llama.cpp remains the default drafting backend; authenticated Codex, Claude,
+and Grok CLIs are optional explicit alternatives. The former
 multi-pass planner/critic workflow remains available as `--pipeline legacy` for
 compatibility, but it is no longer the production default.
 
@@ -25,8 +27,10 @@ deployment, see
    safe new entity path when no exact page exists.
 5. Build one bounded prompt from the abstract, Results, Conclusion,
    traditional-use sections, Introduction, and Discussion plus compact page
-   identity/heading context.
-6. Make exactly one local-model call that extracts both the study's core
+   identity/heading context. Source-exact high-signal abstract outcomes and
+   healing/nutrition background candidates are listed explicitly so distinct
+   properties are not lost inside a long section.
+6. Make exactly one drafting call that extracts both the study's core
    results and useful traditional or background healing uses stated in the
    paper, then maps them to existing pages or a focused new page.
 7. Deterministically validate exact quotations, near-verbatim bullets, study
@@ -79,9 +83,12 @@ The model returns one JSON object with:
 - `append_existing` or `create_new`, a domain-safe target path, the exact target
   entity, heading, and placement rationale;
 - new-page title, tags, definition lead, and category rationale when needed;
+- an optional source-grounded `section_summary` for a concise study thesis
+  directly below `## Healing Properties`;
 - one-idea bullets containing `text`, an exact contiguous `source_quote`, the
-  exact `source_section`, `claim_kind`, `evidence_scope`, and optional property
-  subsection.
+  exact `source_section`, `claim_kind`, `evidence_scope`, and a property
+  subsection for every `## Healing Properties` bullet, up to sixteen bullets
+  per target section.
 
 `source_finding` is reserved for the paper's own results.
 `background_fact` covers useful background, traditional, historical, or
@@ -103,8 +110,10 @@ The single pass may publish only when all applicable checks pass:
 - every bullet has an exact source passage and remains near-verbatim;
 - every target entity appears in the bullet and its source passage;
 - source findings are not mislabeled as Introduction background;
-- animal findings remain animal-scoped and receive the rendered preclinical
-  warning/species context;
+- animal findings remain animal-scoped and keep their species/model cue in
+  each claim;
+- Healing Properties bullets are grouped under property headings such as
+  Glycemic Control, Lipid Metabolism, Blood Pressure, or Vitamin A Status;
 - new pages have a definition-form lead, focused tags, a category rationale,
   and at least one direct source finding;
 - no bullet introduces an external cited-reference record;
@@ -123,8 +132,9 @@ are normalized deterministically.
 
 After the single model response, bounded deterministic cleanup may restore
 source whitespace, replace an over-paraphrase with its exact source quote,
-remove external-reference fields, or drop an unprovable bullet. It cannot
-invent or rewrite a claim, and every action is recorded in the run report.
+remove external-reference fields, restore an exact source thesis, infer a
+property heading, or drop an unprovable bullet. It cannot invent a claim, and
+every action is recorded in the run report.
 
 Per-bullet exact quotation and source-section provenance remains in adjacent
 HTML comments for PR review. These comments contain no independently followed
@@ -162,6 +172,31 @@ telemetry but allow a second draft PR:
 This flag requires `--publish`. The new PR body records that the duplicate stop
 was deliberately bypassed; it never auto-merges either PR.
 
+## Optional frontier-agent backends
+
+llama.cpp remains the default and needs no new option. To spend credits from an
+already installed and authenticated agent CLI, select it explicitly:
+
+```bash
+./agent-workflow local-publish URL --domain "Natural Healing" \
+  --backend codex --model MODEL_ID --publish
+
+./agent-workflow local-publish URL --domain "Natural Healing" \
+  --backend claude --model MODEL_ID --publish
+
+./agent-workflow local-publish URL --domain "Natural Healing" \
+  --backend grok --model MODEL_ID --publish
+```
+
+Omit `--model` to use that CLI's configured default. The executable may be
+overridden with `CODEX_BIN`, `CLAUDE_BIN`, or `GROK_BIN`. Agent backends are
+available only with the default `simple` pipeline. They receive the same
+bounded prompt and return only a JSON plan. Claude and Grok run with tools (and
+Grok web search) disabled; Codex runs in its read-only sandbox. None receives
+write authority. The publisher remains solely responsible for
+validation, file changes, Git operations, and PR creation. `--base-url` applies
+only to the local backend.
+
 Only use the compatibility pipeline for diagnosis of older reports:
 
 ```bash
@@ -190,7 +225,9 @@ Process one job as a dry run or allow a passing job to open a draft PR:
 ./agent-workflow local-worker --max-jobs 1 --publish
 ```
 
-The worker uses the simple pipeline by default. Queue leasing, retries,
+The worker uses the simple pipeline and local backend by default. An operator
+may explicitly pass `--backend codex|claude|grok` for a bounded worker run;
+doing so can consume the selected CLI account's credits. Queue leasing, retries,
 `validated`, `needs_review`, `duplicate`, `failed`, and `pr_open` states are
 unchanged. Requeue a reviewed stopped job explicitly:
 

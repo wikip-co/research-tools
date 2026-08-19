@@ -1879,7 +1879,8 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
         tools_root=AGENT_TOOLS_ROOT,
         output_dir=Path(args.output_dir).expanduser().resolve(),
         base_url=args.base_url or default_base_url,
-        model=args.model or default_model,
+        model=args.model or (default_model if args.backend == "local" else ""),
+        backend=args.backend,
         publish=args.publish,
         base_ref=args.base_ref,
         max_candidates=args.limit,
@@ -1913,6 +1914,7 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
         "balance_repair": result.get("balance_repair"),
         "critic_mode": result.get("critic_mode"),
         "pipeline": result.get("pipeline"),
+        "backend": result.get("backend"),
         "claim_policy": result.get("claim_policy"),
         "domain": result.get("domain"),
         "run_id": result.get("run_id"),
@@ -2028,7 +2030,8 @@ def local_worker_command(args: argparse.Namespace) -> dict[str, Any]:
                 tools_root=AGENT_TOOLS_ROOT,
                 output_dir=job_output,
                 base_url=args.base_url or default_base_url,
-                model=args.model or default_model,
+                model=args.model or (default_model if args.backend == "local" else ""),
+                backend=args.backend,
                 publish=args.publish,
                 base_ref=args.base_ref,
                 max_candidates=args.limit,
@@ -2633,12 +2636,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     local_publish_parser = subparsers.add_parser(
         "local-publish",
-        help="Draft and validate a research update with the local llama.cpp model.",
+        help="Draft and validate a research update with llama.cpp or a selected frontier-agent CLI.",
     )
     local_publish_parser.add_argument("source", help="HTTP(S) article URL or PDF path.")
     local_publish_parser.add_argument("--alert-name", default="", help="Optional Scholar alert topic.")
     local_publish_parser.add_argument("--base-url", default="", help="OpenAI-compatible llama.cpp /v1 base URL.")
-    local_publish_parser.add_argument("--model", default="", help="Local llama.cpp model identifier.")
+    local_publish_parser.add_argument(
+        "--backend",
+        choices=["local", "codex", "claude", "grok"],
+        default="local",
+        help="Draft backend; local llama.cpp is the default. Frontier agents run read-only and return only the JSON plan.",
+    )
+    local_publish_parser.add_argument(
+        "--model",
+        default="",
+        help="Optional model identifier for the selected backend; local uses LOCAL_LLM_MODEL by default and agent CLIs use their configured default.",
+    )
     local_publish_parser.add_argument("--base-ref", default="origin/main", help="Git ref for the isolated content worktree.")
     local_publish_parser.add_argument("--limit", type=int, default=12, help="Maximum domain-filtered target candidates.")
     local_publish_parser.add_argument(
@@ -2729,6 +2742,12 @@ def build_parser() -> argparse.ArgumentParser:
     local_worker_parser.add_argument("--lease-seconds", type=int, default=3600)
     local_worker_parser.add_argument("--max-jobs", type=int, default=1)
     local_worker_parser.add_argument("--base-url", default="")
+    local_worker_parser.add_argument(
+        "--backend",
+        choices=["local", "codex", "claude", "grok"],
+        default="local",
+        help="Draft backend; local llama.cpp is the unattended default.",
+    )
     local_worker_parser.add_argument("--model", default="")
     local_worker_parser.add_argument("--base-ref", default="origin/main")
     local_worker_parser.add_argument("--limit", type=int, default=12)
