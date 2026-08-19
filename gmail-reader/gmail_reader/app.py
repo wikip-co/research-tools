@@ -1551,17 +1551,25 @@ def resolve_paper_row(conn: sqlite3.Connection, identifier: str) -> sqlite3.Row 
     normalized_doi = normalize_doi(stripped)
     canonical_url = canonicalize_url(stripped)
     normalized_pmid = stripped if stripped.isdigit() else ""
+    # Only compare non-empty values: an empty normalized DOI/PMID must never
+    # match rows whose doi/pmid columns are empty strings, which previously
+    # resolved identifiers to an arbitrary unrelated paper.
+    conditions: list[str] = []
+    params: list[str] = []
+    for column, value in (
+        ("paper_key", stripped),
+        ("canonical_url", canonical_url),
+        ("doi", normalized_doi),
+        ("pmid", normalized_pmid),
+    ):
+        if value:
+            conditions.append(f"{column} = ?")
+            params.append(value)
+    if not conditions:
+        return None
     row = conn.execute(
-        """
-        SELECT *
-        FROM papers
-        WHERE paper_key = ?
-           OR canonical_url = ?
-           OR doi = ?
-           OR pmid = ?
-        LIMIT 1
-        """,
-        (stripped, canonical_url, normalized_doi, normalized_pmid),
+        f"SELECT * FROM papers WHERE {' OR '.join(conditions)} LIMIT 1",
+        params,
     ).fetchone()
     if row:
         return row

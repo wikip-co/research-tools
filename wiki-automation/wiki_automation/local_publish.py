@@ -1034,13 +1034,20 @@ def validate_draft_plan(
             if quote and not exact_source_passage(packet, quote):
                 issues.append(f"{prefix}_quote_not_in_source")
             reason = str(exclusion.get("reason") or "").strip()
+            contradiction = (
+                r"\b(?:not excluded|already (?:captured|included|integrated)|rather integrated)\b"
+            )
+            # A reason is contradictory only when redundancy is its whole
+            # justification; "mechanistic hypothesis; core finding already
+            # captured" carries an independent reason and is legitimate.
+            independent_reason = re.sub(
+                rf"[^.;,]*{contradiction}[^.;,]*", " ", reason, flags=re.IGNORECASE
+            )
             if not reason:
                 issues.append(f"{prefix}_missing_reason")
-            elif re.search(
-                r"\b(?:not excluded|already (?:captured|included|integrated)|rather integrated)\b",
-                reason,
-                re.IGNORECASE,
-            ):
+            elif re.search(contradiction, reason, re.IGNORECASE) and len(
+                normalize_evidence(independent_reason)
+            ) < 15:
                 issues.append(f"{prefix}_contradictory_reason")
     for target_index, proposal in enumerate(proposals):
         target_prefix = f"target_{target_index}"
@@ -1201,8 +1208,10 @@ def validate_draft_plan(
                 issues.append(f"{prefix}_invalid_evidence_scope")
             if is_methods_statement(strip_scope_prefix(text, packet)):
                 issues.append(f"{prefix}_methods_statement_not_effect_claim")
+            # The contract asks for an empty subsection on animal findings, so
+            # "" is a valid absent value; only a non-string is malformed.
             subsection = item.get("subsection")
-            if subsection is not None and not str(subsection).strip():
+            if subsection is not None and not isinstance(subsection, str):
                 issues.append(f"{prefix}_invalid_subsection")
             if (
                 includes_background_claims(claim_policy)

@@ -98,6 +98,33 @@ class PaperTrackingTests(unittest.TestCase):
         self.assertEqual(merged["paper"]["workflow_state"], "merged")
         self.assertEqual(merged["paper"]["archived_source_path"], "/archive/example-paper/source.pdf")
 
+    def test_identifier_lookup_never_matches_on_empty_doi_or_pmid(self) -> None:
+        upsert_external_paper(
+            self.db_path,
+            title="Unrelated Paper With No DOI",
+            url="https://example.org/unrelated",
+            doi="",
+            pmid="",
+            workflow_state="matched",
+            matched_content_path="",
+        )
+        missing_doi = find_paper(self.db_path, "10.1016/j.foodres.2026.120323")
+        self.assertFalse(missing_doi["found"])
+        missing_pmid = find_paper(self.db_path, "99999999")
+        self.assertFalse(missing_pmid["found"])
+        upsert_external_paper(
+            self.db_path,
+            title="The Real Paper",
+            url="https://example.org/real",
+            doi="10.1016/j.foodres.2026.120323",
+            pmid="",
+            workflow_state="scraped",
+            matched_content_path="",
+        )
+        resolved = find_paper(self.db_path, "10.1016/j.foodres.2026.120323")
+        self.assertTrue(resolved["found"])
+        self.assertEqual(resolved["paper"]["title"], "The Real Paper")
+
     def test_parse_scholar_alert_fixture(self) -> None:
         html = (FIXTURES_DIR / "scholar_alert.html").read_text(encoding="utf-8")
         alert_name, candidates = parse_articles_from_html(html, "Resveratrol - new results")

@@ -610,6 +610,101 @@ tags:
             "docs/local-research-publisher.md claim-policy set diverges from CLAIM_POLICIES",
         )
 
+    def test_empty_subsection_is_valid_and_nonstring_is_not(self) -> None:
+        quote = "The citrus intervention reduced body-weight gain in rats during the feeding period."
+        packet = dict(self.packet)
+        packet["abstract"] = quote
+        packet["study_type"] = "Animal Study"
+
+        def plan_with_subsection(value: object) -> dict:
+            return {
+                "decision": "append_existing",
+                "target_path": "Natural Healing/quercetin.md",
+                "parent_heading": "",
+                "heading": "## Healing Properties",
+                "bullets": [
+                    {
+                        "text": quote,
+                        "source_quote": quote,
+                        "evidence_scope": "animal",
+                        "subsection": value,
+                    }
+                ],
+            }
+
+        # The plan contract asks for an empty subsection on animal findings.
+        empty = validate_draft_plan(
+            plan_with_subsection(""),
+            packet=packet,
+            candidate_paths={"Natural Healing/quercetin.md"},
+        )
+        self.assertNotIn("bullet_0_invalid_subsection", empty.issues)
+        malformed = validate_draft_plan(
+            plan_with_subsection(7),
+            packet=packet,
+            candidate_paths={"Natural Healing/quercetin.md"},
+        )
+        self.assertIn("bullet_0_invalid_subsection", malformed.issues)
+
+    def test_exclusion_reason_with_independent_justification_is_valid(self) -> None:
+        quote = "The greater efficacy may be related to bioactive compounds in the citrus matrix."
+        packet = dict(self.packet)
+        packet["abstract"] = f"{quote} Another citrus finding about quercetin appears here."
+
+        def plan_with_reason(reason: str) -> dict:
+            return {
+                "decision": "publish_changes",
+                "study_type": "Review",
+                "target_proposals": [
+                    {
+                        "operation": "append_existing",
+                        "target_path": "Natural Healing/quercetin.md",
+                        "target_entity": "quercetin",
+                        "parent_heading": "",
+                        "heading": "## Safety",
+                        "rationale": "Direct findings.",
+                        "bullets": [
+                            {
+                                "text": "Another citrus finding about quercetin appears here.",
+                                "source_quote": "Another citrus finding about quercetin appears here.",
+                                "source_section": "Abstract",
+                                "claim_kind": "source_finding",
+                                "evidence_scope": "review_summary",
+                                "cited_references": [],
+                            }
+                        ],
+                        "exclusions": [],
+                    }
+                ],
+                "exclusions": [{"source_quote": quote, "reason": reason}],
+            }
+
+        candidates = {
+            "Natural Healing/quercetin.md": {
+                "path": "Natural Healing/quercetin.md",
+                "title": "Quercetin",
+            }
+        }
+        mixed = validate_draft_plan(
+            plan_with_reason(
+                "Mechanistic hypothesis rather than a direct finding; the direct "
+                "finding of broader improvements is already captured."
+            ),
+            packet=packet,
+            candidate_paths=set(candidates),
+            candidate_metadata=candidates,
+            claim_policy="integrated",
+        )
+        self.assertNotIn("exclusion_0_contradictory_reason", mixed.issues)
+        redundant_only = validate_draft_plan(
+            plan_with_reason("This passage is already captured elsewhere."),
+            packet=packet,
+            candidate_paths=set(candidates),
+            candidate_metadata=candidates,
+            claim_policy="integrated",
+        )
+        self.assertIn("exclusion_0_contradictory_reason", redundant_only.issues)
+
     def test_rat_mouse_terms_are_preclinical_and_require_animal_scope(self) -> None:
         for cue in ("rat", "rats", "mouse", "mice"):
             with self.subTest(cue=cue):
