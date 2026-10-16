@@ -181,6 +181,25 @@ def study_type_matches_packet(plan_study_type: str, packet: dict[str, Any]) -> b
     return generic_recorded and source_is_preclinical(packet) and preclinical_planned
 
 
+GENERIC_STUDY_TYPE_LABELS = {"", "article", "research article", "original article"}
+
+
+def study_type_contract(packet: dict[str, Any], fallback: str) -> str:
+    """Tell the model to echo the packet's recorded study_type verbatim.
+
+    The deterministic gate (study_type_matches_packet) requires an exact
+    normalized match with the recorded or classified label, so a descriptive
+    paraphrase such as "systematic review of 28 RCTs" is always rejected.
+    """
+
+    recorded = str(packet.get("study_type") or "").strip()
+    if normalize_evidence(recorded) in GENERIC_STUDY_TYPE_LABELS:
+        return fallback
+    return (
+        f"copy exactly this recorded study type, verbatim with no added words: {recorded}"
+    )
+
+
 def exact_source_passage(packet: dict[str, Any], passage: str) -> bool:
     """Return whether a claim passage is an exact contiguous source span."""
     return bool(passage and passage in source_evidence(packet))
@@ -3063,7 +3082,7 @@ def simple_draft_prompt(
     contract = {
         "decision": "publish_changes | duplicate | needs_review",
         "reason": "required only for duplicate or needs_review",
-        "study_type": "specific design supported by the paper",
+        "study_type": study_type_contract(packet, "specific design supported by the paper"),
         "target_proposals": [
             {
                 "operation": "append_existing | create_new",
@@ -3125,7 +3144,10 @@ def simple_draft_prompt(
 8. CORE_RESULT_CANDIDATES identifies distinct high-signal abstract findings. Include every materially distinct candidate supported by the selected target entity unless a more specific Results bullet already captures the same outcome. Do not omit separate vitamin, sugar-independence, comparative-efficacy, or limitation findings merely because another metabolic outcome was included.
 9. BACKGROUND_CLAIM_CANDIDATES identifies useful source-exact background properties. When they support the selected target entity, include each distinct property and normally retain three to six such candidates when available. Publisher citation markers in their quotes are context only: remove those markers from visible text and still cite only the main scraped article.
 10. Prefer concrete Results outcomes, including quantitative findings when available. Keep the update useful but bounded: at most four target sections and sixteen bullets per section.
-11. Return needs_review only when source identity, evidence, taxonomy, or placement truly cannot be resolved from this packet. Return only the JSON object; there will be no repair or critic pass."""
+11. Return needs_review only when source identity, evidence, taxonomy, or placement truly cannot be resolved from this packet. Return only the JSON object; there will be no repair or critic pass.
+12. Set study_type exactly as JSON_CONTRACT instructs. When a recorded study type is given, copy it character for character; put design detail such as trial counts in bullets, not in study_type.
+13. Never emit near-duplicate bullets: when two candidate passages report the same outcome (for example overlapping subgroup sentences), keep only the most complete one. Background_fact bullets must add a distinct property not already covered by a result bullet; do not pad with generic introduction sentences such as study aims, prevalence statistics, or food-source lists unless they state a healing property of the entity.
+14. Each bullet text must be exactly one sentence (the rendered gate rejects multi-sentence bullets). When a quote spans two sentences, choose the single most informative sentence as its own bullet with its own exact source_quote."""
     return "\n\n".join(
         (
             "JSON_CONTRACT:\n" + json.dumps(contract, indent=2),
@@ -3171,7 +3193,10 @@ def draft_prompt(
 ) -> str:
     contract = {
         "decision": "publish_changes | duplicate | needs_review",
-        "study_type": "most specific evidence design supported by the source; a generic publisher label may be refined from explicit rat/mouse/human text",
+        "study_type": study_type_contract(
+            packet,
+            "most specific evidence design supported by the source; a generic publisher label may be refined from explicit rat/mouse/human text",
+        ),
         "target_proposals": [
             {
                 "operation": "append_existing | create_new",
