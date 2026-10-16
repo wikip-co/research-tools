@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import fcntl
 import hashlib
 import io
@@ -2174,6 +2175,39 @@ def background_claim_candidates(
     return candidates
 
 
+def split_multi_sentence_bullet(
+    item: dict[str, Any], packet: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Split a multi-sentence bullet into single-sentence bullets.
+
+    Each piece keeps its own exact source quote: the matching sentence of the
+    original quote, re-verified as a contiguous source span.  If any sentence
+    cannot be paired with a provable quote sentence, the bullet is returned
+    unchanged so the rendered single-idea gate still rejects it.
+    """
+
+    text_sentences = split_bullet_sentences(str(item.get("text") or ""))
+    if len(text_sentences) < 2:
+        return [item]
+    quote_sentences = split_bullet_sentences(str(item.get("source_quote") or ""))
+    if len(quote_sentences) != len(text_sentences):
+        return [item]
+    pieces: list[dict[str, Any]] = []
+    for text_sentence, quote_sentence in zip(text_sentences, quote_sentences):
+        canonical = whitespace_exact_source_passage(packet, quote_sentence)
+        if (
+            not canonical
+            or len(normalize_evidence(canonical)) < 35
+            or word_token_similarity(
+                strip_scope_prefix(text_sentence, packet), canonical
+            )
+            < 0.68
+        ):
+            return [item]
+        pieces.append({**item, "text": text_sentence, "source_quote": canonical})
+    return pieces
+
+
 def normalize_simple_draft_plan(
     plan: dict[str, Any], *, packet: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -2234,6 +2268,7 @@ def normalize_simple_draft_plan(
         if not isinstance(bullets, list):
             continue
         retained: list[Any] = []
+        seen_texts: set[str] = set()
         for bullet_index, item in enumerate(bullets):
             location = {
                 "target_index": target_index,
@@ -2321,7 +2356,47 @@ def normalize_simple_draft_plan(
                 actions.append(
                     {**location, "action": "removed_publisher_markers"}
                 )
-            retained.append(item)
+            pieces = split_multi_sentence_bullet(item, packet)
+            if len(pieces) > 1:
+                actions.append(
+                    {
+                        **location,
+                        "action": "split_multi_sentence_bullet",
+                        "pieces": len(pieces),
+                    }
+                )
+            split_entity = str(proposal.get("target_entity") or "")
+            for piece in pieces:
+                if (
+                    len(pieces) > 1
+                    and split_entity
+                    and not (
+                        phrase_in_text(split_entity, str(piece.get("source_quote") or ""))
+                        and phrase_in_text(split_entity, str(piece.get("text") or ""))
+                    )
+                ):
+                    # A split-off sentence that no longer names the target
+                    # entity cannot pass the entity gate; drop it explicitly.
+                    actions.append(
+                        {
+                            **location,
+                            "action": "dropped_split_sentence_without_entity",
+                            "text": piece.get("text"),
+                        }
+                    )
+                    continue
+                key = normalize_evidence(str(piece.get("text") or ""))
+                if key in seen_texts:
+                    actions.append(
+                        {
+                            **location,
+                            "action": "dropped_duplicate_bullet",
+                            "text": piece.get("text"),
+                        }
+                    )
+                    continue
+                seen_texts.add(key)
+                retained.append(piece)
         proposal["bullets"] = retained
     return actions
 
@@ -2777,6 +2852,25 @@ def heading_section_lines(markdown: str, heading: str) -> list[str]:
     return lines[start + 1 : end]
 
 
+def inserted_section_lines(
+    original_lines: list[str], updated_lines: list[str]
+) -> list[str]:
+    """Lines this run added to a section, in order.
+
+    Structural rules apply to the publisher's own block.  Pre-existing
+    human-authored lines (which may predate the single-sentence and
+    summary-placement rules) are not re-litigated, and an appended block's
+    summary is judged against the block's own first subsection.
+    """
+
+    matcher = difflib.SequenceMatcher(a=original_lines, b=updated_lines, autojunk=False)
+    inserted: list[str] = []
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag in {"insert", "replace"}:
+            inserted.extend(updated_lines[j1:j2])
+    return inserted
+
+
 def rendered_structure_issues(
     section_lines: list[str],
     packet: dict[str, Any],
@@ -2882,7 +2976,10 @@ def validate_rendered_markdown(
     if grouped_rendering_enabled(plan):
         issues.extend(
             rendered_structure_issues(
-                heading_section_lines(updated, str(plan.get("heading") or "")),
+                inserted_section_lines(
+                    heading_section_lines(original, str(plan.get("heading") or "")),
+                    heading_section_lines(updated, str(plan.get("heading") or "")),
+                ),
                 packet,
                 plan,
             )
