@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import fcntl
 import hashlib
 import io
@@ -179,6 +180,25 @@ def study_type_matches_packet(plan_study_type: str, packet: dict[str, Any]) -> b
         re.search(r"\b(?:animal|preclinical|in vivo|rat|rats|mouse|mice)\b", planned)
     )
     return generic_recorded and source_is_preclinical(packet) and preclinical_planned
+
+
+GENERIC_STUDY_TYPE_LABELS = {"", "article", "research article", "original article"}
+
+
+def study_type_contract(packet: dict[str, Any], fallback: str) -> str:
+    """Tell the model to echo the packet's recorded study_type verbatim.
+
+    The deterministic gate (study_type_matches_packet) requires an exact
+    normalized match with the recorded or classified label, so a descriptive
+    paraphrase such as "systematic review of 28 RCTs" is always rejected.
+    """
+
+    recorded = str(packet.get("study_type") or "").strip()
+    if normalize_evidence(recorded) in GENERIC_STUDY_TYPE_LABELS:
+        return fallback
+    return (
+        f"copy exactly this recorded study type, verbatim with no added words: {recorded}"
+    )
 
 
 def exact_source_passage(packet: dict[str, Any], passage: str) -> bool:
@@ -2155,6 +2175,39 @@ def background_claim_candidates(
     return candidates
 
 
+def split_multi_sentence_bullet(
+    item: dict[str, Any], packet: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Split a multi-sentence bullet into single-sentence bullets.
+
+    Each piece keeps its own exact source quote: the matching sentence of the
+    original quote, re-verified as a contiguous source span.  If any sentence
+    cannot be paired with a provable quote sentence, the bullet is returned
+    unchanged so the rendered single-idea gate still rejects it.
+    """
+
+    text_sentences = split_bullet_sentences(str(item.get("text") or ""))
+    if len(text_sentences) < 2:
+        return [item]
+    quote_sentences = split_bullet_sentences(str(item.get("source_quote") or ""))
+    if len(quote_sentences) != len(text_sentences):
+        return [item]
+    pieces: list[dict[str, Any]] = []
+    for text_sentence, quote_sentence in zip(text_sentences, quote_sentences):
+        canonical = whitespace_exact_source_passage(packet, quote_sentence)
+        if (
+            not canonical
+            or len(normalize_evidence(canonical)) < 35
+            or word_token_similarity(
+                strip_scope_prefix(text_sentence, packet), canonical
+            )
+            < 0.68
+        ):
+            return [item]
+        pieces.append({**item, "text": text_sentence, "source_quote": canonical})
+    return pieces
+
+
 def normalize_simple_draft_plan(
     plan: dict[str, Any], *, packet: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -2215,6 +2268,7 @@ def normalize_simple_draft_plan(
         if not isinstance(bullets, list):
             continue
         retained: list[Any] = []
+        seen_texts: set[str] = set()
         for bullet_index, item in enumerate(bullets):
             location = {
                 "target_index": target_index,
@@ -2302,7 +2356,47 @@ def normalize_simple_draft_plan(
                 actions.append(
                     {**location, "action": "removed_publisher_markers"}
                 )
-            retained.append(item)
+            pieces = split_multi_sentence_bullet(item, packet)
+            if len(pieces) > 1:
+                actions.append(
+                    {
+                        **location,
+                        "action": "split_multi_sentence_bullet",
+                        "pieces": len(pieces),
+                    }
+                )
+            split_entity = str(proposal.get("target_entity") or "")
+            for piece in pieces:
+                if (
+                    len(pieces) > 1
+                    and split_entity
+                    and not (
+                        phrase_in_text(split_entity, str(piece.get("source_quote") or ""))
+                        and phrase_in_text(split_entity, str(piece.get("text") or ""))
+                    )
+                ):
+                    # A split-off sentence that no longer names the target
+                    # entity cannot pass the entity gate; drop it explicitly.
+                    actions.append(
+                        {
+                            **location,
+                            "action": "dropped_split_sentence_without_entity",
+                            "text": piece.get("text"),
+                        }
+                    )
+                    continue
+                key = normalize_evidence(str(piece.get("text") or ""))
+                if key in seen_texts:
+                    actions.append(
+                        {
+                            **location,
+                            "action": "dropped_duplicate_bullet",
+                            "text": piece.get("text"),
+                        }
+                    )
+                    continue
+                seen_texts.add(key)
+                retained.append(piece)
         proposal["bullets"] = retained
     return actions
 
@@ -2758,6 +2852,25 @@ def heading_section_lines(markdown: str, heading: str) -> list[str]:
     return lines[start + 1 : end]
 
 
+def inserted_section_lines(
+    original_lines: list[str], updated_lines: list[str]
+) -> list[str]:
+    """Lines this run added to a section, in order.
+
+    Structural rules apply to the publisher's own block.  Pre-existing
+    human-authored lines (which may predate the single-sentence and
+    summary-placement rules) are not re-litigated, and an appended block's
+    summary is judged against the block's own first subsection.
+    """
+
+    matcher = difflib.SequenceMatcher(a=original_lines, b=updated_lines, autojunk=False)
+    inserted: list[str] = []
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag in {"insert", "replace"}:
+            inserted.extend(updated_lines[j1:j2])
+    return inserted
+
+
 def rendered_structure_issues(
     section_lines: list[str],
     packet: dict[str, Any],
@@ -2863,7 +2976,10 @@ def validate_rendered_markdown(
     if grouped_rendering_enabled(plan):
         issues.extend(
             rendered_structure_issues(
-                heading_section_lines(updated, str(plan.get("heading") or "")),
+                inserted_section_lines(
+                    heading_section_lines(original, str(plan.get("heading") or "")),
+                    heading_section_lines(updated, str(plan.get("heading") or "")),
+                ),
                 packet,
                 plan,
             )
@@ -3063,7 +3179,7 @@ def simple_draft_prompt(
     contract = {
         "decision": "publish_changes | duplicate | needs_review",
         "reason": "required only for duplicate or needs_review",
-        "study_type": "specific design supported by the paper",
+        "study_type": study_type_contract(packet, "specific design supported by the paper"),
         "target_proposals": [
             {
                 "operation": "append_existing | create_new",
@@ -3125,7 +3241,10 @@ def simple_draft_prompt(
 8. CORE_RESULT_CANDIDATES identifies distinct high-signal abstract findings. Include every materially distinct candidate supported by the selected target entity unless a more specific Results bullet already captures the same outcome. Do not omit separate vitamin, sugar-independence, comparative-efficacy, or limitation findings merely because another metabolic outcome was included.
 9. BACKGROUND_CLAIM_CANDIDATES identifies useful source-exact background properties. When they support the selected target entity, include each distinct property and normally retain three to six such candidates when available. Publisher citation markers in their quotes are context only: remove those markers from visible text and still cite only the main scraped article.
 10. Prefer concrete Results outcomes, including quantitative findings when available. Keep the update useful but bounded: at most four target sections and sixteen bullets per section.
-11. Return needs_review only when source identity, evidence, taxonomy, or placement truly cannot be resolved from this packet. Return only the JSON object; there will be no repair or critic pass."""
+11. Return needs_review only when source identity, evidence, taxonomy, or placement truly cannot be resolved from this packet. Return only the JSON object; there will be no repair or critic pass.
+12. Set study_type exactly as JSON_CONTRACT instructs. When a recorded study type is given, copy it character for character; put design detail such as trial counts in bullets, not in study_type.
+13. Never emit near-duplicate bullets: when two candidate passages report the same outcome (for example overlapping subgroup sentences), keep only the most complete one. Background_fact bullets must add a distinct property not already covered by a result bullet; do not pad with generic introduction sentences such as study aims, prevalence statistics, or food-source lists unless they state a healing property of the entity.
+14. Each bullet text must be exactly one sentence (the rendered gate rejects multi-sentence bullets). When a quote spans two sentences, choose the single most informative sentence as its own bullet with its own exact source_quote."""
     return "\n\n".join(
         (
             "JSON_CONTRACT:\n" + json.dumps(contract, indent=2),
@@ -3171,7 +3290,10 @@ def draft_prompt(
 ) -> str:
     contract = {
         "decision": "publish_changes | duplicate | needs_review",
-        "study_type": "most specific evidence design supported by the source; a generic publisher label may be refined from explicit rat/mouse/human text",
+        "study_type": study_type_contract(
+            packet,
+            "most specific evidence design supported by the source; a generic publisher label may be refined from explicit rat/mouse/human text",
+        ),
         "target_proposals": [
             {
                 "operation": "append_existing | create_new",
