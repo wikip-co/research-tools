@@ -69,6 +69,37 @@ class WebScraperHelperTests(unittest.TestCase):
         self.assertIn("doi_title_mismatch", main.extraction_issues(data))
         self.assertTrue(main.has_fatal_extraction_issue(data))
 
+    def test_reference_doi_is_not_assigned_to_article_without_doi(self) -> None:
+        html = """
+        <html><head><meta name="citation_title" content="A honey review"></head>
+        <body><h1>A honey review</h1><p>Introduction and article text.</p>
+        <section class="ref-list"><p class="doi">10.1000/cited-paper</p>
+        <a href="https://doi.org/10.1000/cited-paper">DOI</a></section>
+        </body></html>
+        """
+        with (
+            patch.object(main, "fetch_crossref_metadata", return_value={}),
+            patch.object(main, "fetch_pubmed_metadata", return_value={}),
+            patch.object(main, "fetch_unpaywall_metadata", return_value={}),
+        ):
+            data = main.extract_article_data("https://example.org/review", html, "fixture")
+        self.assertEqual(data["doi"], "")
+
+    def test_enrichment_does_not_infer_identity_from_body_citations(self) -> None:
+        data = {
+            "title": "A honey review",
+            "url": "https://example.org/review",
+            "body_markdown": "An earlier study (10.1000/cited-paper) was cited.",
+        }
+        with (
+            patch.object(main, "fetch_crossref_metadata", return_value={}) as crossref,
+            patch.object(main, "fetch_pubmed_metadata", return_value={}),
+            patch.object(main, "fetch_unpaywall_metadata", return_value={}),
+        ):
+            main.enrich_metadata(data)
+        self.assertEqual(data["doi"], "")
+        crossref.assert_called_once_with("", "A honey review")
+
     def test_looks_like_pdf_source_for_url_and_file(self) -> None:
         self.assertTrue(main.looks_like_pdf_source("https://example.com/paper.pdf"))
         self.assertTrue(main.looks_like_pdf_source("/tmp/paper.pdf"))

@@ -1107,7 +1107,6 @@ def enrich_metadata(data: dict[str, Any]) -> dict[str, Any]:
         raw_doi,
         str(data.get("url", "")),
         str(data.get("requested_url", "")),
-        str(data.get("body_markdown", ""))[:5000],
     )
     if raw_doi != normalized_doi:
         metadata_repairs.append("doi:discarded_placeholder_or_normalized")
@@ -1369,11 +1368,22 @@ def extract_article_data(url: str, raw_html: str, retrieval_backend: str) -> dic
             if not is_placeholder_metadata("authors", candidate)
         )
 
+    # A DOI in a bibliography identifies a cited work, not this article.
+    # Prefer explicit metadata/URL and DOI-labelled elements outside references;
+    # title-based enrichment can recover missing identifiers conservatively.
+    identity_soup = BeautifulSoup(raw_html, "html.parser")
+    for references in list(
+        identity_soup.select(
+            '.ref-list, .references, [role="doc-bibliography"], [id^="ref-list"]'
+        )
+    ):
+        references.decompose()
     doi = normalize_doi(
         first_item(meta_values(soup, "name", "citation_doi")),
-        *selector_texts(soup, '[class*="doi"]'),
+        *meta_values(soup, "name", "dc.identifier"),
+        *meta_values(soup, "name", "DC.Identifier"),
         url,
-        raw_html,
+        *selector_texts(identity_soup, '[class*="doi"]'),
     )
     journal = first_nonempty(
         first_item(meta_values(soup, "name", "citation_journal_title")),
