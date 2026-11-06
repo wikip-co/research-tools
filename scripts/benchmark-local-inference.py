@@ -175,7 +175,10 @@ def run_case(base, case, label, repeat, mode, model="benchmark", max_tokens=550)
         msg = choice["message"]
         content = msg.get("content") or msg.get("reasoning_content") or ""
         result = json.loads(content)
-        checks = {k: result.get(k) == v and (k in result) for k, v in expected.items()}
+        checks = {
+            k: k in result and type(result[k]) is type(v) and result[k] == v
+            for k, v in expected.items()
+        }
         q = result.get("source_quote")
         checks["fields_exact"] = set(result) == set(expected) | {"source_quote"}
         checks["quote_exact"] = isinstance(q, str) and bool(q) and q in source

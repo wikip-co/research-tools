@@ -71,8 +71,11 @@ for row in rows:
         response = json.load(urllib.request.urlopen(req, timeout=300))
         choice = response["choices"][0]
         msg = choice["message"]
+        content = (msg.get("content") or "").strip()
+        if not content:
+            content = msg.get("reasoning_content") or "{}"
         answer = (
-            json.loads(msg.get("content") or "{}").get("answer", "").strip().upper()
+            json.loads(content).get("answer", "").strip().upper()
         )
         record.update(
             answer=answer,
