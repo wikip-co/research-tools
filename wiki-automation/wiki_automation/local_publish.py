@@ -68,6 +68,13 @@ MAX_DRAFT_OUTPUT_TOKENS = 10000
 SIMPLE_MAX_SOURCE_CONTEXT_CHARS = 55000
 SIMPLE_MAX_ALL_CANDIDATE_CONTEXT_CHARS = 20000
 SIMPLE_MAX_DRAFT_OUTPUT_TOKENS = 6000
+SIMPLE_OUTPUT_CONSTRAINT_REMINDERS = (
+    'Omit section_summary entirely when no qualifying thesis is available. Never return '
+    'an empty section_summary object or blank summary fields. Keep the literal Markdown '
+    'hashes in heading and parent_heading. For a top-level ## heading, parent_heading '
+    'must be an empty string. Skip any bullet whose exact source quote does not '
+    'explicitly name the target entity. Do not resolve pronouns or implied entities.'
+)
 CRITIC_SEVERITIES = {"warning", "review", "blocking"}
 CRITIC_SEVERITY_RANK = {"warning": 0, "review": 1, "blocking": 2}
 PLACEMENT_ISSUE_CODES = {
@@ -3272,7 +3279,7 @@ def simple_draft_prompt(
             "QUANTITATIVE_RESULTS_CANDIDATES:\n"
             + json.dumps(results_quantitative_sentences(packet), indent=2),
         )
-    )
+    ) + "\n" + SIMPLE_OUTPUT_CONSTRAINT_REMINDERS
 
 
 def draft_prompt(
