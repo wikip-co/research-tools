@@ -61,6 +61,56 @@ completion at 6,000 tokens. An OS advisory lock fails a second publisher run
 quickly with `local_model_busy` instead of allowing two HTTP requests to
 compete for the single model slot.
 
+## Benchmark the local model
+
+Use the synthetic benchmark before changing the model or server settings. It
+checks evidence extraction, exact quotes, missing values, study scope, mixed
+study counts, withdrawal arithmetic, and instructions embedded in source text.
+A paper-sized case sends approximately 71,000 source characters. The publisher
+suite uses the current single-pass prompt, style guides, local client,
+normalizer, and deterministic plan validator with three synthetic fixtures.
+It reads no queue, scrapes no papers, and writes no content changes.
+
+Start the candidate server separately on loopback. Use a spare port such as
+8081 and the alias `benchmark`. Run candidates sequentially so they do not
+compete for the GPU. From the research-tools root:
+
+```bash
+uv run --all-packages python scripts/benchmark-local-inference.py \
+  --base-url http://127.0.0.1:8081/v1 --model benchmark \
+  --label candidate-settings --repeats 2 \
+  --output /tmp/inference-candidate.jsonl
+```
+
+Use `--suite extraction` or `--suite publisher` for a focused comparison.
+The output appends one JSON record per case. Compare latency, generation
+speed, completion status, exact-quote checks, and validator issues. A valid
+`needs_review` decision is not an accepted draft. Check `decision`,
+`bullet_count`, `scope_correct`, and `all_quotes_exact` alongside
+`validation_ok`. Synthetic checks do not establish clinical accuracy or replace
+review of representative real papers.
+
+The production prompt now explicitly requires unavailable optional summaries
+to be omitted, retains Markdown heading prefixes, and repeats the existing
+source-entity requirement. These reminders were verified with live synthetic
+requests. The validator is unchanged. The `--publisher-hints` switch is retained
+for comparison with older prompt versions and adds reminders only when absent. Record the code revision, model file hashes, backend,
+context, cache types, speculative settings, and cache hits with each comparison.
+
+For an additional science comparison, use
+`scripts/benchmark-science-inference.py` with a frozen JSON list of MMLU-Pro
+rows. Pass `--questions PATH`, `--label LABEL`, and `--output PATH`. The script
+sends only questions and options. It never sends answer keys or supplied
+reasoning. Every result includes the input file's SHA-256 digest. Keep the
+sample fixed across models and report the question IDs, source revision,
+sampling method, and reasoning mode. A small direct-answer sample is not an
+official benchmark score or a model ranking.
+
+The local contract benchmark also supports `--suite publisher
+--large-publisher` for one longer request with bounded source context and a
+19.2K-character candidate document. Its default completion cap is 1,800 tokens.
+This is a controlled latency test, not a full publication run.
+
 ## Packet contract
 
 The packet is the normalized evidence bundle produced before model use. It
