@@ -3162,14 +3162,24 @@ def create_isolated_worktree(
     return worktree, branch
 
 
+def publishing_policy() -> dict[str, Any]:
+    # Generated from canonical Agent Wiki articles; no documentation checkout or
+    # network access is required by a packaged/offline publisher.
+    path = Path(__file__).with_name("publishing_policy.json")
+    policy = json.loads(path.read_text(encoding="utf-8"))
+    if policy.get("schema_version") != 1:
+        raise ValueError("Unsupported publishing policy schema")
+    for key in ("general", "natural"):
+        document = policy["documents"][key]
+        digest = hashlib.sha256(document["content"].encode("utf-8")).hexdigest()
+        if digest != document["sha256"]:
+            raise ValueError(f"Publishing policy integrity failure: {key}")
+    return policy
+
+
 def style_context(tools_root: Path) -> str:
-    general = (tools_root / "docs" / "research-publishing-style-guide.md").read_text(
-        encoding="utf-8"
-    )
-    natural = (
-        tools_root.parent / "docs" / "natural-healing-content-style-guide.md"
-    ).read_text(encoding="utf-8")
-    return f"GENERAL GUIDE:\n{general}\n\nNATURAL HEALING GUIDE:\n{natural}"
+    documents = publishing_policy()["documents"]
+    return f"GENERAL GUIDE:\n{documents['general']['content']}\n\nNATURAL HEALING GUIDE:\n{documents['natural']['content']}"
 
 
 def simple_draft_prompt(

@@ -139,7 +139,8 @@ class WebHelpersTests(unittest.TestCase):
             conn.close()
 
         self.assertIsNotNone(job)
-        self.assertIn("research-publishing-style-guide.md", prompt)
+        self.assertIn("https://agent.wikip.co/research-publishing-style-guide/", prompt)
+        self.assertIn("https://agent.wikip.co/natural-healing-content-style-guide/", prompt)
         self.assertEqual(updated, 1)
         self.assertEqual(len(rows), 1)
 

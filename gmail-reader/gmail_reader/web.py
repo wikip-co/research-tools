@@ -363,9 +363,9 @@ def build_codex_prompt(
 Process the selected research article rows below and submit a draft PR to the `content` repo with the markdown changes.
 
 Required workflow:
-1. Read `research-tools/docs/research-publishing-style-guide.md` before editing content.
+1. Read https://agent.wikip.co/research-publishing-style-guide/ before editing content.
    For `content/Natural Healing/**`, also read
-   `docs/natural-healing-content-style-guide.md`; that category guide is
+   https://agent.wikip.co/natural-healing-content-style-guide/; that category guide is
    authoritative and requires near-verbatim, one-idea bullets with citations.
 2. Use `research-tools/agent-workflow intake` or the underlying tools to scrape each source, check duplicates, and match existing content.
 3. Prefer appending to an existing `content` markdown article when the source naturally belongs there. Create a new article only when there is no good existing home.

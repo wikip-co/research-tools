@@ -990,25 +990,25 @@ tags:
         self.assertTrue(truncated.endswith("membrane"))
         self.assertEqual(local_publish.truncate_at_word("short title", 72), "short title")
 
-    def test_documented_claim_policies_match_code_enum(self) -> None:
-        doc = (
-            Path(__file__).resolve().parents[2] / "docs" / "local-research-publisher.md"
-        ).read_text(encoding="utf-8")
-        marker = next(
-            (
-                line
-                for line in doc.splitlines()
-                if line.startswith("Accepted claim policies:")
-            ),
-            "",
-        )
-        self.assertTrue(marker, "docs must declare the accepted claim policies")
-        documented = set(re.findall(r"`([a-z_]+)`", marker))
+    def test_exported_claim_policies_match_code_enum(self) -> None:
         self.assertEqual(
-            documented,
+            set(local_publish.publishing_policy()["claim_policies"]),
             local_publish.CLAIM_POLICIES,
-            "docs/local-research-publisher.md claim-policy set diverges from CLAIM_POLICIES",
         )
+
+    def test_policy_loads_without_a_documentation_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            context = local_publish.style_context(Path(tmp))
+        self.assertIn("GENERAL GUIDE:", context)
+        self.assertIn("NATURAL HEALING GUIDE:", context)
+        self.assertIn("Natural Healing Content Style Guide", context)
+
+    def test_corrupted_policy_fails_closed(self) -> None:
+        policy = local_publish.publishing_policy()
+        policy["documents"]["general"]["content"] += "tampered"
+        with patch.object(Path, "read_text", return_value=json.dumps(policy)):
+            with self.assertRaisesRegex(ValueError, "integrity failure"):
+                local_publish.style_context(Path("/unused"))
 
     def test_empty_subsection_is_valid_and_nonstring_is_not(self) -> None:
         quote = "The citrus intervention reduced body-weight gain in rats during the feeding period."
