@@ -1,9 +1,5 @@
-# content-agent-core
+# Research Content Agent Core Guide
 
-Shared helpers used across the content agent workspace.
+Documentation is maintained in the [Agent Wiki guide](https://agent.wikip.co/research-content-agent-core-guide/).
 
-Current responsibilities:
-
-- safe `.env` parsing for Python tooling
-- shared `agent-browser` session helpers
-- lightweight HTTP JSON/text fetching utilities
+See [all Research project documentation](https://agent.wikip.co/research-documentation-index/) for procedures, release notes, style guides, diagrams, and package guides. This repository owns executable code and resources; this file is only an entry-point pointer.
