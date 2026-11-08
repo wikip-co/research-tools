@@ -1,3 +1,3 @@
-scrapling[fetchers]>=0.4.1
-beautifulsoup4>=4.12.3
-markitdown>=0.0.1a3
+# Compatibility install from web-scraper/; pyproject.toml owns dependencies.
+-e ../content-agent-core
+-e .
