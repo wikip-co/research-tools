@@ -9,6 +9,7 @@ dependencies = []
 package = false
 
 [tool.uv.workspace]
+exclude = ["integrations/scrapling-mcp"]
 members = [
     "content-agent-core",
     "gmail-reader",

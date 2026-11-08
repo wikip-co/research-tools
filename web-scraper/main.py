@@ -7,6 +7,7 @@ import json
 import os
 import re as _re
 import secrets
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ from content_agent_core.agent_browser import (
 )
 from content_agent_core.dotenv import load_dotenv_files
 from content_agent_core.http import fetch_json
+from content_agent_core.url_safety import public_urlopen, validate_public_url
 from markitdown import MarkItDown
 from pypdf import PdfReader
 from scrapling.fetchers import StealthyFetcher
@@ -96,6 +98,8 @@ AGENT_BROWSER_OVERLAY_SELECTORS = [
 
 MIN_BODY_MARKDOWN_CHARS = int(os.getenv("WEB_SCRAPER_MIN_BODY_CHARS", "800"))
 MIN_ABSTRACT_CHARS = int(os.getenv("WEB_SCRAPER_MIN_ABSTRACT_CHARS", "120"))
+SCRAPLING_MODE_DEFAULT = os.getenv("WEB_SCRAPER_SCRAPLING_MODE", "auto").strip().lower() or "auto"
+SCRAPLING_TIMEOUT_MS = int(os.getenv("WEB_SCRAPER_SCRAPLING_TIMEOUT_MS", "30000"))
 AGENT_BROWSER_MODE_DEFAULT = os.getenv("WEB_SCRAPER_AGENT_BROWSER_MODE", "auto").strip().lower() or "auto"
 AGENT_BROWSER_COMMAND = os.getenv("WEB_SCRAPER_AGENT_BROWSER_COMMAND", "agent-browser")
 AGENT_BROWSER_SETTLE_MS = int(os.getenv("WEB_SCRAPER_AGENT_BROWSER_SETTLE_MS", "1200"))
@@ -142,9 +146,10 @@ FATAL_CONTENT_PATTERNS = {
     ),
 }
 FATAL_TITLE_PATTERNS = (
+    _re.compile(r"^(?:sign\s+in|log\s*in|too\s+many\s+requests|rate\s+limit(?:ed|\s+exceeded)?)(?:\s*[|:-].*)?$", _re.IGNORECASE),
     _re.compile(r"^are\s+you\s+a\s+robot\??$", _re.IGNORECASE),
     _re.compile(r"^access\s+denied$", _re.IGNORECASE),
-    _re.compile(r"^just\s+a\s+moment\.?$", _re.IGNORECASE),
+    _re.compile(r"^just\s+a\s+moment(?:\.{0,3}|…)$", _re.IGNORECASE),
     _re.compile(r"^new\s+tab$", _re.IGNORECASE),
     _re.compile(
         r"^there\s+was\s+a\s+problem\s+providing\s+the\s+content\s+you\s+requested$",
@@ -152,7 +157,7 @@ FATAL_TITLE_PATTERNS = (
     ),
 )
 FATAL_RETRIEVAL_ISSUES = frozenset(
-    {"invalid_title", "doi_title_mismatch", *FATAL_CONTENT_PATTERNS.keys()}
+    {"invalid_title", "doi_title_mismatch", "doi_url_mismatch", "empty_document", *FATAL_CONTENT_PATTERNS.keys()}
 )
 
 DOI_PATTERN = _re.compile(r"\b10\.\d{4,9}/[-._;()/:a-z0-9]+\b", _re.IGNORECASE)
@@ -622,6 +627,13 @@ def resolve_agent_browser_mode(cli_mode: str | None) -> str:
     return mode
 
 
+def resolve_scrapling_mode(cli_mode: str | None) -> str:
+    mode = (cli_mode or SCRAPLING_MODE_DEFAULT).lower()
+    if mode not in {"auto", "off", "force"}:
+        raise ValueError(f"Unsupported scrapling mode: {mode}")
+    return mode
+
+
 def resolve_flaresolverr_mode(cli_mode: str | None) -> str:
     mode = (cli_mode or FLARESOLVERR_MODE_DEFAULT or "auto").lower()
     if mode not in {"auto", "off", "force"}:
@@ -637,6 +649,7 @@ def fetch_with_flaresolverr(url: str) -> tuple[str, str]:
     """Fetch URL HTML via FlareSolverr (solves Cloudflare challenges when possible)."""
     if not FLARESOLVERR_URL:
         raise RuntimeError("FLARESOLVERR_URL is not configured")
+    validate_public_url(url)
 
     payload = {
         "cmd": "request.get",
@@ -670,6 +683,7 @@ def fetch_with_flaresolverr(url: str) -> tuple[str, str]:
         raise RuntimeError("FlareSolverr returned Cloudflare challenge page")
     if not isinstance(final_url, str) or not final_url.strip():
         final_url = url
+    validate_public_url(final_url)
     return final_url, html
 
 
@@ -683,51 +697,74 @@ def fetch_with_agent_browser(url: str) -> tuple[str, str]:
     )
     session = f"web-scraper-{secrets.token_hex(6)}"
 
-    run_agent_browser_json(binary, session, ["open", url], env=env, timeout=60)
-    try:
-        run_agent_browser_json(
-            binary,
-            session,
-            ["wait", str(AGENT_BROWSER_SETTLE_MS)],
-            env=env,
-            timeout=20,
-        )
-    except RuntimeError:
-        pass
+    validate_public_url(url)
+    # Ignore ambient authenticated profiles, CDP attachments and saved state.
+    # Names checked against agent-browser 0.41.2 --help.
+    for key in ("AGENT_BROWSER_SESSION", "AGENT_BROWSER_SESSION_NAME", "AGENT_BROWSER_RESTORE",
+                "AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_PROFILE", "AGENT_BROWSER_STATE",
+                "AGENT_BROWSER_CDP", "AGENT_BROWSER_CDP_HEADERS", "AGENT_BROWSER_AUTO_CONNECT",
+                "AGENT_BROWSER_PROVIDER", "AGENT_BROWSER_ENGINE", "AGENT_BROWSER_EXTENSIONS",
+                "AGENT_BROWSER_INIT_SCRIPTS", "AGENT_BROWSER_ENABLE", "AGENT_BROWSER_HEADERS",
+                "AGENT_BROWSER_HEADED"):
+        env.pop(key, None)
+    with tempfile.TemporaryDirectory(prefix="web-scraper-browser-") as config_dir:
+        config = Path(config_dir) / "agent-browser.json"
+        config.write_text('{"headed":false}', encoding="utf-8")
+        env["AGENT_BROWSER_CONFIG"] = str(config)
+        # A unique, unauthenticated session belongs to this acquisition only.
+        try:
+            run_agent_browser_json(binary, session, ["open", url], env=env, timeout=60)
+            try:
+                run_agent_browser_json(
+                    binary,
+                    session,
+                    ["wait", str(AGENT_BROWSER_SETTLE_MS)],
+                    env=env,
+                    timeout=20,
+                )
+            except (RuntimeError, subprocess.TimeoutExpired):
+                pass
 
-    try:
-        run_agent_browser_json(
-            binary,
-            session,
-            ["eval", overlay_cleanup_script(AGENT_BROWSER_OVERLAY_SELECTORS)],
-            env=env,
-            timeout=15,
-        )
-        run_agent_browser_json(binary, session, ["wait", "300"], env=env, timeout=10)
-    except RuntimeError:
-        pass
+            try:
+                run_agent_browser_json(
+                    binary,
+                    session,
+                    ["eval", overlay_cleanup_script(AGENT_BROWSER_OVERLAY_SELECTORS)],
+                    env=env,
+                    timeout=15,
+                )
+                run_agent_browser_json(binary, session, ["wait", "300"], env=env, timeout=10)
+            except (RuntimeError, subprocess.TimeoutExpired):
+                pass
 
-    html_payload = run_agent_browser_json(
-        binary,
-        session,
-        ["eval", "document.documentElement.outerHTML"],
-        env=env,
-        timeout=60,
-    )
-    url_payload = run_agent_browser_json(
-        binary,
-        session,
-        ["eval", "location.href"],
-        env=env,
-        timeout=15,
-    )
-    html = html_payload.get("result", "")
-    final_url = url_payload.get("result", url)
-    if not isinstance(html, str) or not html.strip():
-        raise RuntimeError("agent-browser returned empty HTML")
-    if not isinstance(final_url, str) or not final_url.strip():
-        final_url = url
-    return final_url, html
+            html_payload = run_agent_browser_json(
+                binary,
+                session,
+                ["eval", "document.documentElement.outerHTML"],
+                env=env,
+                timeout=60,
+            )
+            url_payload = run_agent_browser_json(
+                binary,
+                session,
+                ["eval", "location.href"],
+                env=env,
+                timeout=15,
+            )
+            html = html_payload.get("result", "")
+            final_url = url_payload.get("result", url)
+            if not isinstance(html, str) or not html.strip():
+                raise RuntimeError("agent-browser returned empty HTML")
+            if not isinstance(final_url, str) or not final_url.strip():
+                final_url = url
+            validate_public_url(final_url)
+            return final_url, html
+        finally:
+            try:
+                run_agent_browser_json(binary, session, ["close"], env=env, timeout=10)
+            except (RuntimeError, subprocess.TimeoutExpired):
+                pass
+
 
 def detect_study_type(
     title: str,
@@ -930,7 +967,7 @@ def download_remote_file(url: str, suffix: str) -> Path:
         url,
         headers={"User-Agent": "content-agent-tools/0.1"},
     )
-    with urlopen(request, timeout=60) as response:
+    with public_urlopen(request, timeout=60) as response:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
             handle.write(response.read())
             return Path(handle.name)
@@ -1241,6 +1278,8 @@ def fatal_extraction_issues(data: dict[str, Any]) -> list[str]:
     body = normalize_whitespace(str(data.get("body_markdown", "")))
     combined = f"{title}\n{abstract}\n{body}"
     issues: list[str] = []
+    if not abstract and not body:
+        issues.append("empty_document")
 
     issues.extend(
         issue
@@ -1342,7 +1381,10 @@ def scrape_pdf_source(source: str) -> dict[str, Any]:
     return data
 
 
-def extract_article_data(url: str, raw_html: str, retrieval_backend: str) -> dict[str, Any]:
+def extract_article_data(
+    url: str, raw_html: str, retrieval_backend: str, *, enrich: bool = True,
+    requested_url: str | None = None,
+) -> dict[str, Any]:
     soup = BeautifulSoup(raw_html, "html.parser")
 
     title = choose_complete_text(
@@ -1383,6 +1425,7 @@ def extract_article_data(url: str, raw_html: str, retrieval_backend: str) -> dic
         *meta_values(soup, "name", "dc.identifier"),
         *meta_values(soup, "name", "DC.Identifier"),
         url,
+        requested_url or "",
         *selector_texts(identity_soup, '[class*="doi"]'),
     )
     journal = first_nonempty(
@@ -1430,7 +1473,7 @@ def extract_article_data(url: str, raw_html: str, retrieval_backend: str) -> dic
 
     data: dict[str, Any] = {
         "url": url,
-        "requested_url": url,
+        "requested_url": requested_url or url,
         "title": title.strip(),
         "authors": authors.strip(),
         "abstract": abstract.strip(),
@@ -1448,15 +1491,21 @@ def extract_article_data(url: str, raw_html: str, retrieval_backend: str) -> dic
         "source_kind": "html",
         "scraped_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
     }
-    pre_enrichment_issues = fatal_extraction_issues(data)
+    # A metadata-only article landing page can recover an abstract through the
+    # existing enrichment path. A blank document or interstitial cannot.
+    pre_enrichment_issues = [issue for issue in fatal_extraction_issues(data) if issue != "empty_document"]
+    if title == "Unknown Title" and not abstract and not body_markdown:
+        pre_enrichment_issues.append("empty_document")
     if pre_enrichment_issues:
         # Do not query Crossref by an interstitial/error title. Some generic bot
         # titles are also titles of real publications, which can otherwise
         # attach a credible but unrelated DOI to the bad packet.
         data["enrichment_skipped"] = "fatal_retrieval_issue"
         data["retrieval_issues"] = pre_enrichment_issues
-    else:
+    elif enrich:
         enrich_metadata(data)
+    else:
+        data["enrichment_skipped"] = "evaluation"
     data["reference_url"] = citation_url(data)
     data["citation_metadata_issues"] = metadata_quality_issues(data)
     data["footnote_markdown"] = footnote_markdown(data)
@@ -1559,154 +1608,149 @@ def markdown_packet(data: dict[str, str]) -> str:
     )
 
 
-def scrape_with_scrapling(url: str) -> dict[str, Any]:
+def _guard_browser_requests(page) -> None:
+    # Check browser redirects and subresources before navigation. DNS validation
+    # cannot replace network-level egress controls (including DNS rebinding).
+    def route_request(route):
+        try:
+            validate_public_url(route.request.url)
+        except ValueError:
+            route.abort()
+        else:
+            route.continue_()
+    page.route("**/*", route_request)
+
+
+def fetch_with_scrapling(url: str) -> tuple[str, str]:
+    validate_public_url(url)
     page = StealthyFetcher.fetch(
         url,
         headless=True,
         network_idle=True,
         disable_resources=False,
+        timeout=SCRAPLING_TIMEOUT_MS,
+        solve_cloudflare=False,
+        google_search=False,
+        page_setup=_guard_browser_requests,
+        additional_args={"service_workers": "block"},
     )
-    if not page or not page.html_content:
+    if page is None or not page.html_content:
         raise RuntimeError("Failed to fetch: empty response")
-    return extract_article_data(url, page.html_content, retrieval_backend="scrapling")
+    final_url = page.url or url
+    validate_public_url(final_url)
+    return final_url, page.html_content
 
 
-def _primary_needs_fallback(primary_data: dict[str, Any] | None, primary_error: Exception | None) -> bool:
-    if primary_error is not None:
-        return True
-    if primary_data is None:
-        return True
-    return bool(primary_data.get("retrieval_issues"))
+def validate_requested_identity(data: dict[str, Any], source: str) -> dict[str, Any]:
+    expected = normalize_doi(source).lower()
+    actual = normalize_doi(str(data.get("doi", ""))).lower()
+    if expected and actual and expected != actual:
+        issues = data.setdefault("metadata_consistency_issues", [])
+        if "doi_url_mismatch" not in issues:
+            issues.append("doi_url_mismatch")
+    data["retrieval_issues"] = extraction_issues(data)
+    return data
 
 
-def _fallback_trigger_reasons(
-    primary_data: dict[str, Any] | None,
-    primary_error: Exception | None,
-    forced: bool,
-) -> list[str]:
-    if forced:
-        return ["forced"]
-    if primary_error is not None:
-        return [f"primary_fetch_failed: {primary_error}"]
-    if primary_data is not None:
-        return list(primary_data.get("retrieval_issues", [])) or ["quality_check"]
-    return ["no_primary_data"]
+def scrape_with_scrapling(url: str) -> dict[str, Any]:
+    final_url, html = fetch_with_scrapling(url)
+    return validate_requested_identity(
+        extract_article_data(final_url, html, retrieval_backend="scrapling", requested_url=url), url
+    )
+
+
+def retrieval_rank(data: dict[str, Any]) -> tuple[bool, bool, int]:
+    # A long partial document must never displace a valid article or abstract.
+    issues = extraction_issues(data)
+    return not has_fatal_extraction_issue(data), not bool(issues), extraction_score(data)
 
 
 def scrape_article(
     source: str,
     agent_browser_mode: str | None = None,
     flaresolverr_mode: str | None = None,
+    scrapling_mode: str | None = None,
 ) -> dict[str, Any]:
     original_source = source
     source, url_rewrites = canonicalize_article_url(source)
 
     def _annotate(data: dict[str, Any]) -> dict[str, Any]:
-        data.setdefault("requested_url", original_source)
+        data["requested_url"] = original_source
         if url_rewrites:
             data["url_rewrites"] = list(url_rewrites)
             data["canonical_url"] = source
         return data
 
-    # Local PDFs and remote PDFs that were not rewritten (e.g. open bioRxiv PDF).
+    # Publisher PDF gates normalize above; true PDF sources bypass HTML backends.
     if looks_like_pdf_source(source):
         return _annotate(scrape_pdf_source(source))
-
     if not looks_like_url(source):
         raise ValueError("source must be an HTTP(S) URL or a local PDF path")
+    validate_public_url(source)
 
-    ab_mode = resolve_agent_browser_mode(agent_browser_mode)
-    fs_mode = resolve_flaresolverr_mode(flaresolverr_mode)
-    force_ab = ab_mode == "force" or force_agent_browser_for_url(source)
-    force_fs = fs_mode == "force"
-    force_any = force_ab or force_fs
-    binary = resolve_agent_browser_binary(AGENT_BROWSER_COMMAND)
-
-    primary_data: dict[str, Any] | None = None
-    primary_error: Exception | None = None
+    modes = {
+        "scrapling": resolve_scrapling_mode(scrapling_mode),
+        "flaresolverr": resolve_flaresolverr_mode(flaresolverr_mode),
+        "agent-browser": resolve_agent_browser_mode(agent_browser_mode),
+    }
+    if modes["agent-browser"] != "off" and force_agent_browser_for_url(source):
+        modes["agent-browser"] = "force"
+    forced = any(mode == "force" for mode in modes.values())
     best: dict[str, Any] | None = None
     errors: list[str] = []
+    trigger_reasons = ["forced"] if forced else []
 
-    if not force_any:
+    for backend, mode in modes.items():
+        # Force means only explicitly forced backends run. Multiple forces compare
+        # those backends in the normal order; explicit off always wins domain rules.
+        if mode == "off" or (forced and mode != "force"):
+            continue
+        if not forced and best is not None and not extraction_issues(best):
+            break
+        if backend == "flaresolverr" and not flaresolverr_configured():
+            errors.append("flaresolverr: not configured")
+            continue
+        if backend == "agent-browser" and not resolve_agent_browser_binary(AGENT_BROWSER_COMMAND):
+            errors.append("agent-browser: not installed")
+            continue
         try:
-            primary_data = scrape_with_scrapling(source)
-            primary_data["retrieval_issues"] = extraction_issues(primary_data)
-            best = primary_data
+            if backend == "scrapling":
+                candidate = scrape_with_scrapling(source)
+            else:
+                fetch = fetch_with_flaresolverr if backend == "flaresolverr" else fetch_with_agent_browser
+                final_url, html = fetch(source)
+                candidate = extract_article_data(final_url, html, retrieval_backend=backend, requested_url=original_source)
+            validate_requested_identity(candidate, original_source)
+            if backend != "scrapling":
+                candidate["fallback_used"] = True
+                candidate["fallback_trigger"] = list(trigger_reasons)
+            if best is None or retrieval_rank(candidate) > retrieval_rank(best):
+                best = candidate
+            else:
+                prefix = backend.replace("-", "_")
+                best[f"{prefix}_attempted"] = True
+                best[f"{prefix}_kept_other"] = True
+                if backend == "flaresolverr" and best.get("retrieval_backend") == "scrapling":
+                    best["flaresolverr_kept_primary"] = True
+            if not trigger_reasons:
+                trigger_reasons = extraction_issues(candidate)
         except Exception as exc:
-            primary_error = exc
-            errors.append(f"scrapling: {exc}")
-
-    needs_fallback = force_any or _primary_needs_fallback(primary_data, primary_error)
-    trigger_reasons = _fallback_trigger_reasons(primary_data, primary_error, forced=force_any)
-
-    # Prefer FlareSolverr for Cloudflare / weak primary content (proven on Sage etc.).
-    should_try_fs = (
-        fs_mode != "off"
-        and flaresolverr_configured()
-        and (
-            force_fs
-            or needs_fallback
-        )
-    )
-    if should_try_fs:
-        try:
-            final_url, html = fetch_with_flaresolverr(source)
-            fs_data = extract_article_data(final_url, html, retrieval_backend="flaresolverr")
-            fs_data["requested_url"] = original_source
-            fs_data["retrieval_issues"] = extraction_issues(fs_data)
-            fs_data["fallback_used"] = True
-            fs_data["fallback_trigger"] = trigger_reasons
-            if best is None or extraction_score(fs_data) >= extraction_score(best):
-                best = fs_data
-            elif primary_data is not None:
-                primary_data["flaresolverr_attempted"] = True
-                primary_data["flaresolverr_kept_primary"] = True
-        except Exception as fs_exc:
-            errors.append(f"flaresolverr: {fs_exc}")
-            if primary_data is not None:
-                primary_data["flaresolverr_error"] = str(fs_exc)
-
-    # Still weak? Try agent-browser next.
-    still_weak = best is None or bool(best.get("retrieval_issues")) or force_ab
-    should_try_ab = ab_mode != "off" and binary and still_weak
-    if should_try_ab:
-        try:
-            final_url, rendered_html = fetch_with_agent_browser(source)
-            ab_data = extract_article_data(final_url, rendered_html, retrieval_backend="agent-browser")
-            ab_data["requested_url"] = original_source
-            ab_data["retrieval_issues"] = extraction_issues(ab_data)
-            ab_data["fallback_used"] = True
-            ab_data["fallback_trigger"] = trigger_reasons
-            if best is None or extraction_score(ab_data) >= extraction_score(best):
-                best = ab_data
-            elif best is not None:
-                best["agent_browser_attempted"] = True
-                best["agent_browser_kept_other"] = True
-        except Exception as ab_exc:
-            errors.append(f"agent-browser: {ab_exc}")
+            errors.append(f"{backend}: {exc}")
+            if not trigger_reasons:
+                trigger_reasons = ["primary_fetch_failed"]
             if best is not None:
-                best["agent_browser_error"] = str(ab_exc)
+                best[f"{backend.replace('-', '_')}_error"] = str(exc)
 
     if best is not None:
         if errors:
-            best.setdefault("retrieval_errors", errors)
+            best["retrieval_errors"] = errors
         if has_fatal_extraction_issue(best):
-            issues = ", ".join(extraction_issues(best))
-            detail = "; ".join(errors)
             raise RuntimeError(
-                f"All retrieval paths produced an invalid publisher/interstitial packet ({issues})"
-                + (f": {detail}" if detail else "")
+                "All retrieval paths produced an invalid publisher/interstitial packet ("
+                + ", ".join(extraction_issues(best)) + ")"
             )
         return _annotate(best)
-
-    if primary_error is not None:
-        detail = "; ".join(errors) if errors else str(primary_error)
-        raise RuntimeError(f"All retrieval paths failed: {detail}") from primary_error
-
-    raise RuntimeError(
-        "No retrieval path produced data"
-        + (f" ({'; '.join(errors)})" if errors else "")
-    )
+    raise RuntimeError("No retrieval path produced data" + (f" ({'; '.join(errors)})" if errors else ""))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1729,6 +1773,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="json",
         help="Output format. JSON is the default agent contract.",
     )
+    parser.add_argument("--scrapling-mode", choices=["auto", "off", "force"],
+                        help="Primary Scrapling mode: auto, off, or force.")
     parser.add_argument(
         "--agent-browser-mode",
         choices=["auto", "off", "force"],
@@ -1752,6 +1798,7 @@ def main(argv: list[str] | None = None) -> int:
             args.source,
             agent_browser_mode=args.agent_browser_mode,
             flaresolverr_mode=args.flaresolverr_mode,
+            scrapling_mode=args.scrapling_mode,
         )
         packet = markdown_packet(data)
 

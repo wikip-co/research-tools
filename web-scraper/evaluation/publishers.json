@@ -1,0 +1,46 @@
+{
+  "mode": "live",
+  "cases": [
+    {
+      "id": "sage-historical",
+      "url": "https://journals.sagepub.com/doi/full/10.1177/25151355251387927",
+      "expected_doi": "10.1177/25151355251387927",
+      "access_reviewed": true
+    },
+    {
+      "id": "sage-pdf-normalization",
+      "url": "https://journals.sagepub.com/doi/pdf/10.1177/09603271251323134",
+      "expected_doi": "10.1177/09603271251323134",
+      "access_reviewed": true
+    },
+    {
+      "id": "wiley-pdfdirect",
+      "url": "https://acsess.onlinelibrary.wiley.com/doi/pdfdirect/10.1002/agg2.70313",
+      "expected_doi": "10.1002/agg2.70313",
+      "access_reviewed": true
+    },
+    {
+      "id": "ovid-historical",
+      "url": "https://www.ovid.com/jnls/example/fulltext/10.1097/ms9.0000000000005494~significant-anti-myeloma",
+      "access_reviewed": false,
+      "note": "Synthetic fixture path is not a real publication URL; do not fetch."
+    },
+    {
+      "id": "ovid-doi",
+      "url": "https://doi.org/10.1097/MS9.0000000000005494",
+      "expected_doi": "10.1097/MS9.0000000000005494",
+      "access_reviewed": false,
+      "note": "Destination policy and access must be reviewed before permitting redirect retrieval."
+    },
+    {
+      "id": "open-pdf",
+      "url": "https://arxiv.org/pdf/1706.03762.pdf",
+      "access_reviewed": true
+    },
+    {
+      "id": "open-pmc",
+      "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC6357411/",
+      "access_reviewed": true
+    }
+  ]
+}

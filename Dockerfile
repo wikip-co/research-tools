@@ -18,11 +18,13 @@ RUN apt-get update \
         npm \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir uv
-RUN npm install -g @googleworkspace/cli agent-browser@0.23.0
+RUN pip install --no-cache-dir uv==0.13.4
+RUN npm install -g @googleworkspace/cli agent-browser@0.41.2
 RUN agent-browser install --with-deps
 
 WORKDIR /opt/content-agent-tools
+COPY pyproject.toml uv.lock ./
+COPY content-agent-core ./content-agent-core
 COPY gmail-reader ./gmail-reader
 COPY wiki-automation ./wiki-automation
 COPY image-upload ./image-upload
@@ -31,11 +33,8 @@ COPY agent-workflow ./agent-workflow
 COPY scripts ./scripts
 
 RUN chmod +x /opt/content-agent-tools/agent-workflow /opt/content-agent-tools/scripts/*.sh \
-    && uv sync --directory /opt/content-agent-tools/gmail-reader --frozen \
-    && uv sync --directory /opt/content-agent-tools/wiki-automation --frozen \
-    && uv sync --directory /opt/content-agent-tools/image-upload --frozen \
-    && uv sync --directory /opt/content-agent-tools/web-scraper --frozen \
-    && /opt/content-agent-tools/web-scraper/.venv/bin/playwright install --with-deps chromium \
+    && uv sync --all-packages --frozen \
+    && /opt/content-agent-tools/.venv/bin/playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
 
 ENTRYPOINT ["/opt/content-agent-tools/scripts/entrypoint.sh"]

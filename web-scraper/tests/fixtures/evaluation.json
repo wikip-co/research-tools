@@ -1,0 +1,45 @@
+{
+  "mode": "offline",
+  "cases": [
+    {
+      "id": "complete-primary",
+      "url": "https://example.org/article",
+      "expected_doi": "10.1000/example-doi",
+      "fixtures": {
+        "scrapling": "complete_article.html",
+        "flaresolverr": "complete_article.html",
+        "agent-browser": "complete_article.html"
+      }
+    },
+    {
+      "id": "challenge-recovery",
+      "url": "https://example.org/article",
+      "expected_doi": "10.1000/example-doi",
+      "fixtures": {
+        "scrapling": "challenge.html",
+        "flaresolverr": "complete_article.html",
+        "agent-browser": "article.html"
+      }
+    },
+    {
+      "id": "unavailable-browser",
+      "url": "https://example.org/article",
+      "expected_doi": "10.1000/example-doi",
+      "fixtures": {
+        "scrapling": "article.html",
+        "flaresolverr": "complete_article.html",
+        "agent-browser": "error:unavailable"
+      }
+    },
+    {
+      "id": "all-invalid",
+      "url": "https://example.org/article",
+      "expected_doi": "10.1000/example-doi",
+      "fixtures": {
+        "scrapling": "challenge.html",
+        "flaresolverr": "empty.html",
+        "agent-browser": "challenge.html"
+      }
+    }
+  ]
+}
