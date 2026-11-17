@@ -3009,8 +3009,27 @@ def validate_rendered_markdown(
     return ValidationResult(not issues, sorted(set(issues)))
 
 
+COMMAND_TIMEOUT_SECONDS = 600
+
+
 def run_command(args: list[str], *, cwd: Path) -> str:
-    result = subprocess.run(args, cwd=cwd, text=True, capture_output=True)
+    # git and gh run unattended here. A credential prompt or a stalled remote
+    # must fail the job rather than hold its lease until an outer timeout.
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1"}
+    try:
+        result = subprocess.run(
+            args,
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"command timed out after {COMMAND_TIMEOUT_SECONDS}s: {' '.join(args[:3])}"
+        ) from exc
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "command failed")
     return result.stdout.strip()

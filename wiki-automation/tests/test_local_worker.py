@@ -136,5 +136,26 @@ class LocalWorkerTests(unittest.TestCase):
         )
 
 
+class RunCommandTests(unittest.TestCase):
+    def test_commands_cannot_prompt_and_time_out(self) -> None:
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        from wiki_automation import local_publish
+
+        seen = local_publish.run_command(
+            [sys.executable, "-c", "import os; print(os.environ['GIT_TERMINAL_PROMPT'], os.environ['GH_PROMPT_DISABLED'])"],
+            cwd=Path.cwd(),
+        )
+        self.assertEqual(seen, "0 1")
+        with mock.patch.object(local_publish, "COMMAND_TIMEOUT_SECONDS", 0.2):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                local_publish.run_command(
+                    [sys.executable, "-c", "import time; time.sleep(5)"], cwd=Path.cwd()
+                )
+        self.assertTrue(issubclass(subprocess.TimeoutExpired, Exception))
+
+
 if __name__ == "__main__":
     unittest.main()
