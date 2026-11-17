@@ -5,12 +5,13 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/anthony/Research/research-tools
-Environment=PATH=/home/anthony/.local/bin:/home/anthony/n/bin:/usr/local/bin:/usr/bin:/bin
-Environment=GMAIL_READER_DB=/home/anthony/Research/research-tools/gmail-reader/data/scholar-alerts.db
-Environment=CONTENT_REPO_ROOT=/home/anthony/Research/content
-Environment=LOCAL_LLM_BASE_URL=http://127.0.0.1:8080/v1
-Environment=LOCAL_LLM_MODEL=qwen3.8-27b-q8_0-mtp
-ExecStart=/home/anthony/Research/research-tools/agent-workflow enqueue-local-backlog --domain "Natural Healing" --min-score 12 --limit 1
-ExecStart=/home/anthony/Research/research-tools/agent-workflow local-worker --max-jobs 1 --publish
+# Paths assume the workspace at ~/Projects/Research. GMAIL_READER_DB,
+# CONTENT_REPO_ROOT, LOCAL_LLM_BASE_URL and LOCAL_LLM_MODEL come from .env.
+WorkingDirectory=%h/Projects/Research/research-tools
+EnvironmentFile=-%h/Projects/Research/research-tools/.env
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/Projects/Research/research-tools/agent-workflow enqueue-local-backlog --domain "Natural Healing" --min-score 12 --limit 1
+# The lease outlives the unit timeout, so a run killed by systemd is reclaimed
+# by a later run instead of overlapping with it.
+ExecStart=%h/Projects/Research/research-tools/agent-workflow local-worker --max-jobs 1 --lease-seconds 3600 --publish
 TimeoutStartSec=45min

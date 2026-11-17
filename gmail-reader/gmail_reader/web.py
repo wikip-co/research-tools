@@ -1501,9 +1501,9 @@ def render_job_detail(db_path: Path, job_id: int) -> str | None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run a LAN-accessible Gmail Reader triage UI.")
+    parser = argparse.ArgumentParser(description="Run the Gmail Reader triage UI (loopback by default; set --host for LAN access).")
     parser.add_argument("--db", default=os.environ.get("GMAIL_READER_DB", str(DEFAULT_DB_PATH)))
-    parser.add_argument("--host", default=os.environ.get("GMAIL_READER_WEB_HOST", "0.0.0.0"))
+    parser.add_argument("--host", default=os.environ.get("GMAIL_READER_WEB_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("GMAIL_READER_WEB_PORT", "8765")))
     parser.add_argument(
         "--workspace-root",

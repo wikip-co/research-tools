@@ -105,14 +105,14 @@ ensure_content_repo_ready() {
 
   if [[ -n "$source_path" && -d "$source_path/.git" ]]; then
     require_command git
-    git clone --local --no-hardlinks "$source_path" "$CONTENT_REPO_ROOT" >/dev/null 2>&1
+    git clone --quiet --local --no-hardlinks "$source_path" "$CONTENT_REPO_ROOT" >&2
     export CONTENT_REPO_ROOT
     return
   fi
 
   if [[ -n "$CONTENT_REPO_GIT_URL" ]]; then
     require_command git
-    git clone --branch "$CONTENT_REPO_REF" "$CONTENT_REPO_GIT_URL" "$CONTENT_REPO_ROOT" >/dev/null 2>&1
+    git clone --quiet --branch "$CONTENT_REPO_REF" "$CONTENT_REPO_GIT_URL" "$CONTENT_REPO_ROOT" >&2
     export CONTENT_REPO_ROOT
     return
   fi
@@ -131,11 +131,24 @@ sync_content_repo() {
   ensure_content_repo_ready
   require_command git
 
+  local failed=0 step
   if [[ -n "$CONTENT_REPO_REF" ]]; then
-    git -C "$CONTENT_REPO_ROOT" fetch --all --prune >/dev/null 2>&1 || true
-    git -C "$CONTENT_REPO_ROOT" checkout "$CONTENT_REPO_REF" >/dev/null 2>&1 || true
-    git -C "$CONTENT_REPO_ROOT" pull --ff-only >/dev/null 2>&1 || true
+    for step in "fetch --all --prune --quiet" "checkout --quiet $CONTENT_REPO_REF" "pull --ff-only --quiet"; do
+      # shellcheck disable=SC2086  # each step is a fixed word list
+      if ! git -C "$CONTENT_REPO_ROOT" $step >&2; then
+        printf 'Content repo sync step failed: git %s\n' "$step" >&2
+        failed=1
+        break
+      fi
+    done
   fi
+  jq -n \
+    --arg root "$CONTENT_REPO_ROOT" \
+    --arg ref "$CONTENT_REPO_REF" \
+    --arg head "$(git -C "$CONTENT_REPO_ROOT" rev-parse HEAD 2>/dev/null || true)" \
+    --argjson ok "$([[ "$failed" -eq 0 ]] && printf true || printf false)" \
+    '{ok: $ok, result: {content_repo_root: $root, ref: $ref, head: $head}}'
+  return "$failed"
 }
 
 require_command() {
@@ -150,7 +163,8 @@ usage() {
   cat <<'EOF'
 Usage:
   agent-workflow setup                              # Install dependencies and verify auth
-  agent-workflow doctor                             # JSON health check for tooling and repo wiring
+  agent-workflow doctor [--deep]                    # JSON health check; --deep also probes the database,
+                                                    # queue, local model endpoint and GitHub auth
   agent-workflow sync-content-repo                  # Refresh the managed content repo clone
   agent-workflow backlog [wiki-automation backlog args...]
   agent-workflow queue [wiki-automation queue args...]
@@ -163,6 +177,9 @@ Usage:
   agent-workflow enqueue-local-backlog --domain "Natural Healing" [--min-score N] [--limit N]
   agent-workflow local-worker [--max-jobs N] [--publish]
   agent-workflow requeue-local <job-id> --reason "why this job should run again"
+  agent-workflow jobs [--state STATE] [--limit N]      # List local publishing jobs
+  agent-workflow queue-status                       # Queue depth, in-flight leases and stuck jobs
+  agent-workflow reconcile-jobs                     # Fail jobs that exhausted attempts with a dead worker
   agent-workflow ingest-paper "<source>" [wiki-automation ingest-paper args...]
   agent-workflow append "<url>" --target "<path>" [wiki-automation append args...]
   agent-workflow tags [--suggest "<query>"] [--limit N]
@@ -186,6 +203,15 @@ run_wiki_command() {
   ensure_content_repo_ready
   CONTENT_REPO_ROOT="$CONTENT_REPO_ROOT" AGENT_TOOLS_ROOT="$AGENT_TOOLS_ROOT" \
     uv run --directory "$WIKI_AUTOMATION_DIR" wiki-automation "$@"
+}
+
+run_gmail_command() {
+  require_command uv
+  local args=()
+  if [[ -n "${GMAIL_READER_DB:-}" ]]; then
+    args+=(--db "$GMAIL_READER_DB")
+  fi
+  uv run --directory "$AGENT_TOOLS_ROOT/gmail-reader" gmail-reader "${args[@]}" "$@"
 }
 
 run_queue() {
@@ -391,13 +417,22 @@ run_triage_ui() {
   uv run --directory "$AGENT_TOOLS_ROOT/gmail-reader" gmail-reader-web "${args[@]}"
 }
 
+json_bool() {
+  if "$@" >/dev/null 2>&1; then printf 'true'; else printf 'false'; fi
+}
+
 run_doctor() {
   require_command jq
+  local deep=0
+  if [[ "${1:-}" == "--deep" ]]; then
+    deep=1
+  fi
   local managed_exists=0 configured_root_exists=0 source_exists=0
   local resolved_source=""
   local repo_root_display="${CONTENT_REPO_ROOT:-$CONTENT_REPO_MANAGED_ROOT}"
+  local problems=() cmd
 
-  if [[ -n "${CONTENT_REPO_ROOT:-}" && -d "$CONTENT_REPO_ROOT" ]]; then
+  if [[ -n "${CONTENT_REPO_ROOT:-}" ]] && is_git_repo "$CONTENT_REPO_ROOT"; then
     configured_root_exists=1
   fi
   if is_git_repo "$CONTENT_REPO_MANAGED_ROOT"; then
@@ -408,6 +443,65 @@ run_doctor() {
     source_exists=1
   fi
 
+  # ok now reflects whether the core workflow can run. It used to be a
+  # constant true.
+  for cmd in uv git; do
+    command -v "$cmd" >/dev/null 2>&1 || problems+=("required command missing: $cmd")
+  done
+  if [[ -n "${CONTENT_REPO_ROOT:-}" && "$configured_root_exists" -eq 0 ]]; then
+    problems+=("CONTENT_REPO_ROOT is not a git repository: $CONTENT_REPO_ROOT")
+  elif [[ -z "${CONTENT_REPO_ROOT:-}" && "$managed_exists" -eq 0 && "$source_exists" -eq 0 && -z "${CONTENT_REPO_GIT_URL:-}" ]]; then
+    problems+=("no content repository is configured or cloneable")
+  fi
+  if [[ -n "${GMAIL_READER_DB:-}" && ! -f "$GMAIL_READER_DB" ]]; then
+    problems+=("GMAIL_READER_DB does not exist: $GMAIL_READER_DB")
+  fi
+
+  local deep_json='null'
+  if [[ "$deep" -eq 1 ]]; then
+    local db_path="${GMAIL_READER_DB:-$AGENT_TOOLS_ROOT/gmail-reader/data/scholar-alerts.db}"
+    local queue_json='null' db_state="missing" llm_state="not_configured" gh_state="unavailable"
+    local content_head="" llm_url="${LOCAL_LLM_BASE_URL:-}"
+    if [[ -f "$db_path" ]]; then
+      if queue_json="$(uv run --directory "$AGENT_TOOLS_ROOT/gmail-reader" gmail-reader --db "$db_path" publication-queue-status 2>/dev/null | jq -c '.result')" \
+        && [[ -n "$queue_json" && "$queue_json" != "null" ]]; then
+        db_state="readable"
+        if [[ "$(jq -r '.unrecoverable_without_reconcile' <<<"$queue_json")" != "0" ]]; then
+          problems+=("publishing queue has abandoned final-attempt jobs; run: agent-workflow reconcile-jobs")
+        fi
+      else
+        queue_json='null'
+        db_state="unreadable"
+        problems+=("publishing database could not be read: $db_path")
+      fi
+    fi
+    if [[ -n "$llm_url" ]]; then
+      if command -v curl >/dev/null 2>&1 && curl --silent --fail --max-time 5 "${llm_url%/}/models" >/dev/null 2>&1; then
+        llm_state="reachable"
+      else
+        llm_state="unreachable"
+      fi
+    fi
+    if command -v gh >/dev/null 2>&1; then
+      if gh auth status >/dev/null 2>&1; then gh_state="authenticated"; else gh_state="unauthenticated"; fi
+    fi
+    if is_git_repo "$repo_root_display"; then
+      content_head="$(git -C "$repo_root_display" rev-parse --short HEAD 2>/dev/null || true)"
+    fi
+    deep_json="$(jq -n \
+      --arg db_path "$db_path" --arg db_state "$db_state" --arg llm_url "$llm_url" \
+      --arg llm_state "$llm_state" --arg gh_state "$gh_state" --arg content_head "$content_head" \
+      --argjson queue "$queue_json" \
+      '{database: {path: $db_path, state: $db_state}, queue: $queue,
+        local_llm: {base_url: $llm_url, state: $llm_state},
+        github_auth: $gh_state, content_repo_head: $content_head}')"
+  fi
+
+  local problems_json='[]'
+  if ((${#problems[@]})); then
+    problems_json="$(printf '%s\n' "${problems[@]}" | jq -R . | jq -cs .)"
+  fi
+
   jq -n \
     --arg agent_tools_root "$AGENT_TOOLS_ROOT" \
     --arg content_repo_root "$repo_root_display" \
@@ -416,20 +510,23 @@ run_doctor() {
     --arg git_url "${CONTENT_REPO_GIT_URL:-}" \
     --arg ref "$CONTENT_REPO_REF" \
     --arg gmail_db "${GMAIL_READER_DB:-}" \
-    --argjson uv "$(command -v uv >/dev/null 2>&1 && printf 'true' || printf 'false')" \
-    --argjson gh "$(command -v gh >/dev/null 2>&1 && printf 'true' || printf 'false')" \
-    --argjson gws "$(command -v gws >/dev/null 2>&1 && printf 'true' || printf 'false')" \
-    --argjson git "$(command -v git >/dev/null 2>&1 && printf 'true' || printf 'false')" \
-    --argjson vault "$(command -v vault >/dev/null 2>&1 && printf 'true' || printf 'false')" \
-    --argjson agent_browser "$(command -v agent-browser >/dev/null 2>&1 && printf 'true' || printf 'false')" \
+    --argjson uv "$(json_bool command -v uv)" \
+    --argjson gh "$(json_bool command -v gh)" \
+    --argjson gws "$(json_bool command -v gws)" \
+    --argjson git "$(json_bool command -v git)" \
+    --argjson vault "$(json_bool command -v vault)" \
+    --argjson agent_browser "$(json_bool command -v agent-browser)" \
     --argjson configured_root_exists "$([[ "$configured_root_exists" -eq 1 ]] && printf 'true' || printf 'false')" \
     --argjson managed_root_exists "$([[ "$managed_exists" -eq 1 ]] && printf 'true' || printf 'false')" \
     --argjson source_exists "$([[ "$source_exists" -eq 1 ]] && printf 'true' || printf 'false')" \
     --argjson cloudinary_env "$([[ -n "${CLOUDINARY_CLOUD_NAME:-}" && -n "${CLOUDINARY_API_KEY:-}" && -n "${CLOUDINARY_API_SECRET:-}" ]] && printf 'true' || printf 'false')" \
     --argjson google_env "$([[ -n "${GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE:-}" ]] && printf 'true' || printf 'false')" \
+    --argjson problems "$problems_json" \
+    --argjson deep "$deep_json" \
     '{
-      ok: true,
-      result: {
+      ok: ($problems | length == 0),
+      result: ({
+        problems: $problems,
         commands: {
           uv: $uv,
           gh: $gh,
@@ -454,8 +551,9 @@ run_doctor() {
           cloudinary_env_loaded: $cloudinary_env,
           google_env_loaded: $google_env
         }
-      }
+      } + (if $deep == null then {} else {deep: $deep} end))
     }'
+  ((${#problems[@]} == 0))
 }
 
 run_setup() {
@@ -471,7 +569,7 @@ run_setup() {
       printf '  ✓ %s found\n' "$cmd"
     else
       printf '  ✗ %s NOT FOUND\n' "$cmd"
-      ((errors++))
+      errors=$((errors + 1))
     fi
   done
   printf '\n'
@@ -483,7 +581,7 @@ run_setup() {
     printf 'OK\n'
   else
     printf 'FAILED\n'
-    ((errors++))
+    errors=$((errors + 1))
   fi
   printf '\n'
 
@@ -501,7 +599,7 @@ run_setup() {
     else
       printf '    configure CONTENT_REPO_SOURCE_PATH or CONTENT_REPO_GIT_URL\n'
     fi
-    ((errors++))
+    errors=$((errors + 1))
   fi
   printf '\n'
 
@@ -545,11 +643,11 @@ run_setup() {
       printf 'OK\n'
     else
       printf 'FAILED (run: source auth-bootstrap)\n'
-      ((errors++))
+      errors=$((errors + 1))
     fi
   else
     printf '  ✗ Cannot connect to Vault\n'
-    ((errors++))
+    errors=$((errors + 1))
   fi
   printf '\n'
 
@@ -564,11 +662,11 @@ run_setup() {
       printf 'OK\n'
     else
       printf 'FAILED\n'
-      ((errors++))
+      errors=$((errors + 1))
     fi
   else
     printf '  ✗ No credentials loaded (run: source auth-bootstrap)\n'
-    ((errors++))
+    errors=$((errors + 1))
   fi
   printf '\n'
 
@@ -579,7 +677,7 @@ run_setup() {
     printf '==> Setup completed with %d error(s).\n' "$errors"
   fi
 
-  return $errors
+  ((errors == 0))
 }
 
 main() {
@@ -630,6 +728,15 @@ main() {
       ;;
     requeue-local)
       run_requeue_local "$@"
+      ;;
+    jobs)
+      run_gmail_command publication-jobs "$@"
+      ;;
+    queue-status)
+      run_gmail_command publication-queue-status "$@"
+      ;;
+    reconcile-jobs)
+      run_gmail_command reconcile-publication-jobs "$@"
       ;;
     ingest-paper)
       run_ingest_paper "$@"
