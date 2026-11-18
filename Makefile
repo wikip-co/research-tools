@@ -1,7 +1,20 @@
-.PHONY: sync test test-root test-core test-gmail test-web test-wiki test-image
+.PHONY: sync lint lint-python lint-shell test test-root test-core test-gmail test-web test-wiki test-image
 
 sync:
 	uv sync --all-packages
+
+RUFF_VERSION ?= 0.17.5
+SHELL_SCRIPTS := agent-workflow auth-bootstrap gmail-reader/backup-db.sh scripts/entrypoint.sh scripts/fetch-vault-secrets.sh scripts/sync-scholar-alerts
+
+lint: lint-python lint-shell
+
+# Correctness rules only: syntax errors, undefined names, unused imports.
+lint-python:
+	uvx ruff@$(RUFF_VERSION) check --select E9,F .
+
+lint-shell:
+	bash -n $(SHELL_SCRIPTS)
+	uvx --from shellcheck-py shellcheck --severity=error $(SHELL_SCRIPTS)
 
 test: test-root test-core test-gmail test-web test-wiki test-image
 

@@ -5,9 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/anthony/Research/research-tools
-Environment=PATH=/home/anthony/.local/bin:/home/anthony/n/bin:/usr/local/bin:/usr/bin:/bin
-Environment=GMAIL_READER_DB=/home/anthony/Research/research-tools/gmail-reader/data/scholar-alerts.db
+# Paths assume the workspace at ~/Projects/Research; GMAIL_READER_DB comes from .env.
+WorkingDirectory=%h/Projects/Research/research-tools
+EnvironmentFile=-%h/Projects/Research/research-tools/.env
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=GMAIL_SYNC_DAYS_BACK=3
 Environment=GMAIL_SYNC_MAX_MESSAGES=100
-ExecStart=/home/anthony/Research/research-tools/scripts/sync-scholar-alerts
+ExecStart=%h/Projects/Research/research-tools/scripts/sync-scholar-alerts

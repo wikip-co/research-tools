@@ -5,14 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/anthony/Research/research-tools
-Environment=PATH=/home/anthony/.local/bin:/home/anthony/n/bin:/usr/local/bin:/usr/bin:/bin
-Environment=GMAIL_READER_DB=/home/anthony/Research/research-tools/gmail-reader/data/scholar-alerts.db
-Environment=GMAIL_READER_WEB_HOST=0.0.0.0
-Environment=GMAIL_READER_WEB_PORT=8765
-Environment=RESEARCH_WORKSPACE_ROOT=/home/anthony/Research
-Environment=CODEX_BIN=/home/anthony/n/bin/codex
-ExecStart=/home/anthony/Research/research-tools/agent-workflow triage-ui --host 0.0.0.0 --port 8765
+# Paths assume the workspace at ~/Projects/Research. Host settings such as
+# GMAIL_READER_DB, CONTENT_REPO_ROOT and RESEARCH_WORKSPACE_ROOT come from .env.
+WorkingDirectory=%h/Projects/Research/research-tools
+EnvironmentFile=-%h/Projects/Research/research-tools/.env
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Loopback unless .env sets GMAIL_READER_WEB_HOST. The UI can start a
+# full-access agent run, so LAN exposure is an explicit choice.
+ExecStart=%h/Projects/Research/research-tools/agent-workflow triage-ui
 Restart=on-failure
 RestartSec=5
 

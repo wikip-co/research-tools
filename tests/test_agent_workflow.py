@@ -117,6 +117,50 @@ class AgentWorkflowTests(unittest.TestCase):
             self.assertEqual(payload["result"]["matches"][0]["path"], "article.md")
             self.assertTrue((managed_repo / ".git").exists())
 
+    def test_doctor_fails_when_configured_content_repo_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = _isolated_content_env(Path(tmpdir) / "none", Path(tmpdir) / "managed")
+            env["CONTENT_REPO_ROOT"] = str(Path(tmpdir) / "missing")
+            result = subprocess.run(
+                ["./agent-workflow", "doctor"], cwd=REPO_ROOT, env=env, capture_output=True, text=True
+            )
+            payload = json.loads(result.stdout)
+            self.assertEqual(result.returncode, 1)
+            self.assertFalse(payload["ok"])
+            self.assertIn("CONTENT_REPO_ROOT is not a git repository", payload["result"]["problems"][0])
+
+    def test_sync_content_repo_reports_failure_instead_of_silent_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "content"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                 "commit", "--allow-empty", "-m", "init"],
+                cwd=repo, check=True, capture_output=True,
+            )
+            env = _isolated_content_env(repo, Path(tmpdir) / "managed")
+            env["CONTENT_REPO_ROOT"] = str(repo)
+            env["CONTENT_REPO_REF"] = "no-such-ref"
+            result = subprocess.run(
+                ["./agent-workflow", "sync-content-repo"],
+                cwd=REPO_ROOT, env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertFalse(json.loads(result.stdout)["ok"])
+            self.assertIn("sync step failed", result.stderr)
+
+    def test_setup_counts_errors_without_tripping_errexit(self) -> None:
+        # Under `set -e`, ((errors++)) returns status 1 when errors is 0 and
+        # aborted setup at its first failed check, hiding every later one.
+        script = (REPO_ROOT / "agent-workflow").read_text(encoding="utf-8")
+        self.assertNotIn("((errors++))", script)
+        probe = subprocess.run(
+            ["bash", "-c", "set -euo pipefail; errors=0; errors=$((errors + 1)); echo reached"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(probe.stdout.strip(), "reached")
+
 
 if __name__ == "__main__":
     unittest.main()

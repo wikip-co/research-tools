@@ -111,8 +111,16 @@ PUBLICATION_JOB_STATES = (
 )
 PUBLICATION_JOB_TERMINAL_STATES = {"pr_open", "duplicate", "rejected", "failed"}
 PUBLICATION_JOB_STOPPED_STATES = {*PUBLICATION_JOB_TERMINAL_STATES, "needs_review", "validated"}
+PUBLICATION_JOB_WAITING_STATES = {"queued", "retry"}
+SQLITE_BUSY_TIMEOUT_SECONDS = 30
 DEFAULT_RESEARCH_DOMAIN = "Natural Healing"
 PUBLICATION_CLAIM_POLICIES = {"integrated", "strict", "compendium"}
+
+
+class LeaseLostError(ValueError):
+    """A worker reported on a publication job it no longer owns."""
+
+    code = "lease_lost"
 
 
 def utc_now_iso() -> str:
@@ -463,7 +471,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     update_job_parser.add_argument("job_id", type=int)
     update_job_parser.add_argument("--state", required=True, choices=PUBLICATION_JOB_STATES)
-    update_job_parser.add_argument("--worker", default="")
+    update_job_parser.add_argument(
+        "--worker",
+        default="",
+        help="Reporting worker. The job must still be leased to it; omit for an operator override.",
+    )
+    update_job_parser.add_argument(
+        "--lease-token", type=int, default=0, help="Lease generation returned by claim-publication."
+    )
+    update_job_parser.add_argument(
+        "--lease-seconds", type=int, default=0, help="Renew the lease on a progress report."
+    )
     update_job_parser.add_argument("--paper-key", default="")
     update_job_parser.add_argument("--packet-path", default="")
     update_job_parser.add_argument("--target-path", default="")
@@ -473,6 +491,15 @@ def build_parser() -> argparse.ArgumentParser:
     update_job_parser.add_argument("--error", default="")
     update_job_parser.add_argument("--result-json", default="")
     update_job_parser.add_argument("--run-id", default="")
+
+    subparsers.add_parser(
+        "reconcile-publication-jobs",
+        help="Fail jobs that exhausted their attempts and can no longer be claimed.",
+    )
+    subparsers.add_parser(
+        "publication-queue-status",
+        help="Summarize queue depth, in-flight leases and stuck jobs (read-only).",
+    )
 
     requeue_job_parser = subparsers.add_parser(
         "requeue-publication",
@@ -608,7 +635,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def ensure_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    # The triage UI, the sync timer and the publishing worker share this file.
+    # Wait for a competing writer instead of failing with "database is locked".
+    conn = sqlite3.connect(path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
     conn.execute(
         """
@@ -697,6 +726,7 @@ def ensure_db(path: Path) -> sqlite3.Connection:
             max_attempts INTEGER NOT NULL DEFAULT 3,
             lease_owner TEXT,
             lease_expires_at TEXT,
+            lease_token INTEGER NOT NULL DEFAULT 0,
             next_run_at TEXT,
             run_id TEXT,
             packet_path TEXT,
@@ -748,11 +778,15 @@ def ensure_db(path: Path) -> sqlite3.Connection:
         "ALTER TABLE publication_jobs ADD COLUMN claim_policy TEXT NOT NULL DEFAULT 'integrated'",
         "ALTER TABLE publication_jobs ADD COLUMN next_run_at TEXT",
         "ALTER TABLE publication_jobs ADD COLUMN run_id TEXT",
+        "ALTER TABLE publication_jobs ADD COLUMN lease_token INTEGER NOT NULL DEFAULT 0",
     ):
         try:
             conn.execute(migration)
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        except sqlite3.OperationalError as exc:
+            # Only "already migrated" is expected. A locked or corrupt database
+            # must not be mistaken for a current schema.
+            if "duplicate column name" not in str(exc).lower():
+                raise
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(status, alert_name)"
     )
@@ -774,9 +808,8 @@ def ensure_db(path: Path) -> sqlite3.Connection:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_papers_workflow_state ON papers(workflow_state)"
     )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_publication_jobs_state ON publication_jobs(state, next_run_at, lease_expires_at, created_at)"
-    )
+    # idx_publication_jobs_state duplicated the claimable index column for column.
+    conn.execute("DROP INDEX IF EXISTS idx_publication_jobs_state")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_publication_jobs_claimable ON publication_jobs(state, next_run_at, lease_expires_at, created_at)"
     )
@@ -2181,6 +2214,9 @@ def claim_publication_job(
     expires = (now_dt + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds").replace("+00:00", "Z")
     conn = ensure_db(db_path)
     conn.execute("BEGIN IMMEDIATE")
+    # A worker that died on its last attempt would otherwise leave the job
+    # leased forever: it is expired, but no longer eligible for another claim.
+    _reconcile_exhausted_jobs(conn, now)
     row = conn.execute(
         """
         SELECT * FROM publication_jobs
@@ -2210,6 +2246,7 @@ def claim_publication_job(
         """
         UPDATE publication_jobs
         SET state = 'leased', attempt_count = attempt_count + 1,
+            lease_token = lease_token + 1,
             lease_owner = ?, lease_expires_at = ?, updated_at = ?,
             started_at = COALESCE(started_at, ?), error = NULL,
             next_run_at = NULL, finished_at = NULL
@@ -2222,7 +2259,19 @@ def claim_publication_job(
         INSERT INTO publication_job_events (job_id, from_state, to_state, detail_json, created_at)
         VALUES (?, ?, 'leased', ?, ?)
         """,
-        (row["job_id"], row["state"], json.dumps({"worker": worker, "lease_expires_at": expires}), now),
+        (
+            row["job_id"],
+            row["state"],
+            json.dumps(
+                {
+                    "worker": worker,
+                    "lease_expires_at": expires,
+                    "lease_token": int(row["lease_token"] or 0) + 1,
+                    "superseded_worker": row["lease_owner"] or "",
+                }
+            ),
+            now,
+        ),
     )
     conn.commit()
     claimed = conn.execute("SELECT * FROM publication_jobs WHERE job_id = ?", (row["job_id"],)).fetchone()
@@ -2236,89 +2285,264 @@ def set_publication_job_state(
     job_id: int,
     state: str,
     worker: str = "",
+    lease_token: int = 0,
+    lease_seconds: int = 0,
     **updates: str,
 ) -> dict[str, Any]:
+    """Record a job transition.
+
+    A call that names a ``worker`` is a worker report and is fenced: the job
+    must still be leased to that worker, and to the same lease generation when
+    ``lease_token`` is given. A superseded, stopped or reconciled lease raises
+    ``LeaseLostError`` and changes nothing. A call without ``worker`` is an
+    explicit operator override and is recorded as such.
+    """
     if state not in PUBLICATION_JOB_STATES:
         raise ValueError(f"Invalid publication job state: {state}")
+    if lease_seconds and lease_seconds < 60:
+        raise ValueError("lease_seconds must be at least 60")
+    result_json = updates.get("result_json", "")
+    if result_json:
+        json.loads(result_json)
     conn = ensure_db(db_path)
-    row = conn.execute("SELECT * FROM publication_jobs WHERE job_id = ?", (job_id,)).fetchone()
-    if not row:
-        conn.close()
-        raise ValueError(f"Publication job not found: {job_id}")
-    if worker and row["lease_owner"] and worker != row["lease_owner"]:
-        conn.close()
-        raise ValueError(f"Publication job {job_id} is leased by another worker")
+    try:
+        # Check ownership and write in one transaction so a concurrent claim
+        # cannot slip in between the read and the update.
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM publication_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        if not row:
+            raise ValueError(f"Publication job not found: {job_id}")
+        if worker:
+            owner = row["lease_owner"] or ""
+            if owner != worker:
+                raise LeaseLostError(
+                    f"Publication job {job_id} is not leased by {worker} "
+                    f"(state {row['state']}, owner {owner or 'none'})"
+                )
+            if lease_token and int(row["lease_token"] or 0) != lease_token:
+                raise LeaseLostError(
+                    f"Publication job {job_id} lease {lease_token} was superseded "
+                    f"by lease {row['lease_token']}"
+                )
 
-    now = utc_now_iso()
-    column_map = {
-        "paper_key": "paper_key",
-        "packet_path": "packet_path",
-        "target_path": "target_path",
-        "branch": "branch",
-        "commit": "commit_sha",
-        "pr": "pr_url",
-        "error": "error",
-        "result_json": "result_json",
-        "run_id": "run_id",
-    }
-    assignments = ["state = ?", "updated_at = ?"]
-    params: list[Any] = [state, now]
-    detail: dict[str, Any] = {"worker": worker} if worker else {}
-    for key, column in column_map.items():
-        value = updates.get(key, "")
-        if not value:
-            continue
-        if key == "result_json":
-            json.loads(value)
-        assignments.append(f"{column} = ?")
-        params.append(value)
-        detail[key] = value
-    if state == "retry":
-        delay_seconds = min(300 * (2 ** max(int(row["attempt_count"]) - 1, 0)), 21600)
-        next_run_at = (
-            datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
-        ).isoformat(timespec="seconds").replace("+00:00", "Z")
-        assignments.extend(
-            [
-                "lease_owner = NULL",
-                "lease_expires_at = NULL",
-                "next_run_at = ?",
-                "finished_at = NULL",
-            ]
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+        column_map = {
+            "paper_key": "paper_key",
+            "packet_path": "packet_path",
+            "target_path": "target_path",
+            "branch": "branch",
+            "commit": "commit_sha",
+            "pr": "pr_url",
+            "error": "error",
+            "result_json": "result_json",
+            "run_id": "run_id",
+        }
+        assignments = ["state = ?", "updated_at = ?"]
+        params: list[Any] = [state, now]
+        detail: dict[str, Any] = {"worker": worker} if worker else {"actor": "operator"}
+        for key, column in column_map.items():
+            value = updates.get(key, "")
+            if not value:
+                continue
+            assignments.append(f"{column} = ?")
+            params.append(value)
+            detail[key] = value
+        if state == "retry":
+            delay_seconds = min(300 * (2 ** max(int(row["attempt_count"]) - 1, 0)), 21600)
+            next_run_at = (
+                now_dt + timedelta(seconds=delay_seconds)
+            ).isoformat(timespec="seconds").replace("+00:00", "Z")
+            assignments.extend(
+                [
+                    "lease_owner = NULL",
+                    "lease_expires_at = NULL",
+                    "next_run_at = ?",
+                    "finished_at = NULL",
+                ]
+            )
+            params.append(next_run_at)
+            detail["retry_delay_seconds"] = delay_seconds
+            detail["next_run_at"] = next_run_at
+        elif state in PUBLICATION_JOB_STOPPED_STATES:
+            assignments.extend(["finished_at = ?", "lease_owner = NULL", "lease_expires_at = NULL"])
+            params.append(now)
+            assignments.append("next_run_at = NULL")
+        else:
+            assignments.append("next_run_at = NULL")
+            if worker and lease_seconds:
+                # Progress from the owning worker is a heartbeat.
+                renewed = (
+                    now_dt + timedelta(seconds=lease_seconds)
+                ).isoformat(timespec="seconds").replace("+00:00", "Z")
+                assignments.append("lease_expires_at = ?")
+                params.append(renewed)
+                detail["lease_expires_at"] = renewed
+        params.append(job_id)
+        conn.execute(
+            f"UPDATE publication_jobs SET {', '.join(assignments)} WHERE job_id = ?",
+            params,
         )
-        params.append(next_run_at)
-        detail["retry_delay_seconds"] = delay_seconds
-        detail["next_run_at"] = next_run_at
-    elif state in PUBLICATION_JOB_STOPPED_STATES:
-        assignments.extend(["finished_at = ?", "lease_owner = NULL", "lease_expires_at = NULL"])
-        params.append(now)
-        assignments.append("next_run_at = NULL")
-    else:
-        assignments.append("next_run_at = NULL")
-    params.append(job_id)
-    conn.execute(
-        f"UPDATE publication_jobs SET {', '.join(assignments)} WHERE job_id = ?",
-        params,
-    )
-    conn.execute(
-        """
-        INSERT INTO publication_job_events (job_id, from_state, to_state, detail_json, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (job_id, row["state"], state, json.dumps(detail), now),
-    )
-    if state in {"pr_open", "duplicate", "rejected"}:
         conn.execute(
             """
-            UPDATE articles SET processed_at = COALESCE(processed_at, ?), updated_at = ?
-            WHERE article_key = ?
+            INSERT INTO publication_job_events (job_id, from_state, to_state, detail_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (now, now, row["article_key"]),
+            (job_id, row["state"], state, json.dumps(detail), now),
         )
-    conn.commit()
-    updated = conn.execute("SELECT * FROM publication_jobs WHERE job_id = ?", (job_id,)).fetchone()
-    conn.close()
-    return {"job": dict(updated)}
+        if state in {"pr_open", "duplicate", "rejected"}:
+            conn.execute(
+                """
+                UPDATE articles SET processed_at = COALESCE(processed_at, ?), updated_at = ?
+                WHERE article_key = ?
+                """,
+                (now, now, row["article_key"]),
+            )
+        conn.commit()
+        updated = conn.execute("SELECT * FROM publication_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return {"job": dict(updated)}
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _reconcile_exhausted_jobs(conn: sqlite3.Connection, now: str) -> list[dict[str, Any]]:
+    """Fail jobs that used every attempt and can never be claimed again.
+
+    Runs inside the caller's transaction. Two shapes qualify: an in-flight job
+    whose lease expired on its final attempt (the worker died), and a job left
+    in ``retry`` with no attempts remaining.
+    """
+    stopped = sorted(PUBLICATION_JOB_STOPPED_STATES | PUBLICATION_JOB_WAITING_STATES)
+    placeholders = ",".join("?" for _ in stopped)
+    rows = conn.execute(
+        f"""
+        SELECT * FROM publication_jobs
+        WHERE attempt_count >= max_attempts
+          AND (
+            state = 'retry'
+            OR (
+              state NOT IN ({placeholders})
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at <= ?
+            )
+          )
+        ORDER BY job_id
+        """,
+        (*stopped, now),
+    ).fetchall()
+    reconciled: list[dict[str, Any]] = []
+    for row in rows:
+        reason = (
+            "No attempts remained for a scheduled retry"
+            if row["state"] == "retry"
+            else f"Lease expired during the final attempt while {row['state']}; "
+            "the worker reported no outcome"
+        )
+        error = f"{reason} ({row['attempt_count']}/{row['max_attempts']} attempts used)."
+        if row["error"]:
+            error = f"{error} Last error: {row['error']}"
+        conn.execute(
+            """
+            UPDATE publication_jobs
+            SET state = 'failed', lease_owner = NULL, lease_expires_at = NULL,
+                next_run_at = NULL, finished_at = ?, updated_at = ?, error = ?
+            WHERE job_id = ?
+            """,
+            (now, now, error[:4000], row["job_id"]),
+        )
+        detail = {
+            "action": "reconcile_exhausted_attempts",
+            "reason": reason,
+            "abandoned_worker": row["lease_owner"] or "",
+            "lease_expires_at": row["lease_expires_at"] or "",
+            "attempt_count": row["attempt_count"],
+            "max_attempts": row["max_attempts"],
+        }
+        conn.execute(
+            """
+            INSERT INTO publication_job_events (job_id, from_state, to_state, detail_json, created_at)
+            VALUES (?, ?, 'failed', ?, ?)
+            """,
+            (row["job_id"], row["state"], json.dumps(detail), now),
+        )
+        reconciled.append({"job_id": row["job_id"], "from_state": row["state"], "reason": reason})
+    return reconciled
+
+
+def reconcile_publication_jobs(*, db_path: Path) -> dict[str, Any]:
+    """Operator entry point for the reconciliation that every claim performs."""
+    conn = ensure_db(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        reconciled = _reconcile_exhausted_jobs(conn, utc_now_iso())
+        conn.commit()
+    finally:
+        conn.close()
+    return {"reconciled_count": len(reconciled), "jobs": reconciled}
+
+
+def publication_queue_status(*, db_path: Path) -> dict[str, Any]:
+    """Read-only queue health summary for operators, doctor and the triage UI."""
+    conn = ensure_db(db_path)
+    try:
+        now = utc_now_iso()
+        counts = {
+            row["state"]: int(row["count"])
+            for row in conn.execute(
+                "SELECT state, COUNT(*) AS count FROM publication_jobs GROUP BY state"
+            )
+        }
+        stopped = sorted(PUBLICATION_JOB_STOPPED_STATES | PUBLICATION_JOB_WAITING_STATES)
+        placeholders = ",".join("?" for _ in stopped)
+        in_flight = [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT job_id, state, lease_owner, lease_expires_at, attempt_count,
+                       max_attempts, updated_at,
+                       CASE WHEN lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+                            THEN 1 ELSE 0 END AS lease_expired
+                FROM publication_jobs
+                WHERE state NOT IN ({placeholders})
+                ORDER BY job_id
+                """,
+                (now, *stopped),
+            )
+        ]
+        oldest_waiting = conn.execute(
+            """
+            SELECT MIN(created_at) AS created_at FROM publication_jobs
+            WHERE state IN ('queued', 'retry')
+            """
+        ).fetchone()["created_at"]
+        claimable = conn.execute(
+            """
+            SELECT COUNT(*) AS count FROM publication_jobs
+            WHERE attempt_count < max_attempts
+              AND (state = 'queued'
+                   OR (state = 'retry' AND (next_run_at IS NULL OR next_run_at <= ?)))
+            """,
+            (now,),
+        ).fetchone()["count"]
+    finally:
+        conn.close()
+    expired = [job for job in in_flight if job["lease_expired"]]
+    return {
+        "checked_at": now,
+        "total": sum(counts.values()),
+        "counts": {state: counts.get(state, 0) for state in PUBLICATION_JOB_STATES},
+        "claimable_now": int(claimable),
+        "awaiting_human": counts.get("needs_review", 0) + counts.get("validated", 0),
+        "oldest_waiting_created_at": oldest_waiting,
+        "in_flight": in_flight,
+        "expired_leases": len(expired),
+        "unrecoverable_without_reconcile": sum(
+            1 for job in expired if job["attempt_count"] >= job["max_attempts"]
+        ),
+    }
 
 
 def requeue_publication_job(
@@ -2620,6 +2844,8 @@ def main(argv: list[str] | None = None) -> int:
                 job_id=args.job_id,
                 state=args.state,
                 worker=args.worker,
+                lease_token=args.lease_token,
+                lease_seconds=args.lease_seconds,
                 paper_key=args.paper_key,
                 packet_path=args.packet_path,
                 target_path=args.target_path,
@@ -2630,6 +2856,10 @@ def main(argv: list[str] | None = None) -> int:
                 result_json=args.result_json,
                 run_id=args.run_id,
             )
+        elif args.command == "reconcile-publication-jobs":
+            result = reconcile_publication_jobs(db_path=db_path)
+        elif args.command == "publication-queue-status":
+            result = publication_queue_status(db_path=db_path)
         elif args.command == "requeue-publication":
             result = requeue_publication_job(
                 db_path=db_path,
@@ -2647,7 +2877,11 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"Unsupported command: {args.command}")
             return 1
     except Exception as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
+        failure: dict[str, Any] = {"ok": False, "error": str(exc)}
+        code = getattr(exc, "code", "")
+        if isinstance(code, str) and code:
+            failure["code"] = code
+        print(json.dumps(failure), file=sys.stderr)
         return 1
 
     print(json.dumps({"ok": True, "result": result}, indent=2))

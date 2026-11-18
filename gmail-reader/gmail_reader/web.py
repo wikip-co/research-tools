@@ -1,25 +1,134 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import functools
 import html
+import ipaddress
 import json
 import os
 import re
 import shutil
+import signal
+import socket
 import sqlite3
 import subprocess
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from .app import DEFAULT_DB_PATH, ensure_db, utc_now_iso
+from .app import (
+    DEFAULT_DB_PATH,
+    PUBLICATION_JOB_STATES,
+    ensure_db,
+    publication_queue_status,
+    reconcile_publication_jobs,
+    requeue_publication_job,
+    utc_now_iso,
+)
 
 ARTICLE_STATUSES = ("selected", "review", "rejected", "invalid")
 JOB_STATES = ("queued", "running", "completed", "failed")
 PR_URL_PATTERN = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+")
+MAX_FORM_BYTES = 1_000_000
+LOCAL_NAME_SUFFIXES = (".lan", ".local", ".home", ".internal", ".home.arpa", ".localdomain")
+SECURITY_HEADERS = (
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "same-origin"),
+    (
+        "Content-Security-Policy",
+        "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+        "connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    ),
+)
+# One unattended agent run at a time: concurrent runs edit the same content
+# checkout and open competing pull requests.
+CODEX_RUN_LOCK = threading.Lock()
+# A run holds CODEX_RUN_LOCK for its whole lifetime, so a hung run would block
+# every later one. Runs past this deadline are stopped and marked failed.
+DEFAULT_CODEX_TIMEOUT_SECONDS = 3 * 60 * 60
+CODEX_STOP_GRACE_SECONDS = 15
+
+
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def codex_launcher_enabled() -> bool:
+    return not env_flag("GMAIL_READER_WEB_DISABLE_CODEX")
+
+
+def host_name(value: str) -> str:
+    """Return the lower-case host part of a Host header or URL authority."""
+    value = (value or "").strip().lower()
+    if value.startswith("["):
+        return value[1:].split("]", 1)[0]
+    return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
+
+
+@functools.lru_cache(maxsize=1)
+def machine_host_names() -> frozenset[str]:
+    # getfqdn can wait on DNS; resolve once, not on every request.
+    return frozenset({"localhost", socket.gethostname().lower(), socket.getfqdn().lower()})
+
+
+def allowed_host_names() -> set[str]:
+    names = set(machine_host_names())
+    extra = os.environ.get("GMAIL_READER_WEB_ALLOWED_HOSTS", "")
+    names.update(item.strip().lower() for item in extra.split(",") if item.strip())
+    return names
+
+
+def is_allowed_host(host_header: str) -> bool:
+    """Accept only names that can belong to this machine.
+
+    A public DNS name pointed at a LAN address (DNS rebinding) makes a browser
+    treat this UI as same-origin with an attacker's page. IP literals, bare
+    host names, local-only suffixes and explicitly allowed names cannot be
+    registered by a third party.
+    """
+    name = host_name(host_header)
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    if "." not in name or name in allowed_host_names():
+        return True
+    return name.endswith(LOCAL_NAME_SUFFIXES)
+
+
+def is_same_origin_request(headers: Any) -> bool:
+    """Reject state-changing requests that a different site asked the browser to send.
+
+    Non-browser clients send none of these headers and are allowed; browsers
+    always send at least one of them on a cross-site POST.
+    """
+    fetch_site = (headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if fetch_site and fetch_site not in {"same-origin", "none"}:
+        return False
+    host = (headers.get("Host") or "").strip().lower()
+    for header in ("Origin", "Referer"):
+        value = (headers.get(header) or "").strip()
+        if not value:
+            continue
+        if value == "null":
+            return False
+        return urlparse(value).netloc.lower() == host
+    return True
+
+
+def safe_return_to(value: str) -> str:
+    """Only redirect back into this application."""
+    if value.startswith("/") and not value.startswith("//") and "\\" not in value and "\n" not in value and "\r" not in value:
+        return value
+    return "/"
 
 
 def env_path(name: str, default: Path) -> Path:
@@ -30,7 +139,11 @@ def env_path(name: str, default: Path) -> Path:
 def default_workspace_root() -> Path:
     current = Path(__file__).resolve()
     for parent in current.parents:
-        if (parent / ".gitmodules").is_file() and (parent / "research-tools").is_dir():
+        # The coordinator is a flat workspace described by workspace-repos.tsv;
+        # .gitmodules marks the layout that preceded it.
+        if (parent / "research-tools").is_dir() and (
+            (parent / "workspace-repos.tsv").is_file() or (parent / ".gitmodules").is_file()
+        ):
             return parent
     return current.parents[2]
 
@@ -77,6 +190,152 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn = ensure_db(db_path)
     ensure_web_schema(conn)
     return conn
+
+
+def runner_lock_path(db_path: Path) -> Path:
+    return db_path.with_name(db_path.name + ".triage-ui.lock")
+
+
+def acquire_runner_lock(db_path: Path) -> IO[str] | None:
+    """Take the exclusive per-database runner lock, or return None if it is held.
+
+    Only the lock holder may run Codex jobs or fail interrupted ones, so a second
+    triage UI on the same database cannot rewrite the live instance's jobs. The
+    kernel releases the lock when the holder exits, crashes included.
+    """
+    path = runner_lock_path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
+
+
+def fail_interrupted_jobs(conn: sqlite3.Connection) -> int:
+    """Close out jobs whose runner thread died with a previous server process.
+
+    Call this only while holding the runner lock (acquire_runner_lock): with the
+    lock held no other live process can own a queued or running job.
+    """
+    now = utc_now_iso()
+    cur = conn.execute(
+        """
+        UPDATE article_jobs
+        SET state = 'failed', finished_at = ?,
+            error = 'Interrupted: the triage UI restarted before this job finished. '
+                    || 'Check the content repository for a partial branch before retrying.'
+        WHERE state IN ('queued', 'running')
+        """,
+        (now,),
+    )
+    conn.commit()
+    return int(cur.rowcount)
+
+
+def active_job_article_keys(conn: sqlite3.Connection, article_keys: list[str]) -> set[str]:
+    if not article_keys:
+        return set()
+    placeholders = ",".join("?" for _ in article_keys)
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT ji.article_key
+        FROM article_job_items ji
+        JOIN article_jobs j ON j.job_id = ji.job_id
+        WHERE j.state IN ('queued', 'running') AND ji.article_key IN ({placeholders})
+        """,
+        article_keys,
+    ).fetchall()
+    return {row["article_key"] for row in rows}
+
+
+def fetch_publication_jobs(
+    conn: sqlite3.Connection, state: str = "all", limit: int = 100
+) -> list[dict[str, Any]]:
+    where = "" if state == "all" else "WHERE j.state = ?"
+    values: list[Any] = [] if state == "all" else [state]
+    rows = conn.execute(
+        f"""
+        SELECT j.job_id, j.state, j.attempt_count, j.max_attempts, j.lease_owner,
+               j.lease_expires_at, j.next_run_at, j.domain, j.source_url, j.pr_url,
+               j.target_path, j.error, j.created_at, j.updated_at, j.finished_at,
+               a.title
+        FROM publication_jobs j
+        LEFT JOIN articles a ON a.article_key = j.article_key
+        {where}
+        ORDER BY j.job_id DESC
+        LIMIT ?
+        """,
+        [*values, limit],
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def fetch_publication_job(conn: sqlite3.Connection, job_id: int) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT j.*, a.title FROM publication_jobs j
+        LEFT JOIN articles a ON a.article_key = j.article_key
+        WHERE j.job_id = ?
+        """,
+        (job_id,),
+    ).fetchone()
+    if not row:
+        return None
+    job = dict(row)
+    job["events"] = [
+        dict(event)
+        for event in conn.execute(
+            """
+            SELECT event_id, from_state, to_state, detail_json, created_at
+            FROM publication_job_events WHERE job_id = ? ORDER BY event_id
+            """,
+            (job_id,),
+        )
+    ]
+    return job
+
+
+def health_payload(db_path: Path) -> dict[str, Any]:
+    """Liveness plus the facts an operator or agent needs before trusting the queue."""
+    payload: dict[str, Any] = {"ok": True, "checked_at": utc_now_iso(), "db_path": str(db_path)}
+    try:
+        conn = connect(db_path)
+        try:
+            payload["integrity"] = conn.execute("PRAGMA quick_check").fetchone()[0]
+            payload["articles"] = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
+            payload["unprocessed_selected"] = conn.execute(
+                "SELECT COUNT(*) FROM articles WHERE status = 'selected' AND processed_at IS NULL"
+            ).fetchone()[0]
+            payload["latest_message_imported_at"] = conn.execute(
+                "SELECT MAX(imported_at) FROM messages"
+            ).fetchone()[0]
+            payload["codex_jobs_active"] = conn.execute(
+                "SELECT COUNT(*) FROM article_jobs WHERE state IN ('queued', 'running')"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        queue = publication_queue_status(db_path=db_path)
+        payload["queue"] = {
+            key: queue[key]
+            for key in (
+                "total", "counts", "claimable_now", "awaiting_human",
+                "expired_leases", "unrecoverable_without_reconcile",
+            )
+        }
+        payload["codex_launcher_enabled"] = codex_launcher_enabled()
+        if payload["integrity"] != "ok":
+            payload["ok"] = False
+    except Exception as exc:
+        payload["ok"] = False
+        payload["error"] = str(exc)
+    return payload
 
 
 def html_escape(value: Any) -> str:
@@ -406,11 +665,45 @@ def codex_command(workspace_root: Path) -> list[str]:
     return command
 
 
+def codex_timeout_seconds() -> float:
+    raw = os.environ.get("CODEX_WEB_TIMEOUT_SECONDS", "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_CODEX_TIMEOUT_SECONDS
+    except ValueError:
+        value = DEFAULT_CODEX_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_CODEX_TIMEOUT_SECONDS
+
+
+def stop_process_group(process: subprocess.Popen[str], grace_seconds: float = CODEX_STOP_GRACE_SECONDS) -> None:
+    """Terminate, then kill, the child's whole process group.
+
+    Codex starts its own tool subprocesses; signalling only the direct child can
+    leave a grandchild holding stdout open, so the log loop would never end.
+    """
+    for sig, wait in ((signal.SIGTERM, grace_seconds), (signal.SIGKILL, None)):
+        try:
+            os.killpg(process.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        if wait is None:
+            return
+        try:
+            process.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def run_job(job_id: int, db_path: Path, workspace_root: Path, article_keys: list[str]) -> None:
+    with CODEX_RUN_LOCK:
+        _run_job_locked(job_id, db_path, workspace_root, article_keys)
+
+
+def _run_job_locked(job_id: int, db_path: Path, workspace_root: Path, article_keys: list[str]) -> None:
     conn = connect(db_path)
     try:
         job = fetch_job(conn, job_id)
-        if not job:
+        if not job or job["state"] != "queued":
             return
         command = json.loads(job["command_json"])
         prompt = job["prompt"]
@@ -427,20 +720,42 @@ def run_job(job_id: int, db_path: Path, workspace_root: Path, article_keys: list
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
-        if process.stdin is not None:
-            process.stdin.write(prompt)
-            process.stdin.close()
+        timeout = codex_timeout_seconds()
+        timed_out = threading.Event()
+
+        def expire() -> None:
+            timed_out.set()
+            stop_process_group(process)
+
+        watchdog = threading.Timer(timeout, expire)
+        watchdog.daemon = True
+        watchdog.start()
         log_parts: list[str] = []
-        if process.stdout is not None:
-            for line in process.stdout:
-                log_parts.append(line)
-                append_job_log(conn, job_id, line)
-        return_code = process.wait()
+        try:
+            if process.stdin is not None:
+                process.stdin.write(prompt)
+                process.stdin.close()
+            if process.stdout is not None:
+                for line in process.stdout:
+                    log_parts.append(line)
+                    append_job_log(conn, job_id, line)
+            return_code = process.wait()
+        finally:
+            watchdog.cancel()
+            if process.stdout is not None:
+                process.stdout.close()
         log = "".join(log_parts).strip()
         pr_matches = PR_URL_PATTERN.findall(log)
         pr_url = pr_matches[-1] if pr_matches else ""
-        if return_code == 0 and pr_url:
+        if timed_out.is_set():
+            state = "failed"
+            error = (
+                f"Codex did not finish within {timeout:g}s (CODEX_WEB_TIMEOUT_SECONDS) and was stopped. "
+                "Check the content repository for a partial branch before retrying."
+            )
+        elif return_code == 0 and pr_url:
             mark_articles_processed(conn, article_keys)
             state = "completed"
             error = ""
@@ -486,13 +801,32 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         print(f"{self.address_string()} - {format % args}")
 
+    def send_security_headers(self) -> None:
+        for name, value in SECURITY_HEADERS:
+            self.send_header(name, value)
+
     def send_html(self, body: str, status: HTTPStatus = HTTPStatus.OK) -> None:
         data = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
+        self.send_security_headers()
         self.end_headers()
         self.wfile.write(data)
+
+    def reject(self, status: HTTPStatus, message: str) -> None:
+        self.send_html(render_page(status.phrase, f"<p>{html_escape(message)}</p>"), status)
+
+    def host_allowed(self) -> bool:
+        if is_allowed_host(self.headers.get("Host", "")):
+            return True
+        self.reject(
+            HTTPStatus.FORBIDDEN,
+            "This host name is not recognized as this machine. Use its IP address or local "
+            "name, or add the name to GMAIL_READER_WEB_ALLOWED_HOSTS.",
+        )
+        return False
 
     def send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
         data = json.dumps(payload).encode("utf-8")
@@ -500,6 +834,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
+        self.send_security_headers()
         self.end_headers()
         self.wfile.write(data)
 
@@ -513,16 +848,47 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", location)
         self.end_headers()
 
-    def read_form(self) -> dict[str, list[str]]:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        raw = self.rfile.read(length).decode("utf-8")
+    def read_form(self) -> dict[str, list[str]] | None:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_FORM_BYTES:
+            self.reject(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Form body is missing a valid length or is too large.")
+            return None
+        raw = self.rfile.read(length).decode("utf-8", errors="replace")
         return parse_qs(raw, keep_blank_values=True)
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query, keep_blank_values=True)
+        if parsed.path == "/healthz":
+            # Liveness stays reachable by any name so monitors need no allowlist.
+            payload = health_payload(self.server.db_path)
+            self.send_json(payload, HTTPStatus.OK if payload["ok"] else HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        if not self.host_allowed():
+            return
         if parsed.path == "/":
             self.send_html(render_index(self.server.db_path, params))
+        elif parsed.path == "/api/queue":
+            self.send_json(publication_queue_status(db_path=self.server.db_path))
+        elif parsed.path == "/api/articles":
+            filters = article_filters(params)
+            conn = connect(self.server.db_path)
+            try:
+                articles, total = fetch_articles(conn, filters)
+            finally:
+                conn.close()
+            self.send_json({"filters": filters, "total": total, "articles": articles})
+        elif parsed.path == "/queue":
+            self.send_html(render_queue(self.server.db_path, params))
+        elif (match := re.fullmatch(r"/queue/(\d+)", parsed.path)):
+            body = render_queue_job(self.server.db_path, int(match.group(1)))
+            if body is None:
+                self.reject(HTTPStatus.NOT_FOUND, "Publishing job not found.")
+            else:
+                self.send_html(body)
         elif parsed.path == "/jobs":
             self.send_html(render_jobs(self.server.db_path))
         elif (match := re.fullmatch(r"/jobs/(\d+)/log", parsed.path)):
@@ -537,15 +903,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "Job not found"}, HTTPStatus.NOT_FOUND)
             else:
                 self.send_json(payload)
-        elif parsed.path.startswith("/jobs/"):
-            job_id = parse_int(parsed.path.rsplit("/", 1)[-1], 0, minimum=0, maximum=1_000_000)
-            self.send_html(render_job_detail(self.server.db_path, job_id))
+        elif (match := re.fullmatch(r"/jobs/(\d+)", parsed.path)):
+            body = render_job_detail(self.server.db_path, int(match.group(1)))
+            if body is None:
+                self.reject(HTTPStatus.NOT_FOUND, "Job not found.")
+            else:
+                self.send_html(body)
         else:
             self.send_html(render_page("Not Found", "<p>Not found.</p>"), HTTPStatus.NOT_FOUND)
 
     def do_HEAD(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/" or parsed.path == "/jobs" or parsed.path.startswith("/jobs/"):
+        if parsed.path in {"/", "/jobs", "/queue", "/healthz"} or parsed.path.startswith(("/jobs/", "/queue/")):
             self.send_head_ok()
             return
         self.send_response(HTTPStatus.NOT_FOUND)
@@ -553,17 +922,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if not self.host_allowed():
+            return
+        if not is_same_origin_request(self.headers):
+            self.reject(HTTPStatus.FORBIDDEN, "Cross-site requests cannot change triage state.")
+            return
         form = self.read_form()
+        if form is None:
+            return
+        if parsed.path == "/queue/action":
+            self.handle_queue_action(form)
+            return
         if parsed.path != "/articles/action":
             self.send_html(render_page("Not Found", "<p>Not found.</p>"), HTTPStatus.NOT_FOUND)
             return
         action = (form.get("action", [""])[0] or "").strip()
         article_keys = selected_values(form, "article_key")
-        return_to = form.get("return_to", ["/"])[0] or "/"
+        return_to = safe_return_to(form.get("return_to", ["/"])[0] or "/")
         conn = connect(self.server.db_path)
         try:
             if action.startswith("status:"):
-                update_article_status(conn, article_keys, action.split(":", 1)[1])
+                try:
+                    update_article_status(conn, article_keys, action.split(":", 1)[1])
+                except ValueError as exc:
+                    self.reject(HTTPStatus.BAD_REQUEST, str(exc))
+                    return
                 self.redirect(return_to)
                 return
             if action == "mark_processed":
@@ -571,7 +954,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.redirect(return_to)
                 return
             if action == "process_codex":
-                articles = fetch_articles_by_key(conn, article_keys)
+                if not codex_launcher_enabled():
+                    self.reject(
+                        HTTPStatus.FORBIDDEN,
+                        "The Codex launcher is disabled (GMAIL_READER_WEB_DISABLE_CODEX).",
+                    )
+                    return
+                busy = active_job_article_keys(conn, article_keys)
+                articles = [
+                    article
+                    for article in fetch_articles_by_key(conn, article_keys)
+                    if article["article_key"] not in busy
+                ]
                 if not articles:
                     self.redirect(return_to)
                     return
@@ -594,6 +988,24 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def handle_queue_action(self, form: dict[str, list[str]]) -> None:
+        action = (form.get("action", [""])[0] or "").strip()
+        try:
+            if action == "reconcile":
+                reconcile_publication_jobs(db_path=self.server.db_path)
+                self.redirect("/queue")
+                return
+            if action == "requeue":
+                job_id = int(form.get("job_id", ["0"])[0] or "0")
+                reason = (form.get("reason", [""])[0] or "").strip()
+                requeue_publication_job(db_path=self.server.db_path, job_id=job_id, reason=reason)
+                self.redirect(f"/queue/{job_id}")
+                return
+        except ValueError as exc:
+            self.reject(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        self.redirect("/queue")
+
 
 def render_page(title: str, content: str) -> str:
     return f"""<!doctype html>
@@ -603,36 +1015,46 @@ def render_page(title: str, content: str) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{html_escape(title)}</title>
   <style>
-    :root {{ color-scheme: light; --line: #d8dee4; --bg: #f6f8fa; --ink: #1f2328; --muted: #656d76; --accent: #0969da; }}
-    body {{ margin: 0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; color: var(--ink); background: white; font-size: 14px; }}
+    :root {{ color-scheme: light dark; --line: #d8dee4; --bg: #f6f8fa; --surface: #ffffff; --ink: #1f2328; --muted: #656d76; --accent: #0969da; --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; }}
+    @media (prefers-color-scheme: dark) {{ :root {{ --line: #30363d; --bg: #161b22; --surface: #0d1117; --ink: #e6edf3; --muted: #9198a1; --accent: #4493f8; --ok: #3fb950; --warn: #d29922; --bad: #f85149; }} }}
+    body {{ margin: 0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; color: var(--ink); background: var(--surface); font-size: 14px; }}
     header {{ display: flex; align-items: center; gap: 16px; padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--bg); position: sticky; top: 0; z-index: 5; }}
     header a {{ color: var(--accent); text-decoration: none; font-weight: 600; }}
     main {{ padding: 16px 18px 32px; }}
-    form.filters {{ display: grid; grid-template-columns: minmax(220px, 1fr) repeat(5, max-content); gap: 8px; align-items: end; margin-bottom: 14px; }}
+    form.filters {{ display: grid; grid-template-columns: minmax(220px, 1fr) repeat(6, max-content); gap: 8px; align-items: end; margin-bottom: 14px; }}
     label {{ display: grid; gap: 4px; color: var(--muted); font-size: 12px; }}
     input, select, button, textarea {{ font: inherit; }}
-    input, select {{ border: 1px solid var(--line); border-radius: 6px; padding: 7px 8px; background: white; }}
-    button {{ border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px; background: #fff; cursor: pointer; }}
+    input, select {{ border: 1px solid var(--line); border-radius: 6px; padding: 7px 8px; background: var(--surface); color: var(--ink); }}
+    button {{ border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px; background: var(--surface); color: var(--ink); cursor: pointer; }}
     button.primary {{ background: var(--accent); border-color: var(--accent); color: white; }}
-    button.danger {{ color: #cf222e; }}
+    button.danger {{ color: var(--bad); }}
+    a {{ color: var(--accent); }}
+    a[aria-disabled="true"] {{ color: var(--muted); pointer-events: none; text-decoration: none; }}
+    .cards {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }}
+    .card {{ border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; background: var(--bg); min-width: 110px; }}
+    .card b {{ display: block; font-size: 22px; }}
+    .card.alert {{ border-color: var(--bad); }}
+    .notice {{ border: 1px solid var(--warn); border-radius: 6px; padding: 8px 12px; margin: 10px 0; }}
+    .wrap {{ overflow-wrap: anywhere; }}
     .toolbar {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; }}
     .muted {{ color: var(--muted); }}
     table {{ border-collapse: collapse; width: 100%; table-layout: fixed; }}
     th, td {{ border-bottom: 1px solid var(--line); padding: 8px; vertical-align: top; text-align: left; }}
     th {{ background: var(--bg); font-size: 12px; color: var(--muted); position: sticky; top: 49px; z-index: 4; }}
-    tr:hover td {{ background: #f6f8fa; }}
+    tr:hover td {{ background: var(--bg); }}
     .title {{ font-weight: 650; }}
     .snippet {{ color: var(--muted); margin-top: 4px; max-height: 4.5em; overflow: hidden; }}
-    .pill {{ display: inline-block; border: 1px solid var(--line); border-radius: 999px; padding: 1px 7px; font-size: 12px; background: #fff; margin: 0 4px 4px 0; }}
-    .status-selected {{ border-color: #1a7f37; color: #1a7f37; }}
-    .status-review {{ border-color: #9a6700; color: #9a6700; }}
-    .status-rejected, .status-invalid {{ border-color: #cf222e; color: #cf222e; }}
-    .job-running, .job-queued {{ border-color: #0969da; color: #0969da; }}
-    .job-completed {{ border-color: #1a7f37; color: #1a7f37; }}
-    .job-failed {{ border-color: #cf222e; color: #cf222e; }}
+    .pill {{ display: inline-block; border: 1px solid var(--line); border-radius: 999px; padding: 1px 7px; font-size: 12px; background: var(--surface); margin: 0 4px 4px 0; }}
+    .status-selected {{ border-color: var(--ok); color: var(--ok); }}
+    .status-review {{ border-color: var(--warn); color: var(--warn); }}
+    .status-rejected, .status-invalid {{ border-color: var(--bad); color: var(--bad); }}
+    .job-running, .job-queued, .job-leased, .job-scraping, .job-matching, .job-drafting, .job-validating, .job-publishing {{ border-color: var(--accent); color: var(--accent); }}
+    .job-completed, .job-pr_open, .job-validated {{ border-color: var(--ok); color: var(--ok); }}
+    .job-needs_review, .job-retry, .job-duplicate {{ border-color: var(--warn); color: var(--warn); }}
+    .job-failed, .job-rejected {{ border-color: var(--bad); color: var(--bad); }}
     .links a {{ display: inline-block; margin-right: 8px; color: var(--accent); }}
     .pager {{ display: flex; gap: 8px; align-items: center; margin: 12px 0; }}
-    pre {{ white-space: pre-wrap; overflow: auto; background: #f6f8fa; border: 1px solid var(--line); border-radius: 6px; padding: 12px; }}
+    pre {{ white-space: pre-wrap; overflow: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 12px; }}
     .job-log-header {{ display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin: 20px 0 8px; }}
     .job-log-controls {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }}
     .job-terminal {{ min-height: 420px; max-height: 68vh; overflow: auto; border: 1px solid #30363d; border-radius: 6px; padding: 12px; background: #0d1117; color: #e6edf3; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }}
@@ -663,7 +1085,8 @@ def render_page(title: str, content: str) -> str:
   <header>
     <strong>Research Triage</strong>
     <a href="/">Articles</a>
-    <a href="/jobs">Jobs</a>
+    <a href="/queue">Publishing queue</a>
+    <a href="/jobs">Codex jobs</a>
   </header>
   <main>{content}</main>
 </body>
@@ -699,6 +1122,14 @@ def render_index(db_path: Path, params: dict[str, list[str]]) -> str:
         option(item["alert_name"], filters["alert_name"], f"{item['alert_name']} ({item['article_count']})")
         for item in alerts
     )
+    codex_button = (
+        '<button class="primary" name="action" value="process_codex" '
+        'title="Starts an unattended Codex run with full access to this machine" '
+        'onclick="return confirm(\'Start an unattended Codex run with full access to this machine '
+        'for the checked rows?\')">Process with Codex (full access)</button>'
+        if codex_launcher_enabled()
+        else '<span class="muted">Codex launcher disabled</span>'
+    )
     content = f"""
 <form class="filters" method="get" action="/">
   <label>Search
@@ -724,8 +1155,8 @@ def render_index(db_path: Path, params: dict[str, list[str]]) -> str:
 
 <div class="pager">
   <span class="muted">Showing {filters['offset'] + 1 if total else 0}-{min(filters['offset'] + filters['limit'], total)} of {total}</span>
-  <a href="/?{urlencode(prev_query)}">Previous</a>
-  <a href="/?{urlencode(next_query)}">Next</a>
+  <a href="/?{urlencode(prev_query)}"{'' if filters['offset'] > 0 else ' aria-disabled="true" tabindex="-1"'}>Previous</a>
+  <a href="/?{urlencode(next_query)}"{'' if filters['offset'] + filters['limit'] < total else ' aria-disabled="true" tabindex="-1"'}>Next</a>
 </div>
 
 <form method="post" action="/articles/action">
@@ -738,7 +1169,7 @@ def render_index(db_path: Path, params: dict[str, list[str]]) -> str:
     <button class="danger" name="action" value="status:rejected">Reject</button>
     <button class="danger" name="action" value="status:invalid">Invalid</button>
     <button name="action" value="mark_processed">Mark processed</button>
-    <button class="primary" name="action" value="process_codex">Process with Codex</button>
+    {codex_button}
   </div>
   <table>
     <thead>
@@ -784,7 +1215,7 @@ def render_article_row(article: dict[str, Any]) -> str:
     if workflow:
         state_bits.append(f'<span class="pill">{html_escape(workflow)}</span>')
     if processed:
-        state_bits.append(f'<span class="pill status-selected">processed</span>')
+        state_bits.append('<span class="pill status-selected">processed</span>')
     if job_state:
         state_bits.append(f'<span class="pill job-{html_escape(job_state)}">{html_escape(job_state)}</span>')
     return f"""
@@ -824,7 +1255,8 @@ def render_jobs(db_path: Path) -> str:
         for job in jobs
     )
     content = f"""
-<h1>Jobs</h1>
+<h1>Codex jobs</h1>
+<p class="muted">Runs started from the Articles page. The local publisher's work is under <a href="/queue">Publishing queue</a>.</p>
 <table>
   <thead><tr><th>Job</th><th>State</th><th>Rows</th><th>Created</th><th>Finished</th><th>Result</th></tr></thead>
   <tbody>{rows or '<tr><td colspan="6">No jobs yet.</td></tr>'}</tbody>
@@ -986,7 +1418,120 @@ def render_job_log_script() -> str:
 """
 
 
-def render_job_detail(db_path: Path, job_id: int) -> str:
+def render_queue(db_path: Path, params: dict[str, list[str]]) -> str:
+    state = (params.get("state", ["all"])[0] or "all").strip()
+    if state != "all" and state not in PUBLICATION_JOB_STATES:
+        state = "all"
+    status = publication_queue_status(db_path=db_path)
+    conn = connect(db_path)
+    try:
+        jobs = fetch_publication_jobs(conn, state, 100)
+    finally:
+        conn.close()
+    counts = status["counts"]
+    cards = [
+        ("Claimable now", status["claimable_now"], False),
+        ("In flight", len(status["in_flight"]), False),
+        ("Awaiting human", status["awaiting_human"], False),
+        ("PR open", counts.get("pr_open", 0), False),
+        ("Failed", counts.get("failed", 0), counts.get("failed", 0) > 0),
+        ("Expired leases", status["expired_leases"], status["expired_leases"] > 0),
+    ]
+    card_html = "".join(
+        f'<div class="card{" alert" if alert else ""}"><b>{html_escape(value)}</b>{html_escape(label)}</div>'
+        for label, value, alert in cards
+    )
+    notice = ""
+    if status["unrecoverable_without_reconcile"]:
+        notice = f"""
+<form class="notice" method="post" action="/queue/action">
+  {html_escape(status['unrecoverable_without_reconcile'])} job(s) lost their worker on the final attempt and cannot be claimed again.
+  <button name="action" value="reconcile">Mark them failed</button>
+</form>"""
+    state_options = option("all", state, "All states") + "".join(
+        option(item, state, f"{item} ({counts.get(item, 0)})") for item in PUBLICATION_JOB_STATES
+    )
+    rows = "\n".join(
+        f"""
+        <tr>
+          <td><a href="/queue/{job['job_id']}">{job['job_id']}</a></td>
+          <td><span class="pill job-{html_escape(job['state'])}">{html_escape(job['state'])}</span></td>
+          <td class="wrap"><div class="title">{html_escape(job['title'] or job['source_url'])}</div>
+              <div class="muted">{html_escape(job['error'] or '')}</div></td>
+          <td>{html_escape(job['attempt_count'])}/{html_escape(job['max_attempts'])}</td>
+          <td class="wrap">{html_escape(job['lease_owner'] or '')}<div class="muted">{html_escape(job['lease_expires_at'] or job['next_run_at'] or '')}</div></td>
+          <td>{html_escape(job['updated_at'])}</td>
+          <td>{('<a href="' + html_escape(job['pr_url']) + '" target="_blank" rel="noreferrer">PR</a>') if job.get('pr_url') else ''}</td>
+        </tr>
+        """
+        for job in jobs
+    )
+    content = f"""
+<h1>Publishing queue</h1>
+<p class="muted">Jobs for the local publisher worker. Checked {html_escape(status['checked_at'])}; oldest waiting job created {html_escape(status['oldest_waiting_created_at'] or 'n/a')}.</p>
+<div class="cards">{card_html}</div>
+{notice}
+<form class="toolbar" method="get" action="/queue">
+  <label>State <select name="state">{state_options}</select></label>
+  <button class="primary" type="submit">Filter</button>
+</form>
+<table>
+  <thead><tr><th style="width:60px">Job</th><th style="width:110px">State</th><th>Article</th><th style="width:80px">Attempts</th><th style="width:18%">Lease / next run</th><th style="width:15%">Updated</th><th style="width:50px">PR</th></tr></thead>
+  <tbody>{rows or '<tr><td colspan="7">No publishing jobs match.</td></tr>'}</tbody>
+</table>
+"""
+    return render_page("Publishing queue", content)
+
+
+def render_queue_job(db_path: Path, job_id: int) -> str | None:
+    conn = connect(db_path)
+    try:
+        job = fetch_publication_job(conn, job_id)
+    finally:
+        conn.close()
+    if not job:
+        return None
+    fields = (
+        "source_url", "domain", "claim_policy", "lease_owner", "lease_expires_at",
+        "next_run_at", "run_id", "packet_path", "target_path", "branch", "commit_sha",
+        "pr_url", "error", "created_at", "started_at", "finished_at",
+    )
+    field_rows = "".join(
+        f"<tr><th style='width:160px;position:static'>{html_escape(name)}</th><td class='wrap'>{html_escape(job.get(name))}</td></tr>"
+        for name in fields
+        if job.get(name)
+    )
+    event_rows = "".join(
+        f"<tr><td>{html_escape(event['created_at'])}</td><td>{html_escape(event['from_state'] or '')} → {html_escape(event['to_state'])}</td>"
+        f"<td class='wrap'>{html_escape(event['detail_json'] or '')}</td></tr>"
+        for event in job["events"]
+    )
+    requeue = ""
+    if job["state"] in {"validated", "needs_review", "failed", "rejected"}:
+        requeue = f"""
+<h2>Run again</h2>
+<form class="toolbar" method="post" action="/queue/action">
+  <input type="hidden" name="job_id" value="{html_escape(job_id)}">
+  <label>Reason (recorded in the job history)
+    <input name="reason" required size="60" placeholder="why this job should run again">
+  </label>
+  <button name="action" value="requeue">Requeue</button>
+</form>"""
+    content = f"""
+<h1>Publishing job {html_escape(job_id)}</h1>
+<p><span class="pill job-{html_escape(job['state'])}">{html_escape(job['state'])}</span>
+   <span class="pill">attempt {html_escape(job['attempt_count'])}/{html_escape(job['max_attempts'])}</span></p>
+<p class="title">{html_escape(job.get('title') or '')}</p>
+<table><tbody>{field_rows}</tbody></table>
+{requeue}
+<h2>History</h2>
+<table><thead><tr><th style="width:190px">When</th><th style="width:220px">Transition</th><th>Detail</th></tr></thead>
+<tbody>{event_rows}</tbody></table>
+"""
+    return render_page(f"Publishing job {job_id}", content)
+
+
+def render_job_detail(db_path: Path, job_id: int) -> str | None:
     conn = connect(db_path)
     try:
         job = fetch_job(conn, job_id)
@@ -994,7 +1539,7 @@ def render_job_detail(db_path: Path, job_id: int) -> str:
     finally:
         conn.close()
     if not job:
-        return render_page("Job not found", "<p>Job not found.</p>")
+        return None
     log_text = job.get("log") or job.get("error") or ""
     initial_log = {
         "job_id": job_id,
@@ -1043,9 +1588,9 @@ def render_job_detail(db_path: Path, job_id: int) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run a LAN-accessible Gmail Reader triage UI.")
+    parser = argparse.ArgumentParser(description="Run the Gmail Reader triage UI (loopback by default; set --host for LAN access).")
     parser.add_argument("--db", default=os.environ.get("GMAIL_READER_DB", str(DEFAULT_DB_PATH)))
-    parser.add_argument("--host", default=os.environ.get("GMAIL_READER_WEB_HOST", "0.0.0.0"))
+    parser.add_argument("--host", default=os.environ.get("GMAIL_READER_WEB_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("GMAIL_READER_WEB_PORT", "8765")))
     parser.add_argument(
         "--workspace-root",
@@ -1059,8 +1604,24 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     db_path = Path(args.db).expanduser().resolve()
     workspace_root = Path(args.workspace_root).expanduser().resolve()
-    connect(db_path).close()
+    # Bind first: a launch that loses the port race must exit without touching
+    # the shared database.
     server = TriageServer((args.host, args.port), Handler, db_path=db_path, workspace_root=workspace_root)
+    runner_lock = acquire_runner_lock(db_path)
+    if runner_lock is None:
+        server.server_close()
+        print(
+            f"Another triage UI is already running against {db_path} "
+            f"(lock: {runner_lock_path(db_path)}). Stop it before starting a new one."
+        )
+        return 1
+    startup = connect(db_path)
+    try:
+        interrupted = fail_interrupted_jobs(startup)
+    finally:
+        startup.close()
+    if interrupted:
+        print(f"Marked {interrupted} interrupted Codex job(s) as failed")
     print(f"Serving research triage UI on http://{args.host}:{args.port}")
     print(f"SQLite DB: {db_path}")
     print(f"Workspace root: {workspace_root}")
@@ -1070,6 +1631,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nStopping research triage UI")
     finally:
         server.server_close()
+        runner_lock.close()
     return 0
 
 

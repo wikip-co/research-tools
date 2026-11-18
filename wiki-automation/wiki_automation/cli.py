@@ -9,11 +9,9 @@ import shutil
 import subprocess
 import sys
 import unicodedata
-from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
-from math import log
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
@@ -872,6 +870,14 @@ def gmail_reader_command(*args: str) -> list[str]:
     return command
 
 
+class ToolError(RuntimeError):
+    """A JSON tool reported failure; ``code`` carries its machine-readable reason."""
+
+    def __init__(self, message: str, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def run_json_tool(tool_dir: Path, args: list[str]) -> dict[str, Any]:
     command = ["uv", "run", *args]
     result = subprocess.run(
@@ -894,7 +900,10 @@ def run_json_tool(tool_dir: Path, args: list[str]) -> dict[str, Any]:
         ) from exc
 
     if result.returncode != 0 or not payload.get("ok", False):
-        raise RuntimeError(payload.get("error", f"Command failed: {' '.join(command)}"))
+        raise ToolError(
+            payload.get("error", f"Command failed: {' '.join(command)}"),
+            str(payload.get("code") or ""),
+        )
     return payload["result"]
 
 
@@ -1929,7 +1938,31 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def update_local_job(job_id: int, state: str, worker: str, **values: str) -> dict[str, Any]:
+def publication_job_state_for_stage(stage: str) -> str:
+    """Map run_local_publish's fine-grained stage names onto valid job states.
+
+    set-publication-job-state only accepts PUBLICATION_JOB_STATES, so reporting a
+    sub-stage such as "drafting_attempt_1" verbatim is rejected, which fails the
+    job and leaves its lease unrenewed.
+    """
+    if stage == "balance_repair" or stage.startswith(
+        ("drafting_attempt_", "format_repair_attempt_", "critic_attempt_")
+    ):
+        return "drafting"
+    if stage.startswith("deterministic_validation_attempt_"):
+        return "validating"
+    return stage
+
+
+def update_local_job(
+    job_id: int,
+    state: str,
+    worker: str,
+    *,
+    lease_token: int = 0,
+    lease_seconds: int = 0,
+    **values: str,
+) -> dict[str, Any]:
     command = gmail_reader_command(
         "set-publication-job-state",
         str(job_id),
@@ -1938,6 +1971,10 @@ def update_local_job(job_id: int, state: str, worker: str, **values: str) -> dic
         "--worker",
         worker,
     )
+    if lease_token:
+        command.extend(["--lease-token", str(lease_token)])
+    if lease_seconds:
+        command.extend(["--lease-seconds", str(lease_seconds)])
     option_names = {
         "paper_key": "--paper-key",
         "packet_path": "--packet-path",
@@ -2016,10 +2053,19 @@ def local_worker_command(args: argparse.Namespace) -> dict[str, Any]:
             break
         job = claim["job"]
         job_id = int(job["job_id"])
+        lease_token = int(job.get("lease_token") or 0)
         job_output = Path(args.output_dir).expanduser().resolve() / f"job-{job_id}"
 
-        def progress(state: str) -> None:
-            update_local_job(job_id, state, worker)
+        def progress(state: str, *, job_id: int = job_id, lease_token: int = lease_token) -> None:
+            # Each stage report renews the lease. If another worker has taken
+            # the job this raises, which stops this run before it can publish.
+            update_local_job(
+                job_id,
+                publication_job_state_for_stage(state),
+                worker,
+                lease_token=lease_token,
+                lease_seconds=args.lease_seconds,
+            )
 
         try:
             progress("scraping")
@@ -2064,6 +2110,7 @@ def local_worker_command(args: argparse.Namespace) -> dict[str, Any]:
                 job_id,
                 terminal_state,
                 worker,
+                lease_token=lease_token,
                 packet_path=str(report.get("report_path") or ""),
                 target_path=str(report.get("target_path") or ""),
                 branch=str(report.get("branch") or ""),
@@ -2074,12 +2121,32 @@ def local_worker_command(args: argparse.Namespace) -> dict[str, Any]:
             )
             processed.append({"job_id": job_id, **summary})
         except Exception as exc:
+            if getattr(exc, "code", "") == "lease_lost":
+                # The job belongs to another worker or was stopped by an
+                # operator. Its record is theirs; report and move on.
+                processed.append({"job_id": job_id, "status": "lease_lost", "error": str(exc)})
+                continue
             next_state = (
                 "retry"
                 if int(job["attempt_count"]) < int(job["max_attempts"])
                 else "failed"
             )
-            update_local_job(job_id, next_state, worker, error=str(exc)[:4000])
+            try:
+                update_local_job(
+                    job_id, next_state, worker, lease_token=lease_token, error=str(exc)[:4000]
+                )
+            except Exception as update_exc:
+                processed.append(
+                    {
+                        "job_id": job_id,
+                        "status": "lease_lost"
+                        if getattr(update_exc, "code", "") == "lease_lost"
+                        else "unrecorded_failure",
+                        "error": str(exc),
+                        "record_error": str(update_exc),
+                    }
+                )
+                continue
             processed.append({"job_id": job_id, "status": next_state, "error": str(exc)})
     return {"worker": worker, "processed": processed, "idle": not processed}
 
