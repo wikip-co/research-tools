@@ -1938,6 +1938,22 @@ def local_publish_command(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def publication_job_state_for_stage(stage: str) -> str:
+    """Map run_local_publish's fine-grained stage names onto valid job states.
+
+    set-publication-job-state only accepts PUBLICATION_JOB_STATES, so reporting a
+    sub-stage such as "drafting_attempt_1" verbatim is rejected, which fails the
+    job and leaves its lease unrenewed.
+    """
+    if stage == "balance_repair" or stage.startswith(
+        ("drafting_attempt_", "format_repair_attempt_", "critic_attempt_")
+    ):
+        return "drafting"
+    if stage.startswith("deterministic_validation_attempt_"):
+        return "validating"
+    return stage
+
+
 def update_local_job(
     job_id: int,
     state: str,
@@ -2045,7 +2061,7 @@ def local_worker_command(args: argparse.Namespace) -> dict[str, Any]:
             # the job this raises, which stops this run before it can publish.
             update_local_job(
                 job_id,
-                state,
+                publication_job_state_for_stage(state),
                 worker,
                 lease_token=lease_token,
                 lease_seconds=args.lease_seconds,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import functools
 import html
 import ipaddress
@@ -8,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -15,7 +17,7 @@ import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from .app import (
@@ -46,6 +48,10 @@ SECURITY_HEADERS = (
 # One unattended agent run at a time: concurrent runs edit the same content
 # checkout and open competing pull requests.
 CODEX_RUN_LOCK = threading.Lock()
+# A run holds CODEX_RUN_LOCK for its whole lifetime, so a hung run would block
+# every later one. Runs past this deadline are stopped and marked failed.
+DEFAULT_CODEX_TIMEOUT_SECONDS = 3 * 60 * 60
+CODEX_STOP_GRACE_SECONDS = 15
 
 
 def env_flag(name: str) -> bool:
@@ -186,8 +192,38 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def runner_lock_path(db_path: Path) -> Path:
+    return db_path.with_name(db_path.name + ".triage-ui.lock")
+
+
+def acquire_runner_lock(db_path: Path) -> IO[str] | None:
+    """Take the exclusive per-database runner lock, or return None if it is held.
+
+    Only the lock holder may run Codex jobs or fail interrupted ones, so a second
+    triage UI on the same database cannot rewrite the live instance's jobs. The
+    kernel releases the lock when the holder exits, crashes included.
+    """
+    path = runner_lock_path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
+
+
 def fail_interrupted_jobs(conn: sqlite3.Connection) -> int:
-    """Close out jobs whose runner thread died with a previous server process."""
+    """Close out jobs whose runner thread died with a previous server process.
+
+    Call this only while holding the runner lock (acquire_runner_lock): with the
+    lock held no other live process can own a queued or running job.
+    """
     now = utc_now_iso()
     cur = conn.execute(
         """
@@ -629,6 +665,35 @@ def codex_command(workspace_root: Path) -> list[str]:
     return command
 
 
+def codex_timeout_seconds() -> float:
+    raw = os.environ.get("CODEX_WEB_TIMEOUT_SECONDS", "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_CODEX_TIMEOUT_SECONDS
+    except ValueError:
+        value = DEFAULT_CODEX_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_CODEX_TIMEOUT_SECONDS
+
+
+def stop_process_group(process: subprocess.Popen[str], grace_seconds: float = CODEX_STOP_GRACE_SECONDS) -> None:
+    """Terminate, then kill, the child's whole process group.
+
+    Codex starts its own tool subprocesses; signalling only the direct child can
+    leave a grandchild holding stdout open, so the log loop would never end.
+    """
+    for sig, wait in ((signal.SIGTERM, grace_seconds), (signal.SIGKILL, None)):
+        try:
+            os.killpg(process.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        if wait is None:
+            return
+        try:
+            process.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def run_job(job_id: int, db_path: Path, workspace_root: Path, article_keys: list[str]) -> None:
     with CODEX_RUN_LOCK:
         _run_job_locked(job_id, db_path, workspace_root, article_keys)
@@ -655,20 +720,42 @@ def _run_job_locked(job_id: int, db_path: Path, workspace_root: Path, article_ke
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
-        if process.stdin is not None:
-            process.stdin.write(prompt)
-            process.stdin.close()
+        timeout = codex_timeout_seconds()
+        timed_out = threading.Event()
+
+        def expire() -> None:
+            timed_out.set()
+            stop_process_group(process)
+
+        watchdog = threading.Timer(timeout, expire)
+        watchdog.daemon = True
+        watchdog.start()
         log_parts: list[str] = []
-        if process.stdout is not None:
-            for line in process.stdout:
-                log_parts.append(line)
-                append_job_log(conn, job_id, line)
-        return_code = process.wait()
+        try:
+            if process.stdin is not None:
+                process.stdin.write(prompt)
+                process.stdin.close()
+            if process.stdout is not None:
+                for line in process.stdout:
+                    log_parts.append(line)
+                    append_job_log(conn, job_id, line)
+            return_code = process.wait()
+        finally:
+            watchdog.cancel()
+            if process.stdout is not None:
+                process.stdout.close()
         log = "".join(log_parts).strip()
         pr_matches = PR_URL_PATTERN.findall(log)
         pr_url = pr_matches[-1] if pr_matches else ""
-        if return_code == 0 and pr_url:
+        if timed_out.is_set():
+            state = "failed"
+            error = (
+                f"Codex did not finish within {timeout:g}s (CODEX_WEB_TIMEOUT_SECONDS) and was stopped. "
+                "Check the content repository for a partial branch before retrying."
+            )
+        elif return_code == 0 and pr_url:
             mark_articles_processed(conn, article_keys)
             state = "completed"
             error = ""
@@ -1517,6 +1604,17 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     db_path = Path(args.db).expanduser().resolve()
     workspace_root = Path(args.workspace_root).expanduser().resolve()
+    # Bind first: a launch that loses the port race must exit without touching
+    # the shared database.
+    server = TriageServer((args.host, args.port), Handler, db_path=db_path, workspace_root=workspace_root)
+    runner_lock = acquire_runner_lock(db_path)
+    if runner_lock is None:
+        server.server_close()
+        print(
+            f"Another triage UI is already running against {db_path} "
+            f"(lock: {runner_lock_path(db_path)}). Stop it before starting a new one."
+        )
+        return 1
     startup = connect(db_path)
     try:
         interrupted = fail_interrupted_jobs(startup)
@@ -1524,7 +1622,6 @@ def main(argv: list[str] | None = None) -> int:
         startup.close()
     if interrupted:
         print(f"Marked {interrupted} interrupted Codex job(s) as failed")
-    server = TriageServer((args.host, args.port), Handler, db_path=db_path, workspace_root=workspace_root)
     print(f"Serving research triage UI on http://{args.host}:{args.port}")
     print(f"SQLite DB: {db_path}")
     print(f"Workspace root: {workspace_root}")
@@ -1534,6 +1631,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nStopping research triage UI")
     finally:
         server.server_close()
+        runner_lock.close()
     return 0
 
 

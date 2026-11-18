@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import re
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from wiki_automation import cli
@@ -84,6 +86,34 @@ class LocalWorkerTests(unittest.TestCase):
         self.assertIn("--lease-seconds", queue.updates[0])
         self.assertIn("--lease-seconds", queue.updates[1])
         self.assertNotIn("--lease-seconds", queue.updates[2])
+
+    def test_sub_stage_progress_is_reported_as_a_valid_job_state(self) -> None:
+        queue = FakeQueue([job(7, token=3)])
+
+        def publish(**kwargs):
+            kwargs["progress"]("drafting_attempt_1")
+            kwargs["progress"]("deterministic_validation_attempt_1")
+            kwargs["progress"]("critic_attempt_2")
+            return {"status": "validated_draft"}
+
+        result = self.run_worker(queue, publish)
+        self.assertEqual(result["processed"][0]["status"], "validated_draft")
+        states = [c[c.index("--state") + 1] for c in queue.updates]
+        self.assertEqual(states[:4], ["scraping", "drafting", "validating", "drafting"])
+        for command in queue.updates[:4]:
+            self.assertIn("--lease-seconds", command)
+
+    def test_every_stage_run_local_publish_reports_maps_to_a_job_state(self) -> None:
+        try:
+            from gmail_reader.app import PUBLICATION_JOB_STATES
+        except ImportError:
+            self.skipTest("gmail_reader is not installed in this environment")
+        source = (Path(cli.__file__).parent / "local_publish.py").read_text(encoding="utf-8")
+        stages = re.findall(r'progress\(f?"([^"]+)"\)', source)
+        self.assertIn("matching", stages)
+        for stage in stages:
+            concrete = re.sub(r"\{[^}]*\}", "1", stage)
+            self.assertIn(cli.publication_job_state_for_stage(concrete), PUBLICATION_JOB_STATES, stage)
 
     def test_lost_lease_stops_the_run_and_the_worker_continues(self) -> None:
         queue = FakeQueue([job(7, token=3), job(8, token=1)], lost_states={"drafting"})

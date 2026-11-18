@@ -20,6 +20,7 @@ from gmail_reader.app import (
 from gmail_reader.web import (
     Handler,
     TriageServer,
+    acquire_runner_lock,
     active_job_article_keys,
     append_job_log,
     default_workspace_root,
@@ -35,7 +36,9 @@ from gmail_reader.web import (
     fetch_articles_by_key,
     fetch_job,
     job_log_delta,
+    main,
     mark_articles_processed,
+    run_job,
     update_article_status,
 )
 
@@ -225,6 +228,61 @@ class WebHelpersTests(unittest.TestCase):
             conn.close()
         self.assertEqual(job["state"], "failed")
         self.assertIn("Interrupted", job["error"])
+
+    def test_runner_lock_is_exclusive_per_database(self) -> None:
+        first = acquire_runner_lock(self.db_path)
+        self.assertIsNotNone(first)
+        try:
+            self.assertIsNone(acquire_runner_lock(self.db_path))
+        finally:
+            first.close()
+        again = acquire_runner_lock(self.db_path)
+        self.assertIsNotNone(again)
+        again.close()
+
+    def test_second_instance_leaves_the_live_instances_jobs_alone(self) -> None:
+        conn = connect(self.db_path)
+        try:
+            job_id = create_job(conn, fetch_articles_by_key(conn, ["article-1"]), "prompt", ["codex"])
+        finally:
+            conn.close()
+        live = acquire_runner_lock(self.db_path)
+        try:
+            with mock.patch("builtins.print"):
+                code = main(["--db", str(self.db_path), "--host", "127.0.0.1", "--port", "0"])
+        finally:
+            live.close()
+        self.assertEqual(code, 1)
+        conn = connect(self.db_path)
+        try:
+            self.assertEqual(fetch_job(conn, job_id)["state"], "queued")
+        finally:
+            conn.close()
+
+    def test_hung_codex_run_is_stopped_and_releases_the_queue(self) -> None:
+        # The grandchild keeps stdout open, so only a process-group kill ends the run.
+        command = ["sh", "-c", "echo started; sleep 60 & sleep 60"]
+        conn = connect(self.db_path)
+        try:
+            job_id = create_job(conn, fetch_articles_by_key(conn, ["article-1"]), "prompt", command)
+        finally:
+            conn.close()
+        with mock.patch.dict(os.environ, {"CODEX_WEB_TIMEOUT_SECONDS": "0.5"}):
+            runner = threading.Thread(
+                target=run_job, args=(job_id, self.db_path, Path(self.tempdir.name), ["article-1"])
+            )
+            runner.start()
+            runner.join(timeout=20)
+        self.assertFalse(runner.is_alive())
+        conn = connect(self.db_path)
+        try:
+            job = fetch_job(conn, job_id)
+            self.assertEqual(active_job_article_keys(conn, ["article-1"]), set())
+        finally:
+            conn.close()
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("did not finish", job["error"])
+        self.assertIn("started", job["log"])
 
 
 class RequestGuardTests(unittest.TestCase):
